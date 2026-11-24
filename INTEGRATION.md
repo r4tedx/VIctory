@@ -105,6 +105,10 @@ and the name is its author's GitHub login.
 - #326 (SkippySteve): DXBC/DXIL parser and sampler/SP3 robustness fixes
 - #259 (desplmfao): a descriptor's level count is queried only when
   word 3 is read
+- #136 (mpDom, from `8ae232f`): only the descriptor-use selection and
+  record-count reconstruction for descriptors used by `s_buffer_load_dword*`.
+  The ordinary scalar load changes, a16 sampling, gather emulation, phi,
+  signature, interpolation, conservative depth and LOD changes are excluded.
 - #179 (TG0000): interpolation halves indexed on demand
 - #176 (Yaekai): packed fp16 pixel inputs paired with unlisted signature
   rows
@@ -170,6 +174,10 @@ is described in its merge or fix commit.
   `v_readfirstlane` comes before #233's console-flow form.
 - **Mechanical fixes for #233's new arguments** in tests: `emit/lower.rs`,
   `emit/image_tests.rs`, `emit/mod.rs`, `sgpr_spill.rs`.
+- **#136 scalar buffer descriptor review:** retry descriptor data lowering
+  only for programs refused by the existing path. Require a known, aligned
+  table entry and use the same raw or structured view for the scalar load
+  and record count.
 
 ## Left out on purpose
 
@@ -178,8 +186,9 @@ is described in its merge or fix commit.
 - #193: its fallback reads a structured view through a raw handle,
   which returns 0 on NVIDIA; a title run with it (and other PRs) ended in
   a 0x887A0001 device removal
-- #136: a16 bias read as f32; `image_gather4_l` ignores the sampler's
-  address mode; 31 `E_OUTOFMEMORY` refusals in a title run
+- Rest of #136: a16 bias read as f32; `image_gather4_l` ignores the
+  sampler's address mode; missing phi inputs become zero. The full PR
+  had 31 `E_OUTOFMEMORY` refusals in a title run.
 - #317: MSAA descriptors report 1 sample instead of log2(samples)
 - #269: its new tests fail on 32-lane hosts (NVIDIA)
 - #318: a16 also packs derivatives, which the hardware does not
@@ -224,8 +233,9 @@ is described in its merge or fix commit.
   the hang. This tree removes known errors around it, not the hang.
 - **The top rows of issue #293's table** ("an address in an SGPR that is
   no root parameter", "a descriptor neither loaded nor built", "a
-  structured buffer of unknown stride", "a scalar memory read as data").
-  No PR in this tree fixes them.
+  structured buffer of unknown stride"). The #136 excerpt addresses
+  "a scalar memory read as data" when the data is a known buffer
+  descriptor's record count.
 - **Faults on textures the title freed earlier.**
 
 ## How to build
