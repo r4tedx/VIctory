@@ -9951,6 +9951,13 @@ impl<'a> Lower<'a> {
 
     /// A dword a scalar load writes, where the load is a descriptor the
     /// program uses as a resource or sampler.
+    /// Whether `v` is a dword of a lane mask structurisation tracked.
+    fn mask_value(&self, v: Value) -> bool {
+        self.x.st.masks.contains_key(&v)
+            || self.x.st.highs.contains_key(&v)
+            || self.x.st.others.contains_key(&v)
+    }
+
     fn descriptor_dword(&self, v: Value) -> bool {
         let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
             block
@@ -10015,6 +10022,22 @@ impl<'a> Lower<'a> {
                     // shortcut: undefined on that edge, assuming the program
                     // reads the joined value only after the data edge.
                     (Some(Val::Missing(_)), _) if self.descriptor_dword(arg) => {
+                        if bit {
+                            self.s.m.undef(self.s.t.i1)
+                        } else {
+                            self.s.m.undef(self.s.t.i32)
+                        }
+                    }
+                    // A lane mask's dword reaching a join read as data:
+                    // the console compiler keeps masks as booleans, so the
+                    // register only carries a mask there after its data
+                    // value's last use on that edge (a mask copied into data
+                    // is a ballot, written by its own instruction).
+                    // shortcut: undefined on that edge, as for descriptors
+                    // above. Compute reads the mask's exact ballot instead.
+                    (Some(Val::Missing(LANE_MASK)), _)
+                        if self.mask_data != MaskData::Console && self.mask_value(arg) =>
+                    {
                         if bit {
                             self.s.m.undef(self.s.t.i1)
                         } else {
