@@ -145,8 +145,9 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
+    pub gs_vertices: Option<u16>,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
     pub inputs: &'a [SigElement],
@@ -194,6 +195,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[29] = p.outputs.len() as u8;
     info[31] = in_vectors as u8;
     info[32] = out_vectors as u8;
+    if let Some(maximum) = p.gs_vertices {
+        info[..4].copy_from_slice(&3u32.to_le_bytes()); // triangle inputs
+        info[4..8].copy_from_slice(&5u32.to_le_bytes()); // triangle strip
+        info[8..12].copy_from_slice(&1u32.to_le_bytes()); // stream 0
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&maximum.to_le_bytes());
+    }
     if let Some((mesh, shared)) = p.mesh {
         info[0..4].copy_from_slice(&shared.to_le_bytes());
         info[12..14].copy_from_slice(&(mesh.max_vertices as u16).to_le_bytes());

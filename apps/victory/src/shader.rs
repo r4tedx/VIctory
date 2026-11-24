@@ -114,7 +114,17 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
                             if disasm {
-                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                if let victory_shader::native::StageIo::Gs(gs) = &n.io {
+                                    listing.push(format!("    GS output ring: {} dwords/vertex, {} dwords/invocation, {} vertices", gs.vertex_dwords, gs.invocation_dwords, gs.max_vertices));
+                                    listing.push(format!("    GS copy VS: {} B, {:?}", gs.copy.code.len(), gs.copy.io));
+                                    match gfx10::decode(&gs.copy.code) {
+                                        Ok(copy) => listing.extend(copy.iter().map(|i| format_instruction(i, gs.copy.wave64))),
+                                        Err(e) => listing.push(format!("    GS copy decode: {e}")),
+                                    }
+                                    listing.push("    GS body".into());
+                                } else {
+                                    listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                }
                                 listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                 listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                             }

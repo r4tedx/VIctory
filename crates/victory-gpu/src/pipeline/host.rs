@@ -365,14 +365,18 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "geometry" | "mesh"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry");
+        if mesh.is_some() && geometry.is_some() {
+            return refuse("geometry and mesh stages in one pipeline", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -383,6 +387,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -626,11 +631,20 @@ impl HostPipeline {
             });
         }
 
+        let pixel = stages
+            .iter()
+            .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_PIXEL)
+            .map_or_else(Default::default, code);
+        let gs = stages
+            .iter()
+            .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_GEOMETRY)
+            .map_or_else(Default::default, code);
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
+            PS: pixel,
+            GS: gs,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -652,16 +666,24 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
+        fn dxil(stage: Option<&Arc<Shader>>) -> &[u8] {
+            stage
+                .and_then(|s| s.translated())
+                .map_or(&[], |s| s.host.dxil.as_slice())
+        }
+        let mut bytecodes = vec![dxil(find("vertex")), dxil(find("pixel"))];
+        if geometry.is_some() {
+            bytecodes.push(dxil(geometry));
+        }
+        let name = super::library::name("graphics", &root_blob, &bytecodes, &state);
         let made = if let Some(depth) = depth_with_bounds {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
-                input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, desc.InputLayout),
+                gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS),
+                input: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+                    desc.InputLayout,
+                ),
                 strip_cut: Sub(
                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
                     desc.IBStripCutValue,
@@ -724,6 +746,7 @@ struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 #[repr(C)]
 struct VertexStream {
     vs: Sub<D3D12_SHADER_BYTECODE>,
+    gs: Sub<D3D12_SHADER_BYTECODE>,
     input: Sub<D3D12_INPUT_LAYOUT_DESC>,
     strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,

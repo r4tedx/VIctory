@@ -345,12 +345,38 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A triangle pipeline with a geometry stage between VS and PS.
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+        ])?;
+        let pso = self.graphics_pipeline_with(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// A graphics pipeline with the given root signature; vertex inputs
     /// packed in register order.
     pub fn pipeline_with(
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.graphics_pipeline_with(root, vs, None, ps)
+    }
+
+    fn graphics_pipeline_with(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -376,6 +402,12 @@ impl Host {
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the descriptor never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |code| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                }
+            }),
             VS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: vs.as_ptr().cast(),
                 BytecodeLength: vs.len(),

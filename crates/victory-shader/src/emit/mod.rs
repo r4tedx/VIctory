@@ -85,10 +85,12 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
-#[cfg(all(test, windows))]
-mod image_tests;
+#[cfg(test)]
+mod geometry_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
@@ -260,7 +262,7 @@ pub fn last_module_summary() -> String {
     shader::last_summary()
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
+/// Translates the vertex, geometry, pixel, compute or mesh program of a console
 /// shader container, for any host ([`Target::ANY`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_for(container, Target::ANY)
@@ -272,32 +274,38 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let geometry = crate::dxbc::u32_at(dxil.data, 0).is_ok_and(|v| v >> 16 == 2);
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
+            if geometry {
+                p.stage == HwStage::Gs
+            } else {
+                matches!(
+                    p.stage,
+                    HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                )
+            }
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, geometry, pixel, compute or mesh program",
         })?;
     // A compute program whose root arguments all sit past the 16 user SGPRs
     // finds them through the spill table `s[0:1]` points to.
-    let mut p = ir::build_with(
-        &native.patched_code(),
-        native.wave64,
-        native.vgprs,
-        native.spilled(),
-    )?;
+    let mut p = native.translation_ir()?;
     crate::sgpr_spill::forward(&mut p);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, &native);
+    let res = match &io {
+        Ok(raised) => {
+            resource::track_io(&p, &native.layout, native.stage, st.as_ref().ok(), raised)
+        }
+        Err(_) => resource::track(&p, &native.layout, native.stage, st.as_ref().ok()),
+    }?;
+    let io = io?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res, target)
 }
@@ -403,12 +411,57 @@ fn emit_program(
             None => Ok(Vec::new()),
         }
     };
+    if native.stage == HwStage::Gs
+        && (io.geometry.is_none() || !matches!(native.io, crate::native::StageIo::Gs(_)))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "unraised geometry stream I/O",
+        });
+    }
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     // Lowering declares the `SV_Barycentrics` a program reads, with the mode
     // it reads them in: a row of the console's own would be a second one.
     inputs.retain(|e| e.kind != 28);
     let mut outputs = sig(FourCC::OSG1)?;
+    if let crate::native::StageIo::Gs(gs) = &native.io {
+        use crate::dxbc::u32_at;
+        let info = c.part(FourCC::PSV0).and_then(|p| {
+            let size = u32_at(p.data, 0).ok()? as usize;
+            p.data.get(4..)?.get(..size)
+        });
+        let supported = info.is_some_and(|i| {
+            i.len() >= 36
+                && i[24] == 2
+                && i[25] == 0
+                && u32_at(i, 0) == Ok(3)
+                && u32_at(i, 4) == Ok(5)
+                && u32_at(i, 8) == Ok(1)
+                && u32::from(u16::from_le_bytes([i[26], i[27]])) == gs.max_vertices
+                && (1..=1024).contains(&gs.max_vertices)
+        });
+        if !supported {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "the geometry primitive or stream configuration",
+            });
+        }
+        for e in &mut inputs {
+            e.interp = match (e.kind, e.comp) {
+                (3, _) => 4,
+                (0, 9) => 2,
+                (0, _) => 1,
+                _ => {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "a geometry system input",
+                    });
+                }
+            };
+        }
+        harmonize_row_interp(&mut inputs);
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say. Conservative depth outputs
     // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`, kinds 18/19) require

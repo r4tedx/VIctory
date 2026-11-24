@@ -184,6 +184,7 @@ pub struct Export {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Io {
+    pub geometry: Option<Box<crate::geometry::Streams>>,
     /// Input values the hardware loads, with their meaning; other VGPRs
     /// read before written hold undefined values.
     pub inputs: Vec<(Value, Input)>,
@@ -205,6 +206,12 @@ pub(crate) fn raise_interps(
     first_halves: bool,
 ) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    if let (StageIo::Gs(gs), HwStage::Gs) = (&native.io, native.stage) {
+        return Ok(Io {
+            geometry: Some(Box::new(crate::geometry::raise(p, gs)?)),
+            ..Io::default()
+        });
+    }
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
             StageIo::Ps {
