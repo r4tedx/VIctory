@@ -350,6 +350,18 @@ fn console_flow_is_for_one_console_wave_per_group() {
     let mut with_barrier = body.to_vec();
     with_barrier.push(0xBF8A_0000); // s_barrier
     stops(&program(&with_barrier, 128));
+    // A select on a mask held as numbers counts only in the console flow's
+    // own pass: a group that shares LDS still stops there.
+    let select = [
+        0xBE8A_03FF,
+        0x0F0F_0F0F, // s_mov_b32 s10, 0x0f0f0f0f
+        0xBE8B_03FF,
+        0x3333_3333, // s_mov_b32 s11, 0x33333333
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0xD501_0002,
+        0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
+    ];
+    stops(&program_lds(&select, 128));
 }
 
 /// Groups of two and four console waves as host groups of one wave each,
@@ -1072,9 +1084,21 @@ fn selects_on_masks_held_as_numbers() {
         };
         for (label, body, by_group) in [("constant", &constant[..], false), ("built", &built, true)]
         {
-            for (wave64, threads) in [(true, 64), (false, 64), (false, 32)] {
+            // (128 threads of a wave64: two console waves, one host group
+            // each where the host has no 64-lane waves.)
+            for (wave64, threads) in [(true, 64), (false, 64), (false, 32), (true, 128)] {
                 let mut p = program(body, threads);
                 p.wave64 = wave64;
+                if threads > 64 {
+                    // The select counts only once its result is needed: the
+                    // console flow's own pass must split the group too.
+                    let wave32_only = super::Target {
+                        lanes_min: 32,
+                        lanes_max: 32,
+                    };
+                    let split = emit_for(&p, wave32_only).unwrap();
+                    assert_eq!(split.group_waves, threads / 64, "{label}");
+                }
                 let groups = 2;
                 let out = run(&host, &p, groups)
                     .unwrap_or_else(|e| panic!("{name}: {label} wave64 {wave64}: {e}"));
@@ -1083,8 +1107,8 @@ fn selects_on_masks_held_as_numbers() {
                         // s8 = g * threads * 4: bit 8 in group 1 of 64, bit 7 of 32.
                         let lo = 0x0F0F_0F0F | if by_group { g * threads * 4 } else { 0 };
                         (0..threads).map(move |t| {
-                            let (word, lane) = if wave64 && t >= 32 {
-                                (0x3333_3333, t - 32)
+                            let (word, lane) = if wave64 && t % 64 >= 32 {
+                                (0x3333_3333, t % 64 - 32)
                             } else {
                                 (lo, t % 32)
                             };

@@ -1443,6 +1443,14 @@ impl<'a> Lower<'a> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
+        // The console flow's group barriers are reached by every thread
+        // only in a group of one console wave.
+        if self.x.console_cf
+            && self.s.wave_size == Some(32)
+            && let Some(why) = self.no_console_flow
+        {
+            return Err(unsupported(0, why));
+        }
         if let Some(n) = self.s.wave_size
             && !self.x.target.runs(n)
         {
