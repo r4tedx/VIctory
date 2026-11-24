@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
+const SCALAR_MEMORY_AS_DATA: Why = "a scalar memory read as data";
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -103,8 +104,9 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut scalar_descriptor_data = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, scalar_descriptor_data).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -113,6 +115,18 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                         what: "a phi that does not settle",
                     });
                 }
+            }
+            // Keep existing translations on their original scalar load path.
+            // Retry with descriptor reconstruction when that path needs a
+            // scalar-only descriptor's dword as data.
+            Err(Stop::Fail(ShaderError::Unsupported { what: SCALAR_MEMORY_AS_DATA, .. }))
+                if !scalar_descriptor_data
+                    && parts.res.descriptors.iter().any(|d| {
+                        parts.p.blocks[d.site.0].insts[d.site.1].name().starts_with("s_buffer_load_dword")
+                    }) =>
+            {
+                scalar_descriptor_data = true;
+                bad.clear();
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -211,6 +225,9 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    scalar_descriptor_data: bool,
+    /// Loads whose reconstructed descriptor has a scalar buffer user.
+    scalar_buffer_views: HashMap<(Site, u8), (u32, u32)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
@@ -542,7 +559,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, scalar_descriptor_data: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -774,6 +791,8 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            scalar_descriptor_data,
+            scalar_buffer_views: HashMap::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -3524,28 +3543,42 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(
-            kind,
-            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-        ) {
-            let u = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
-                0x1000
+        // The view a reconstructed descriptor of these dwords reads through,
+        // else a raw view of a buffer the table calls an SRV or a UAV.
+        let scalar_props = self.reconstructed_scalar_view(src)?;
+        let raw_props = match kind.map(|u| u.kind) {
+            Some(ResourceType::Srv) => Some((11, 0)),
+            Some(ResourceType::Uav) => Some((11 | 0x1000, 0)),
+            _ => None,
+        };
+        if let Some(props) = scalar_props.or(raw_props) {
+            let h = self.handle(site, src, false, props)?;
+            let addr = if scalar_props.is_some() {
+                let aligned = self.s.m.i32(!3);
+                self.s.m.bin(c, Bin::And, addr, aligned)
             } else {
-                0
+                addr
             };
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let stride = (props.1 != 0).then(|| self.s.m.i32(props.1));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (index, in_element) = match stride {
+                    Some(stride) => (
+                        self.s.m.bin(c, Bin::UDiv, a, stride),
+                        self.s.m.bin(c, Bin::URem, a, stride),
+                    ),
+                    None => (a, self.s.m.undef(self.s.t.i32)),
+                };
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, in_element, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -3673,7 +3706,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err(SCALAR_MEMORY_AS_DATA);
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -3681,7 +3714,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err(SCALAR_MEMORY_AS_DATA),
         };
         // How the program uses the descriptor tells the view's kind: its
         // own uses, else those of a twin load of the same dwords (a
@@ -3700,12 +3733,49 @@ impl<'a> Lower<'a> {
                     })
                 })
         };
-        let use_at =
-            uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
+        let own = |load: Site| load == site;
+        let twin = |load: Site| self.twin_loads(site, load);
+        // The loads whose uses tell the kind: this one, else its twins.
+        let (use_at, same): (_, &dyn Fn(Site) -> bool) = match uses(&own) {
+            Some(at) => (Some(at), &own),
+            None => (uses(&twin), &twin),
+        };
+        let scalar_load = |i: &Inst| i.name().starts_with("s_buffer_load_dword");
+        let mut scalar_props = None;
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
-            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let mut ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            if self.scalar_descriptor_data {
+                let rich =
+                    |i: &Inst| matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. });
+                let mut has_scalar = scalar_load(ui);
+                // Prefer the richer use of these same dwords. A wide scalar
+                // load can also supply a descriptor starting at another dword.
+                let others = self
+                    .x
+                    .res
+                    .descriptors
+                    .iter()
+                    .filter(|d| d.role == Role::Resource)
+                    .filter(|d| {
+                        d.source.leaves().into_iter().any(|l| {
+                            matches!(*l, Source::Loaded { load, first: k } if k == first && same(load))
+                        })
+                    });
+                for d in others {
+                    let other: &Inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                    has_scalar |= scalar_load(other);
+                    if !rich(ui) && rich(other) {
+                        ui = other;
+                    }
+                }
+                if has_scalar {
+                    // A twin reads the same table entry, so this load's own
+                    // address names the view of either.
+                    scalar_props = Some(self.scalar_buffer_props(site, first)?);
+                }
+            }
             let un = ui.name();
             let uav = un.contains("store")
                 || un.contains("atomic")
@@ -3740,7 +3810,10 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
-                _ => return Err("a scalar memory read as data"),
+                Fields::Smem { .. } if scalar_load(ui) => {
+                    (scalar_props.ok_or(SCALAR_MEMORY_AS_DATA)?, None)
+                }
+                _ => return Err(SCALAR_MEMORY_AS_DATA),
             };
             (first, src, props, image, uav)
         } else {
@@ -3761,6 +3834,12 @@ impl<'a> Lower<'a> {
             }
             (0, src, (2, 0x409), Some(2), false)
         };
+        if let Some(scalar_props) = scalar_props {
+            if props != scalar_props {
+                return Err("incompatible scalar and vector views of a buffer descriptor");
+            }
+            self.scalar_buffer_views.insert((site, first), props);
+        }
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -3837,6 +3916,66 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The view of a specific descriptor table entry. A dynamic index can
+    /// cross a range, and the nearest preceding metadata entry need not
+    /// describe this view. The heap index also rounds down to a 32-byte
+    /// slot, so a descriptor starting inside a slot cannot be recovered.
+    fn scalar_buffer_props(&self, load: Site, first: u8) -> Result<(u32, u32), Why> {
+        const UNKNOWN: Why = "a scalar buffer descriptor without a known table view";
+        let a = self.scalar.get(&load).ok_or(UNKNOWN)?;
+        let rp = self.x.native.layout.get(a.param).ok_or(UNKNOWN)?;
+        let offset = a.offset.checked_add(4 * u32::from(first)).ok_or(UNKNOWN)?;
+        if rp.root != RootType::Table || a.dynamic.is_some() || !offset.is_multiple_of(32) {
+            return Err(UNKNOWN);
+        }
+        let mut entries = self.x.native.used.iter().filter(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.slot == rp.slot
+                && u.table_offset_dwords == offset / 4
+        });
+        let used = entries.next().ok_or(UNKNOWN)?;
+        if entries.any(|u| u != used) || used.dwords != 4 {
+            return Err(UNKNOWN);
+        }
+        let uav = match used.kind {
+            ResourceType::Srv => 0,
+            ResourceType::Uav => 0x1000,
+            ResourceType::Cbv => return Err("a constant buffer's descriptor read as data"),
+            _ => return Err(UNKNOWN),
+        };
+        match used.stride {
+            0 => Ok((11 | uav, 0)),
+            stride if stride <= 2048 && stride.is_multiple_of(4) => Ok((12 | uav, stride)),
+            _ => Err("a scalar buffer descriptor with an unsupported stride"),
+        }
+    }
+
+    /// A scalar load and any reconstructed descriptor it can use must agree
+    /// on the view kind, including every input to a phi or select.
+    fn reconstructed_scalar_view(&self, src: &Source) -> Result<Option<(u32, u32)>, Why> {
+        if self.scalar_buffer_views.is_empty() {
+            return Ok(None);
+        }
+        let leaves = src.leaves();
+        let Some(props) = leaves.iter().find_map(|s| match **s {
+            Source::Loaded { load, first } => self.scalar_buffer_views.get(&(load, first)).copied(),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        const INCOMPATIBLE: Why = "a scalar load selecting incompatible buffer descriptors";
+        for s in leaves {
+            let Source::Loaded { load, first } = *s else {
+                return Err(INCOMPATIBLE);
+            };
+            if self.scalar_buffer_props(load, first)? != props {
+                return Err(INCOMPATIBLE);
+            }
+        }
+        Ok(Some(props))
     }
 
     /// Whether an instruction or phi reads `v` other than as a resource

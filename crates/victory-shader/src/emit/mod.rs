@@ -1011,6 +1011,138 @@ mod tests {
         emit(&c, native, &p, &st, &io, &res, Target::ANY)
     }
 
+    fn scalar_descriptor_program(kind: crate::ResourceType, stride: u32) -> NativeProgram {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF408_0100, 0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0
+            0xF420_0202, 0xFA00_000C, // s_buffer_load_dword s8, s[4:7], 12
+            0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+            0x7E00_0208, // v_mov_b32 v0, s8 (the scalar load)
+            0x7E02_0206, // v_mov_b32 v1, s6 (descriptor dword 2)
+            0xE070_0000, 0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
+            0xE070_0004, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let input = UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                input,
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    stride: 0,
+                    table_offset_dwords: 8,
+                    ..input
+                },
+            ],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// The user data of a shader whose one table starts at byte `table` of
+    /// the view heap, dispatched with `views` views: the table's address and
+    /// the heap's guard slot (the null slot the dispatch keeps after them).
+    #[cfg(windows)]
+    fn table_user_data(cs: &HostShader, table: u32, views: usize) -> Vec<u32> {
+        let mut data = vec![0; cs.user_data_dwords().max(1) as usize];
+        for u in &cs.user_data {
+            data[u.index as usize] = match u.root {
+                RootType::Table => table,
+                root => super::host::guard(root, views, 0)
+                    .unwrap_or_else(|| panic!("user data of {root:?}")),
+            };
+        }
+        data
+    }
+
+    #[test]
+    fn scalar_buffer_descriptor_data_loads_values_and_record_count() {
+        for (stride, count) in [(0, 24), (8, 3)] {
+            let native = scalar_descriptor_program(crate::ResourceType::Srv, stride);
+            let cs = emit_synthetic(&[], &native).unwrap();
+            #[cfg(windows)]
+            {
+                use super::host::{Dispatch, Host, Root, Stride, View};
+                validate_if_available(&cs.dxil);
+                for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                    let Ok(host) = Host::new(warp) else {
+                        eprintln!("no SM 6.6 {backend} device; skipped dispatch");
+                        continue;
+                    };
+                    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                    let view_stride = if stride == 0 {
+                        Stride::Raw
+                    } else {
+                        Stride::Structured(stride)
+                    };
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(table_user_data(&cs, 32, 3)))],
+                                views: &[
+                                    View::Buffer { data: &[0; 8], stride: view_stride },
+                                    View::Buffer { data: &[11, 22, 33, 44, 55, 66], stride: view_stride },
+                                    View::RawUav(2),
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(out, [vec![44, count]], "{backend}, stride {stride}");
+                    eprintln!("{backend}, stride {stride}: loaded 44 and record count {count}");
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = (cs, count);
+        }
+    }
+
+    #[test]
+    fn scalar_buffer_descriptor_data_requires_a_known_buffer_view() {
+        use crate::ResourceType::{Cbv, Srv};
+        let cbv = scalar_descriptor_program(Cbv, 0);
+        let mut wrong_slot = scalar_descriptor_program(Srv, 0);
+        wrong_slot.used[0].slot = 1;
+        let mut unaligned = scalar_descriptor_program(Srv, 0);
+        unaligned.code[8..12].copy_from_slice(&0xFA00_0010u32.to_le_bytes());
+        let invalid_stride = scalar_descriptor_program(Srv, 6);
+        for (native, what) in [
+            (cbv, "a constant buffer's descriptor read as data"),
+            (wrong_slot, "a scalar buffer descriptor without a known table view"),
+            (unaligned, "a scalar buffer descriptor without a known table view"),
+            (invalid_stride, "a scalar buffer descriptor with an unsupported stride"),
+        ] {
+            assert_eq!(
+                emit_synthetic(&[], &native),
+                Err(ShaderError::Unsupported { offset: 44, what })
+            );
+        }
+    }
+
     fn sig_elem(
         name: &str,
         index: u32,
