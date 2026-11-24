@@ -64,19 +64,30 @@ pub(crate) const TYPE: Why = "a BVH descriptor of another type (not 8)";
 pub(crate) const RESERVED: Why = "a BVH descriptor with reserved bits set";
 pub(crate) const RETURN_MODE: Why =
     "a BVH descriptor with triangle return mode 0 (triangle id and hit status)";
+/// A constant base is refused: the lowering reads node `n` at byte `64 * n`
+/// of the view in the slot dword 0 names, which assumes the view starts at
+/// the structure's base. A table-loaded base that is not the structure's
+/// start (absolute 64-bit node pointers over base 0, GPURT's
+/// `(bvhAddress >> 3) + nodePointer`) can't be told apart and reads as
+/// misses.
 pub(crate) const CONSTANT_BASE: Why = "a BVH descriptor with a constant base address";
 pub(crate) const BASE: Why = "a BVH descriptor's base address read as data";
 const RAY: Why = "a ray operand";
 
 /// Dword 1 of a BVH descriptor loaded from a table, read as a number: box
-/// sorting enabled (bit 31) and 6 ULPs of box growing (bits 30:23), with
-/// the high bits of the base address 0.
-// shortcut: the console driver's values are not known. Sorting only orders
-// the hits; 6 is GPURT's `BOX_EXPANSION_DEFAULT_AMOUNT`.
-pub(crate) const VIEW_DWORD1: u32 = 1 << 31 | 6 << 23;
+/// sorting enabled (bit 31) and no box growing (bits 30:23), with the high
+/// bits of the base address 0. This is what the title's own descriptors
+/// hold: Leonida's census of the 716 intersection sites (issue #274) found
+/// `box_grow` 0 and `box_sort_en` 1 at every one, and sampled programs set
+/// dword 1 to 0x8000_0000 (`s_brev_b32 s1, 1`).
+pub(crate) const VIEW_DWORD1: u32 = 1 << 31;
 /// Dword 3 of the same: type 8 (bits 31:28) and triangle return mode 1
 /// (bit 24: I and J numerators, what GPURT's traversal reads), with the
-/// high bits of the size 0.
+/// high bits of the size 0. The same census found type 8 and return mode 1
+/// at all 716 sites.
+// shortcut: return mode 1 is taken, not read: a table-loaded descriptor
+// with mode 0 would want the triangle id and hit status in results 2 and 3
+// (ISA table 50) and gets the I and J numerators instead.
 pub(crate) const VIEW_DWORD3: u32 = 8 << 28 | 1 << 24;
 
 /// A ray as the instruction's address VGPRs hold it, as floats.
@@ -143,6 +154,22 @@ impl Lower<'_> {
         self.s.m.extract(c, d, 0)
     }
 
+    /// The raw handle of the view a BVH descriptor names: a UAV when the
+    /// title's used-resource entry says so, else an SRV. Both the
+    /// intersection and a read of the descriptor's dwords as numbers go
+    /// through here, so a program reads one slot as one kind of view.
+    // shortcut: the slot must hold a raw view of the console's node memory
+    // starting at the structure's base (see the host notes in `emit/mod.rs`).
+    // Nothing on the GPU side makes one yet, and PR #702 would make a host
+    // acceleration structure there instead; with a null view every node is
+    // out of bounds and the intersection returns all ones (a miss).
+    fn bvh_handle(&mut self, site: Site, src: &Source) -> Result<V, Why> {
+        let uav = self
+            .used_kind(src)
+            .is_some_and(|u| u.kind == ResourceType::Uav);
+        self.handle(site, src, false, (11 | if uav { 0x1000 } else { 0 }, 0))
+    }
+
     /// A BVH descriptor load (`s_load_dword*` from a table or heap) whose
     /// dwords the code may read as numbers, like
     /// [`Lower::descriptor_data`]: dwords 1 and 3 are the flags of
@@ -158,7 +185,7 @@ impl Lower<'_> {
         src: &Source,
         (code, count, first): (u8, u32, u8),
     ) -> Result<(), Why> {
-        let h = self.handle(site, src, false, (11, 0))?;
+        let h = self.bvh_handle(site, src)?;
         let bytes = self.view_bytes(h);
         let (six, one, zero) = (self.s.m.i32(6), self.s.m.i32(1), self.s.m.i32(0));
         let nodes = self.ibin(Bin::LShr, bytes, six);
@@ -299,10 +326,7 @@ impl Lower<'_> {
         if matches!(src, Source::Constant(_)) {
             return Err(CONSTANT_BASE);
         }
-        let uav = self
-            .used_kind(src)
-            .is_some_and(|u| u.kind == ResourceType::Uav);
-        let h = self.handle(site, src, false, (11 | if uav { 0x1000 } else { 0 }, 0))?;
+        let h = self.bvh_handle(site, src)?;
         let bytes = self.view_bytes(h);
 
         // The node's byte offset is (pointer >> 3) * 64: the pointer
@@ -537,6 +561,11 @@ impl Lower<'_> {
             let m = self.icmp(p, x, y);
             miss = self.ibin(Bin::Or, miss, m);
         }
+        // shortcut: GPURT's software path. Leonida's RX 6800 probe (issue
+        // #274) measured hardware results scaled by k = |d[kz]|^3 on a hit,
+        // and copysign(inf, k * det) in word 0 on a miss with the other
+        // three kept; a shader comparing t / denominator sees the same
+        // acceptance either way, but word 1's sign on a miss differs.
         let t_num = self.pick(miss, inf, t_num);
         let denom = self.pick(miss, fone, denom);
 

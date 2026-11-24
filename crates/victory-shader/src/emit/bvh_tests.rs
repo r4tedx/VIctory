@@ -1420,8 +1420,8 @@ fn bvh_full_width_rays_match_the_model() {
 }
 
 /// Box growing (descriptor bits 62:55) through the instruction, with the
-/// expectations given as numbers: 0 ULPs, the 6 a loaded descriptor has,
-/// and 255.
+/// expectations given as numbers: 0 ULPs (what a loaded descriptor has,
+/// as the title's own descriptors do), 6 and 255.
 #[test]
 fn bvh_box_growing_is_the_descriptors() {
     let case = Case {
@@ -1439,7 +1439,7 @@ fn bvh_box_growing_is_the_descriptors() {
             assert_eq!(got, want, "{name}: {grow} ULPs");
         }
         let loaded = intersect_on(host, &Form::of(false, false), &slivers(), &[case])[0];
-        assert_eq!(loaded, SLIVER_RESULTS[1].1, "{name}: as loaded");
+        assert_eq!(loaded, SLIVER_RESULTS[0].1, "{name}: as loaded");
         eprintln!("{name}: boxes grow by 0, 6 and 255 ULPs as set (synthetic)");
     });
 }

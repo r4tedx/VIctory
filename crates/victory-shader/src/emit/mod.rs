@@ -58,11 +58,14 @@
 //!   and `image_bvh64_intersect_ray` read the BVH through the view at the
 //!   heap index of their descriptor, declared a raw buffer. The host's
 //!   view there must start at the console descriptor's base address and
-//!   span the structure; its size bounds the node fetches (a node that
+//!   span the structure (nothing on the GPU side makes such a view yet;
+//!   PR #702 would put a host acceleration structure there instead); its
+//!   size bounds the node fetches (a node that
 //!   does not lie in it whole returns all ones). The descriptor's flags
 //!   are the constants the code sets in dwords 1 and 3; a descriptor
-//!   loaded from a table reads as box sorting on, 6 ULPs of box growing
-//!   and triangle return mode 1, with the node count from the view's size
+//!   loaded from a table reads as box sorting on, no box growing and
+//!   triangle return mode 1 (what the title's descriptors hold, issue
+//!   #274), with the node count from the view's size
 //!   in dword 2. Its base address (dword 0) has no host value: a program
 //!   that computes the structure's address from it does not translate
 //!   (see `lower/bvh.rs` for what else is open).
