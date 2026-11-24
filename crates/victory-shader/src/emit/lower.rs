@@ -349,6 +349,10 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// A table descriptor loaded through an address recomputed at the use
+/// ([`RelOffset`]) whose constant part reaches more than one of the table's
+/// ranges, or that nothing bounds.
+const TABLE_RANGE: Why = "a table descriptor at an address that does not settle its range";
 
 /// Samples whose level comes from derivatives across each quad of lanes,
 /// lowered with the quad's differences outside pixel shaders: the plain and
@@ -1041,7 +1045,7 @@ impl<'a> Lower<'a> {
                 words: [0, 0],
             };
             let u = if self
-                .used_kind(&src)
+                .used_kind(&src)?
                 .is_some_and(|u| u.kind == ResourceType::Uav)
             {
                 0x1000
@@ -2292,7 +2296,9 @@ impl<'a> Lower<'a> {
         together().or_else(|| self.x.st.pairs.get(&lo).copied())
     }
 
-    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+    /// The condition, beyond being there, under which a lane runs the
+    /// instruction at `(b, i)`; none where every lane that is there runs it.
+    fn mask(&self, b: usize, i: usize) -> Option<Bool> {
         if self.console_cf {
             // Every lane is here: EXEC is the guard. Lane reads and writes
             // ignore EXEC on the console.
@@ -2304,12 +2310,14 @@ impl<'a> Lower<'a> {
                 inst.fields,
                 Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
             );
-            return match self.x.st.execs[b].get(i).copied().flatten() {
-                Some(e) if !ignores && e != Bool::TRUE => Ok(Some(self.boolean(e, self.cur)?)),
-                _ => Ok(None),
-            };
+            let exec = self.x.st.execs[b].get(i).copied().flatten();
+            return exec.filter(|&e| !ignores && e != Bool::TRUE);
         }
-        match self.x.st.guards[b][i] {
+        self.x.st.guards[b][i]
+    }
+
+    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        match self.mask(b, i) {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
@@ -3581,7 +3589,7 @@ impl<'a> Lower<'a> {
             }
             (src, addr, (!has_soff && extra.is_none()).then_some(off))
         };
-        let kind = self.used_kind(src);
+        let kind = self.used_kind(src)?;
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -3772,7 +3780,7 @@ impl<'a> Lower<'a> {
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
-            let used = self.used_kind(&src);
+            let used = self.used_kind(&src)?;
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             let un = ui.name();
             let uav = un.contains("store")
@@ -3822,7 +3830,7 @@ impl<'a> Lower<'a> {
             };
             if count != 8
                 || self
-                    .used_kind(&src)
+                    .used_kind(&src)?
                     .is_some_and(|u| u.kind != ResourceType::Srv)
             {
                 return Err("a descriptor read only as data");
@@ -4156,6 +4164,7 @@ impl<'a> Lower<'a> {
             value,
             base,
             extra_dynamic,
+            ..
         }) = a.rel
         {
             let mut local = HashMap::new();
@@ -4194,7 +4203,7 @@ impl<'a> Lower<'a> {
                 Operand::Vector { reg, .. } => {
                     let v = inst.read(Reg::V(reg))?;
                     let &(b, i) = self.def_site.get(&v)?;
-                    if self.x.st.guards[b][i].is_some() {
+                    if self.mask(b, i).is_some() {
                         return None;
                     }
                     let next = &self.x.p.blocks[b].insts[i];
@@ -4670,8 +4679,11 @@ impl<'a> Lower<'a> {
                     }
                     _ => return Err("an untracked relative address"),
                 };
+                // Lanes the write's mask leaves out keep the old address
+                // (the tracer took the write only over one of this base
+                // where they go on to use it).
                 if let Some(Operand::Vector { reg, .. }) = f.dst
-                    && let Some(g) = self.x.st.guards[ib][ii]
+                    && let Some(g) = self.mask(ib, ii)
                     && let Some(old) = inst.read(Reg::V(reg))
                     && self.reaches_base(old, base)
                 {
@@ -4687,44 +4699,74 @@ impl<'a> Lower<'a> {
         Ok(x)
     }
 
-    /// The used-resource entry a descriptor loaded from a table falls in.
-    fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
+    /// The used-resource entry a descriptor loaded from a table falls in:
+    /// the range the constant part of its address lies in (a computed term
+    /// indexes within the range). Fails where an address recomputed at the
+    /// use does not settle one ([`TABLE_RANGE`]).
+    fn used_kind(&self, src: &Source) -> Result<Option<&'a UsedResource>, Why> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
         {
-            return self.used_kind(args.first()?);
+            return args.first().map_or(Ok(None), |a| self.used_kind(a));
         }
         if let Source::LanePhi { args, .. } = src {
-            return args.iter().flatten().find_map(|a| self.used_kind(a));
+            for a in args.iter().flatten() {
+                if let Some(used) = self.used_kind(a)? {
+                    return Ok(Some(used));
+                }
+            }
+            return Ok(None);
         }
         if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
+            let Some(rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            return Ok(self
                 .x
                 .native
                 .used
                 .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data));
         }
         let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
+            return Ok(None);
         };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
+        let Some(a) = self.scalar.get(load) else {
+            return Ok(None);
+        };
+        let rp = match self.x.native.layout.get(a.param) {
+            Some(rp) if rp.root == RootType::Table => rp,
+            _ => return Ok(None),
+        };
+        // The least and greatest constant part: one, unless phi edges (or
+        // writes under an EXEC mask) reach the address with different ones.
+        let (least, most) = match a.rel {
+            None => (a.offset, a.offset),
+            Some(rel) => {
+                let (least, spread) = rel.constant.ok_or(TABLE_RANGE)?;
+                let least = least.wrapping_add(a.offset);
+                (least, least.checked_add(spread).ok_or(TABLE_RANGE)?)
+            }
+        };
+        let range = |byte: u32| {
+            let dword = (byte / 4) + u32::from(*first);
+            self.x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.user_data == rp.user_data
+                        && u.table_offset_dwords <= dword
+                })
+                .max_by_key(|u| u.table_offset_dwords)
+        };
+        let used = range(least);
+        // Ranges are contiguous: both ends in one, and all between are.
+        if range(most).map(|u| u.table_offset_dwords) != used.map(|u| u.table_offset_dwords) {
+            return Err(TABLE_RANGE);
         }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
+        Ok(used)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -7273,7 +7315,7 @@ impl<'a> Lower<'a> {
         let store = name.starts_with("image_store");
         let uav = store
             || self
-                .used_kind(src)
+                .used_kind(src)?
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
@@ -8194,7 +8236,7 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
-        let used = self.used_kind(src);
+        let used = self.used_kind(src)?;
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);

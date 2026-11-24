@@ -12,8 +12,8 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand, Valu};
@@ -32,6 +32,12 @@ pub struct RelOffset {
     pub value: Value,
     pub base: Value,
     pub extra_dynamic: Option<Value>,
+    /// The constants added to `base` on the way to `value`: the least their
+    /// sum can be, and how far above that it can lie over the phi edges (and
+    /// writes under an EXEC mask) that reach `value`. `None` where no constant
+    /// bounds it: a run-time term subtracted, a pointer stepped round a loop.
+    /// A table's range is picked by it, as by [`Address::offset`] otherwise.
+    pub constant: Option<(u32, u32)>,
 }
 
 /// A byte address: a root parameter's, plus a constant and at most one
@@ -152,15 +158,37 @@ pub struct Waterfall {
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace. `lanes`, `p` as one lane runs it, tells which paths the
 /// lanes that access a per-lane descriptor took and which writes they ran;
-/// without it, per-lane descriptors chosen by control flow are refused and
-/// per-lane writes are taken to run in every lane.
+/// without it, per-lane descriptors chosen by control flow are refused.
+///
+/// An address that passes through a VGPR depends on which lanes each write
+/// ran in: without `lanes` the program is structured
+/// ([`crate::structure::structure`]) the first time one does.
+/// [`track_console`] is for a program lowered from the console's form.
 pub fn track(
     p: &Program,
     layout: &[RootParam],
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    trace(Tracer::new(p, layout, stage, lanes, lanes.map(|l| (l, false)))?)
+}
+
+/// [`track`] for a program lowered from `console`, the form every lane of
+/// the console wave runs through every block
+/// ([`crate::structure::structure_console`]), where EXEC alone masks each
+/// VGPR write. `lanes` is the program as one lane runs it, as for [`track`].
+pub fn track_console(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: &Structured,
+    console: &Structured,
+) -> Result<Resources, ShaderError> {
+    trace(Tracer::new(p, layout, stage, Some(lanes), Some((console, true)))?)
+}
+
+fn trace(t: Tracer) -> Result<Resources, ShaderError> {
+    let p = t.p;
     let mut out = Resources {
         params: p
             .inputs
@@ -261,9 +289,42 @@ enum Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Sum {
     base: Option<Value>,
+    /// With a base and `multi`: the least the constants added to it can sum
+    /// to.
     offset: u32,
     dynamic: Option<Value>,
     multi: bool,
+    /// With a base: how far above `offset` the constants can sum to, over
+    /// the phi edges and masked writes that reach the value (0: `offset`
+    /// exactly). `None` where no constant bounds them.
+    spread: Option<u32>,
+}
+
+/// The stretch of constants (least, spread) that covers `a` and `b`; modulo
+/// 2^32, the shorter way round.
+fn stretch(a: (u32, Option<u32>), b: (u32, Option<u32>)) -> (u32, Option<u32>) {
+    let (first, second) = if b.0.wrapping_sub(a.0) as i32 >= 0 {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let gap = second.0.wrapping_sub(first.0);
+    let spread = first
+        .1
+        .zip(second.1)
+        .and_then(|(x, y)| Some(x.max(gap.checked_add(y)?)));
+    (first.0, spread)
+}
+
+/// Why an address is refused when an EXEC mask kept its register from some
+/// lanes that go on to use it, and those lanes hold no address of its base.
+const MASKED: &str = "an address written under an EXEC mask over another base";
+
+/// What reads a value.
+#[derive(Debug, Clone, Copy)]
+enum Reader {
+    Phi(Value),
+    Inst(Site),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,6 +356,18 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memoized non-cyclic sums by value.
     sums: RefCell<HashMap<Value, Sum>>,
+    /// The structure the program is lowered from, and whether it is the
+    /// console's ([`track_console`]).
+    given: Option<(&'a Structured, bool)>,
+    /// The program's per-lane structure when none is given, made on first
+    /// use; `None` for a program that does not structure (never lowered).
+    own: OnceCell<Option<Structured>>,
+    /// Readers per value, made on first use.
+    readers: OnceCell<HashMap<Value, Vec<Reader>>>,
+    /// Memoized [`Self::kept`] by VGPR write.
+    kept: RefCell<HashMap<Value, Option<Value>>>,
+    /// VGPR writes whose address [`Self::masked`] dropped.
+    lost: RefCell<HashSet<Value>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -310,6 +383,7 @@ impl<'a> Tracer<'a> {
         layout: &'a [RootParam],
         stage: HwStage,
         lanes: Option<&'a Structured>,
+        given: Option<(&'a Structured, bool)>,
     ) -> Result<Self, ShaderError> {
         let all = || {
             p.inputs
@@ -357,6 +431,11 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             sums: RefCell::new(HashMap::new()),
+            given,
+            own: OnceCell::new(),
+            readers: OnceCell::new(),
+            kept: RefCell::new(HashMap::new()),
+            lost: RefCell::new(HashSet::new()),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -554,6 +633,9 @@ impl<'a> Tracer<'a> {
                     let Some((next, f)) = self.valu_ops(val, &["v_mov_b32"]) else {
                         return false;
                     };
+                    if self.kept(val).is_some() {
+                        return false;
+                    }
                     let Some(src) = f.src.first() else {
                         return false;
                     };
@@ -591,7 +673,9 @@ impl<'a> Tracer<'a> {
 
     fn strip_va_mask(&self, mut t: Term) -> Term {
         while let Term::Value(v) = t {
-            if let Some(x) = self.va_masked(v) {
+            if self.kept(v).is_some() {
+                break;
+            } else if let Some(x) = self.va_masked(v) {
                 t = x;
             } else if let Some((x, _)) = self.lane_read(v) {
                 t = x;
@@ -604,6 +688,203 @@ impl<'a> Tracer<'a> {
 
     fn sum(&self, t: Term) -> Sum {
         self.sum_rec(t, &mut Vec::new(), &mut Vec::new()).sum
+    }
+
+    /// The structure the program is lowered from and whether it is the
+    /// console's: the one given, else the program's per-lane structure.
+    fn structured(&self) -> Option<(&Structured, bool)> {
+        self.given.or_else(|| {
+            let own = || crate::structure::structure(self.p).ok();
+            Some((self.own.get_or_init(own).as_ref()?, false))
+        })
+    }
+
+    /// The lane's EXEC bit at the vector instruction at `site`.
+    fn exec(&self, (b, i): Site) -> Option<Bool> {
+        self.structured()?.0.execs[b].get(i).copied().flatten()
+    }
+
+    /// Whether the vector instruction at `site` runs under an EXEC mask that
+    /// leaves out lanes that go on: per lane, lanes that reach it; in the
+    /// console's form, where every lane reaches every block, any lane.
+    fn narrowed(&self, site: Site) -> bool {
+        match self.structured() {
+            Some((_, true)) => self.exec(site).is_some_and(|e| e != Bool::TRUE),
+            Some((st, false)) => st.guards[site.0][site.1].is_some(),
+            None => false,
+        }
+    }
+
+    /// For a VGPR write under an EXEC mask: the register's old value, which
+    /// the lanes the mask leaves out keep, if any of them can go on to read
+    /// the register. `None` for a write whose readers all run in lanes that
+    /// ran it too (a load under the same mask, say): they see what it wrote.
+    fn kept(&self, v: Value) -> Option<Value> {
+        let site = self.defs[v.0 as usize]?;
+        let inst = self.inst(site);
+        let &(reg @ Reg::V(_), _) = inst.writes.iter().find(|w| w.1 == v)? else {
+            return None;
+        };
+        let old = inst.read(reg)?;
+        if let Some(&kept) = self.kept.borrow().get(&v) {
+            return kept;
+        }
+        let kept = (self.narrowed(site) && self.leaks(v, self.exec(site), &mut Vec::new()))
+            .then_some(old);
+        self.kept.borrow_mut().insert(v, kept);
+        kept
+    }
+
+    /// Whether `x` can be read in a lane where `cover` (an EXEC bit; `None`:
+    /// nothing) did not hold: by an instruction whose EXEC does not imply
+    /// it, through a phi, or carried on in the result of a later masked
+    /// write to its register.
+    fn leaks(&self, x: Value, cover: Option<Bool>, seen: &mut Vec<(Value, bool)>) -> bool {
+        if seen.contains(&(x, cover.is_some())) {
+            return false;
+        }
+        seen.push((x, cover.is_some()));
+        let readers = self.readers.get_or_init(|| {
+            let mut readers: HashMap<Value, Vec<Reader>> = HashMap::new();
+            for (b, block) in self.p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    for &a in &phi.args {
+                        readers.entry(a).or_default().push(Reader::Phi(phi.value));
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    for &(_, r) in &inst.reads {
+                        readers.entry(r).or_default().push(Reader::Inst((b, i)));
+                    }
+                }
+            }
+            readers
+        });
+        let Some(readers) = readers.get(&x) else {
+            return false;
+        };
+        readers.iter().any(|&r| match r {
+            Reader::Phi(phi) => self.leaks(phi, None, seen),
+            Reader::Inst(site) => {
+                let inst = self.inst(site);
+                // Lane reads by index take a lane whatever EXEC is.
+                let covered = || {
+                    let (Some((st, _)), Some(c), Some(e)) = (self.structured(), cover, self.exec(site))
+                    else {
+                        return false;
+                    };
+                    !matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+                        && st.bools.within(e, c)
+                };
+                if operand(inst, x) && !covered() {
+                    return true;
+                }
+                // The lanes its own mask leaves out carry `x` on in its result.
+                self.narrowed(site)
+                    && inst.writes.iter().any(|&(reg, y)| {
+                        matches!(reg, Reg::V(_))
+                            && inst.read(reg) == Some(x)
+                            && self.leaks(y, cover, seen)
+                    })
+            }
+        })
+    }
+
+    /// `new`, the trace of what the instruction writing `v` computes, as the
+    /// register holds it after a write under an EXEC mask whose other lanes
+    /// go on to read it ([`Self::kept`]): an address stays one only over an
+    /// address of the same base, which the lowering then picks per lane;
+    /// anything else is the register as it is.
+    fn masked(
+        &self,
+        v: Value,
+        new: Trace,
+        visiting: &mut Vec<Value>,
+        frames: &mut Vec<HashMap<Value, Trace>>,
+    ) -> Trace {
+        let Some(old) = self.kept(v) else {
+            return new;
+        };
+        let as_is = Trace {
+            sum: Sum {
+                base: None,
+                offset: 0,
+                dynamic: Some(v),
+                multi: false,
+                spread: Some(0),
+            },
+            cycle: None,
+        };
+        if !new.has_ptr() {
+            return as_is;
+        }
+        let old = self.sum_rec(self.vorigin(old), visiting, frames);
+        let same = new.sum.base.zip(old.sum.base).is_none_or(|(a, b)| a == b);
+        if !old.has_ptr() || !same {
+            self.lost.borrow_mut().insert(v);
+            return as_is;
+        }
+        let (offset, spread) = match (new.sum.base, old.sum.base) {
+            (Some(_), Some(_)) => stretch(
+                (new.sum.offset, new.sum.spread),
+                (old.sum.offset, old.sum.spread),
+            ),
+            // One side is still being traced round a loop.
+            _ => (0, None),
+        };
+        Trace {
+            sum: Sum {
+                base: new.sum.base.or(old.sum.base),
+                offset,
+                dynamic: Some(v),
+                multi: true,
+                spread,
+            },
+            cycle: match (new.cycle, old.cycle) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
+    /// The source of the `v_mov_b32` that wrote VGPR value `v`.
+    fn moved(&self, v: Value) -> Option<Term> {
+        let (inst, f) = self.valu_ops(v, &["v_mov_b32"])?;
+        if !matches!(f.dst, Some(Operand::Vector { .. })) {
+            return None;
+        }
+        self.vterm(inst, f.src.first()?)
+    }
+
+    /// Whether the terms `v` is computed from include an address dropped at
+    /// a write under an EXEC mask ([`Self::masked`]).
+    fn mask_lost(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if self.lost.borrow().contains(&v) {
+            return true;
+        }
+        if seen.contains(&v) {
+            return false;
+        }
+        seen.push(v);
+        let terms: Vec<Option<Term>> = if let Some((b, i)) = self.phis[v.0 as usize] {
+            let args = &self.p.blocks[b].phis[i].args;
+            args.iter().map(|&a| Some(self.vorigin(a))).collect()
+        } else {
+            match self.def(v).map(|inst| (inst, &inst.fields)) {
+                Some((inst, Fields::Sop { dst, src, .. })) => src
+                    .iter()
+                    .chain(dst.iter().filter(|_| inst.name() == "s_addk_i32"))
+                    .map(|s| self.term(inst, s))
+                    .collect(),
+                Some((inst, Fields::Valu(f))) => {
+                    f.src.iter().map(|s| self.vterm(inst, s)).collect()
+                }
+                _ => Vec::new(),
+            }
+        };
+        terms
+            .into_iter()
+            .any(|t| matches!(t, Some(Term::Value(x)) if self.mask_lost(x, seen)))
     }
 
     fn sum_rec(
@@ -620,6 +901,7 @@ impl<'a> Tracer<'a> {
                         offset: c,
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 };
@@ -636,6 +918,7 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                     multi: true,
+                    spread: None,
                 },
                 cycle: Some(depth),
             };
@@ -644,6 +927,7 @@ impl<'a> Tracer<'a> {
             return cached;
         }
         let (res, cache_global) = self.sum_value(v, visiting, frames);
+        let res = self.masked(v, res, visiting, frames);
         if cache_global && res.cycle.is_none() {
             self.sums.borrow_mut().insert(v, res.sum);
         } else if let Some(frame) = frames.last_mut() {
@@ -664,6 +948,7 @@ impl<'a> Tracer<'a> {
                 offset: 0,
                 dynamic: Some(v),
                 multi: false,
+                spread: Some(0),
             },
             cycle: None,
         };
@@ -676,6 +961,7 @@ impl<'a> Tracer<'a> {
                             offset: 0,
                             dynamic: None,
                             multi: false,
+                            spread: Some(0),
                         },
                         cycle: None,
                     },
@@ -692,6 +978,7 @@ impl<'a> Tracer<'a> {
                         offset: 0,
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 },
@@ -705,6 +992,9 @@ impl<'a> Tracer<'a> {
             let mut shared_base: Option<Value> = None;
             let mut outer_cycle: Option<usize> = None;
             let mut touched_outer = false;
+            // The constants over the edges; none once a loop steps the pointer.
+            let mut span: Option<(u32, Option<u32>)> = None;
+            let mut looped = false;
             let mut ok = !self.p.blocks[phi_b].phis[phi_i].args.is_empty();
             for &arg in &self.p.blocks[phi_b].phis[phi_i].args {
                 let e = self.sum_rec(self.vorigin(arg), visiting, frames);
@@ -717,12 +1007,15 @@ impl<'a> Tracer<'a> {
                     ok = false;
                     break;
                 }
+                looped |= e.cycle.is_some();
                 if let Some(b) = e.sum.base {
                     if shared_base.is_some_and(|sb| sb != b) {
                         ok = false;
                         break;
                     }
                     shared_base = Some(b);
+                    let edge = (e.sum.offset, e.sum.spread);
+                    span = Some(span.map_or(edge, |s| stretch(s, edge)));
                 }
                 if let Some(d) = e.cycle
                     && d < my_depth
@@ -734,12 +1027,14 @@ impl<'a> Tracer<'a> {
             visiting.pop();
             let res = if ok {
                 if let Some(base) = shared_base {
+                    let (offset, spread) = span.unwrap_or((0, None));
                     Trace {
                         sum: Sum {
                             base: Some(base),
-                            offset: 0,
+                            offset,
                             dynamic: Some(v),
                             multi: true,
+                            spread: spread.filter(|_| !looped),
                         },
                         cycle: outer_cycle,
                     }
@@ -750,6 +1045,7 @@ impl<'a> Tracer<'a> {
                             offset: 0,
                             dynamic: None,
                             multi: true,
+                            spread: None,
                         },
                         cycle: Some(d),
                     }
@@ -776,6 +1072,7 @@ impl<'a> Tracer<'a> {
                         offset: x.sum.offset.wrapping_add(y.sum.offset),
                         dynamic: x.sum.dynamic.or(y.sum.dynamic),
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 };
@@ -793,6 +1090,7 @@ impl<'a> Tracer<'a> {
                     offset: p.sum.offset.wrapping_add(o.sum.offset),
                     dynamic,
                     multi,
+                    spread: p.sum.spread,
                 },
                 cycle: p.cycle,
             }
@@ -802,10 +1100,7 @@ impl<'a> Tracer<'a> {
             return (plain_dynamic, true);
         };
 
-        if let Some((_, f)) = self.valu_ops(v, &["v_mov_b32"])
-            && matches!(f.dst, Some(Operand::Vector { .. }))
-            && let Some(src_t) = f.src.first().and_then(|s| self.vterm(inst, s))
-        {
+        if let Some(src_t) = self.moved(v) {
             return (self.sum_rec(src_t, visiting, frames), true);
         }
 
@@ -829,6 +1124,7 @@ impl<'a> Tracer<'a> {
                         offset: inner.sum.offset,
                         dynamic: Some(v),
                         multi: true,
+                        spread: inner.sum.spread,
                     },
                     cycle: inner.cycle,
                 },
@@ -862,6 +1158,7 @@ impl<'a> Tracer<'a> {
                     offset: i32::from(*imm as i16) as u32,
                     dynamic: None,
                     multi: false,
+                    spread: Some(0),
                 },
                 cycle: None,
             };
@@ -892,6 +1189,7 @@ impl<'a> Tracer<'a> {
                                 offset: x.sum.offset.wrapping_shl(shift).wrapping_add(y.sum.offset),
                                 dynamic: None,
                                 multi: false,
+                                spread: Some(0),
                             },
                             cycle: None,
                         },
@@ -907,6 +1205,7 @@ impl<'a> Tracer<'a> {
                         offset: x.sum.offset.wrapping_shl(shift),
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 };
@@ -919,6 +1218,7 @@ impl<'a> Tracer<'a> {
                         offset: y.sum.offset,
                         dynamic: Some(v),
                         multi: true,
+                        spread: y.sum.spread,
                     },
                     cycle: y.cycle,
                 },
@@ -947,6 +1247,7 @@ impl<'a> Tracer<'a> {
                                     .wrapping_add(tb.sum.offset),
                                 dynamic: None,
                                 multi: false,
+                                spread: Some(0),
                             },
                             cycle: None,
                         },
@@ -962,6 +1263,7 @@ impl<'a> Tracer<'a> {
                         offset: ta.sum.offset.wrapping_shl(tsh.sum.offset & 31),
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 };
@@ -974,6 +1276,7 @@ impl<'a> Tracer<'a> {
                         offset: tb.sum.offset,
                         dynamic: Some(v),
                         multi: true,
+                        spread: tb.sum.spread,
                     },
                     cycle: tb.cycle,
                 },
@@ -1019,6 +1322,7 @@ impl<'a> Tracer<'a> {
                                 offset: m.sum.offset.wrapping_sub(s.sum.offset),
                                 dynamic: None,
                                 multi: false,
+                                spread: Some(0),
                             },
                             cycle: None,
                         },
@@ -1027,13 +1331,16 @@ impl<'a> Tracer<'a> {
                 }
                 return (plain_dynamic, true);
             }
+            // A constant taken off moves the constants; a run-time term
+            // taken off leaves nothing that bounds them.
             return (
                 Trace {
                     sum: Sum {
                         base: m.sum.base,
-                        offset: m.sum.offset,
+                        offset: m.sum.offset.wrapping_sub(s.sum.offset),
                         dynamic: Some(v),
                         multi: true,
+                        spread: m.sum.spread.filter(|_| s.sum.dynamic.is_none()),
                     },
                     cycle: m.cycle,
                 },
@@ -1064,6 +1371,7 @@ impl<'a> Tracer<'a> {
                         offset: p.sum.offset | c,
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                     cycle: None,
                 })
@@ -1092,8 +1400,17 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    /// A VGPR value's origin through `v_mov_b32` copies.
+    /// A VGPR value's origin through `v_mov_b32` copies, as every lane that
+    /// reads the register holds it: a copy made under an EXEC mask whose
+    /// other lanes go on to read the register ([`Self::kept`]) is not
+    /// followed.
     fn vorigin(&self, v: Value) -> Term {
+        self.copied(v, true)
+    }
+
+    /// A VGPR value's origin through `v_mov_b32` copies: with `every_lane`
+    /// as [`Self::vorigin`] gives it, else in the lanes that ran the copies.
+    fn copied(&self, v: Value, every_lane: bool) -> Term {
         if let Some(inst) = self.def(v)
             && inst.name() == "v_mov_b32"
             && let Fields::Valu(f) = &inst.fields
@@ -1101,7 +1418,13 @@ impl<'a> Tracer<'a> {
             && f.neg == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
-            && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
+            && !(every_lane && self.kept(v).is_some())
+            && let Some(t) = f.src.first().and_then(|s| match *s {
+                Operand::Vector { reg, .. } => {
+                    Some(self.copied(inst.read(Reg::V(reg))?, every_lane))
+                }
+                op => self.term(inst, &op),
+            })
         {
             return t;
         }
@@ -1148,6 +1471,7 @@ impl<'a> Tracer<'a> {
                         offset: off,
                         dynamic: None,
                         multi: false,
+                        spread: Some(0),
                     },
                 )
             }
@@ -1168,6 +1492,7 @@ impl<'a> Tracer<'a> {
             value: lo_val,
             base,
             extra_dynamic: extra.dynamic,
+            constant: s.spread.map(|spread| (s.offset, spread)),
         });
         let dynamic = if rel.is_some() {
             extra.dynamic.or(Some(lo_val))
@@ -1245,6 +1570,15 @@ impl<'a> Tracer<'a> {
         let Term::Value(v) = hi else {
             return false;
         };
+        // Lanes an EXEC mask left with the old high half use that one.
+        if let Some(old) = self.kept(v)
+            && !self.high_half(self.vorigin(old), high)
+        {
+            return false;
+        }
+        if let Some(src) = self.moved(v) {
+            return self.high_half(src, high);
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_addc_u32"])
             .map(|(_, t)| t)
@@ -1284,6 +1618,18 @@ impl<'a> Tracer<'a> {
             };
             if seen.contains(&v) {
                 return Carry::Cycle;
+            }
+            // Lanes an EXEC mask left with the old high half use that one.
+            if let Some(old) = t.kept(v) {
+                seen.push(v);
+                let old = rec(t, t.vorigin(old), want, seen);
+                seen.pop();
+                if old == Carry::No {
+                    return Carry::No;
+                }
+            }
+            if let Some(src) = t.moved(v) {
+                return rec(t, src, want, seen);
             }
             if let Some((phi_b, phi_i)) = t.phis[v.0 as usize] {
                 if t.p.blocks[phi_b].phis[phi_i].args.is_empty() {
@@ -1347,6 +1693,9 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
+        if self.mask_lost(v, &mut Vec::new()) {
+            return MASKED;
+        }
         if let Some(reg) = self.inputs[v.0 as usize] {
             return if self.param_of(reg).is_some() {
                 "an address from a root parameter that is no address"
@@ -1476,6 +1825,7 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                     multi: false,
+                    spread: Some(0),
                 },
             )?;
             return Ok(Source::Built {
@@ -1686,7 +2036,8 @@ impl<'a> Tracer<'a> {
     fn lane_term(&self, mut t: Term) -> Term {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
-            let next = self.vorigin(v);
+            // A descriptor's dwords, as the lanes that copied them hold them.
+            let next = self.copied(v, false);
             if next == t {
                 break;
             }
@@ -2311,6 +2662,33 @@ impl Tracer<'_> {
         .map(Some)
         .ok_or(())
     }
+}
+
+/// Whether `inst` reads VGPR value `x` as an operand, not only as the old
+/// value of a register it writes (which the lanes outside EXEC keep).
+fn operand(inst: &Inst, x: Value) -> bool {
+    let ops: Vec<&Operand> = match &inst.fields {
+        Fields::Valu(f)
+            if f.sdwa.is_none()
+                && f.dpp.is_none()
+                && !inst.name().starts_with("v_movrel")
+                && !inst.name().starts_with("v_swap")
+                && inst.name() != "v_writelane_b32" =>
+        {
+            f.src.iter().collect()
+        }
+        Fields::Flat {
+            addr, data, saddr, ..
+        } => [addr, data, saddr].into_iter().flatten().collect(),
+        // shortcut: any read by another instruction counts as one.
+        _ => return true,
+    };
+    ops.into_iter().any(|op| match *op {
+        Operand::Vector { reg, dwords } => {
+            (0..dwords).any(|k| inst.read(Reg::V(reg + k)) == Some(x))
+        }
+        _ => false,
+    })
 }
 
 /// A lane select given as a constant.
