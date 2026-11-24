@@ -1689,6 +1689,65 @@ mod tests {
         crate::dxbc::u32_at(psv0, 0).unwrap()
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn texture_array_lod_uses_only_spatial_coordinates() {
+        let target = sig_elem("SV_Target", 0, 16, 9, Some(0), 0, 4);
+        let output = container::signature(&[target], false);
+        // 1D array and 2D array.
+        for dim in [4, 5] {
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0
+                0xBE8C_0380, // s_mov_b32 s12, 0
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xBE8E_0380, // s_mov_b32 s14, 0
+                0xBE8F_0380, // s_mov_b32 s15, 0
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xF180_0100 | dim << 3,
+                0x0061_0300, // image_get_lod v3, v[0:2], s[4:11], s[12:15]
+                0xF800_180F,
+                0x0303_0303, // exp mrt0 v3, v3, v3, v3 done
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 8,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let shader = emit_synthetic(&[(FourCC::OSG1, &output)], &native).unwrap();
+            validate_if_available(&shader.dxil);
+        }
+    }
+
     #[test]
     fn compute_shader_implicit_sample_takes_quad_gradients_and_validates() {
         // Synthetic CS (8x8x1): loads a 2D texture SRV from a root table (s0)

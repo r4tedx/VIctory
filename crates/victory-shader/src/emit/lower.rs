@@ -8085,7 +8085,9 @@ impl<'a> Lower<'a> {
                 60
             };
             let mut cs = vec![fu; 4];
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes only spatial coordinates, even for an array.
+            let active_coords = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(active_coords) {
                 *slot = float(self, coord_at(k))?;
             }
             let mut cube_face = None;
