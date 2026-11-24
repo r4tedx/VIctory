@@ -1,6 +1,6 @@
 //! Review probes for traced buffer addresses: hand-assembled compute programs
 //! that read a root SRV (or a table descriptor) through one address shape
-//! each and store the dword they read to a UAV, compared with the dword the
+//! each and store what they read to a UAV, compared with the dwords the
 //! console would read (computed by hand from the same inputs).
 //!
 //! Layout: root constants in `s0..s3`, a table at `s4`, root SRV A in
@@ -80,14 +80,30 @@ struct Tables {
 }
 
 fn build(body: &[u32], tables: Option<&Tables>) -> Result<HostShader, String> {
+    build_with_threads(body, tables, 1)
+}
+
+fn build_with_threads(
+    body: &[u32],
+    tables: Option<&Tables>,
+    threads: u32,
+) -> Result<HostShader, String> {
     let mut words = Vec::new();
+    let mut store = buffer_store_dword(0, 12, 0);
+    if threads > 1 {
+        // v0 starts as the thread id in X. v7 is reserved for its byte
+        // offset in the output UAV before the body puts the result in v0.
+        words.push(vop2(0x1A, 7, 0x82, 0)); // v_lshlrev_b32 v7, 2, v0
+        store[0] |= 1 << 12; // offen
+        store[1] |= 7;       // vaddr = v7
+    }
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_x4(12, 4, 125, tables.map_or(0, |t| t.out)));
     for i in 0..4u8 {
         words.push(vop1(0x001, i + 1, sgpr(i)));
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let rp = |root, user_data, sgprs, slot| RootParam {
@@ -140,7 +156,7 @@ fn build(body: &[u32], tables: Option<&Tables>) -> Result<HostShader, String> {
         used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 12 << 1,
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -173,6 +189,27 @@ fn run(
     views: &[View],
     out_view: usize,
 ) -> Vec<(&'static str, [u32; 4], Result<u32, String>)> {
+    run_with_readback(shader, cases, views, |o| match out_view {
+        // The root UAV: the index of the one dword written, and
+        // the dword, as `index << 24 | low bits`.
+        usize::MAX => {
+            let c = o.last().expect("a root UAV");
+            let hits: Vec<usize> = (0..c.len()).filter(|&k| c[k] != 0).collect();
+            match hits[..] {
+                [k] => (k as u32) << 24 | (c[k] & 0xFF_FFFF),
+                _ => u32::MAX,
+            }
+        }
+        k => o[k][0],
+    })
+}
+
+fn run_with_readback<T>(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    views: &[View],
+    readback: impl Fn(Vec<Vec<u32>>) -> T,
+) -> Vec<(&'static str, [u32; 4], Result<T, String>)> {
     assert!(shader.root_cbvs.is_empty(), "unexpected root CBV");
     let a: Vec<u32> = (0..DWORDS).map(A).collect();
     let b: Vec<u32> = (0..DWORDS).map(B).collect();
@@ -233,19 +270,7 @@ fn run(
                         groups: [1, 1, 1],
                     },
                 )
-                .map(|o| match out_view {
-                    // The root UAV: the index of the one dword written, and
-                    // the dword, as `index << 24 | low bits`.
-                    usize::MAX => {
-                        let c = o.last().expect("a root UAV");
-                        let hits: Vec<usize> = (0..c.len()).filter(|&k| c[k] != 0).collect();
-                        match hits[..] {
-                            [k] => (k as u32) << 24 | (c[k] & 0xFF_FFFF),
-                            _ => u32::MAX,
-                        }
-                    }
-                    k => o[k][0],
-                });
+                .map(&readback);
             out.push((label, inputs, r));
         }
     }
@@ -717,11 +742,11 @@ fn address_shape_probes() {
     assert!(wrong.is_empty(), "probes with wrong results: {wrong:#?}");
 }
 
-/// Prints one row per probe result and returns whether every dword matched.
-fn report(
+/// Prints one row per probe result and returns whether every read matched.
+fn report<T: PartialEq + std::fmt::Debug>(
     name: &str,
-    rows: Vec<(&'static str, [u32; 4], Result<u32, String>)>,
-    want: impl Fn([u32; 4]) -> u32,
+    rows: Vec<(&'static str, [u32; 4], Result<T, String>)>,
+    want: impl Fn([u32; 4]) -> T,
 ) -> bool {
     let mut ok = true;
     let mut detail = Vec::new();
@@ -730,7 +755,7 @@ fn report(
             Ok(got) => {
                 let want = want(inputs);
                 ok &= got == want;
-                detail.push(format!("{label} {inputs:?}: got {got:#010x} want {want:#010x}"));
+                detail.push(format!("{label} {inputs:?}: got {got:08x?} want {want:08x?}"));
             }
             Err(e) => {
                 ok = false;
@@ -746,26 +771,38 @@ fn report(
     ok
 }
 
-/// A VGPR address pair written under an EXEC mask: lanes where `s0 == 0`
-/// take `A + s1 (+ s3)`, the others keep `B + s2`. The console reads B in
-/// the lanes the mask leaves out.
-fn exec_masked_select(two_terms: bool) -> Vec<u32> {
-    let add_b = vop3b(0x30F, 5, 106, sgpr(8), vgpr(3), 0); // v5 = B.lo + s2
-    let ci_b = vop3b(0x128, 6, 106, sgpr(9), 0x80, sgpr(106)); // v6 = B.hi + carry
-    let cmp = 0x7C00_0000 | 0xC2 << 17 | 1 << 9 | 0x80; // v_cmp_eq_u32 vcc, 0, v1
-    let save = 0xBE80_0000 | 20 << 16 | 0x3C << 8 | 0x6A; // s_and_saveexec_b32 s20, vcc_lo
+fn assert_reason(name: &str, why: &str, reason: &str) {
+    eprintln!("PROBE | {name} | REFUSED | {why}");
+    assert!(why.contains(reason), "{name}: expected {reason:?}, got {why}");
+}
+
+/// Save EXEC in s20 and leave only lanes where `vsrc == 0` active.
+fn exec_if_zero(vsrc: u8) -> [u32; 2] {
+    [
+        0x7C00_0000 | 0xC2 << 17 | (vsrc as u32) << 9 | 0x80, // v_cmp_eq_u32 vcc, 0, vsrc
+        0xBE80_0000 | 20 << 16 | 0x3C << 8 | 0x6A,           // s_and_saveexec_b32 s20, vcc_lo
+    ]
+}
+
+const RESTORE_EXEC: u32 = sop2(0x10, 126, 126, 20); // s_or_b32 exec_lo, exec_lo, s20
+const MASKED: &str = "an address written under an EXEC mask over another base";
+
+/// Lanes selected by EXEC take `A + s1 (+ s3)`. The others keep the old
+/// address, `old_base + s2`, where `old_base` names root SRV A or B.
+fn exec_masked_select(two_terms: bool, old_base: u8, mask_vgpr: u8) -> Vec<u32> {
+    let add_old = vop3b(0x30F, 5, 106, sgpr(old_base), vgpr(3), 0);
+    let ci_old = vop3b(0x128, 6, 106, sgpr(old_base + 1), 0x80, sgpr(106));
     let add_a = vop3b(0x30F, 5, 106, sgpr(6), vgpr(2), 0); // v5 = A.lo + s1
     let ci_a = vop3b(0x128, 6, 106, sgpr(7), 0x80, sgpr(106)); // v6 = A.hi + carry
     let more = vop2(0x25, 5, vgpr(4), 5); // v5 = s3 + v5
-    let restore = sop2(0x10, 126, 126, 20); // s_or_b32 exec_lo, exec_lo, s20
     let load = global_load_dword(0, 5, 125, 0);
-    let mut w = vec![
-        add_b[0], add_b[1], ci_b[0], ci_b[1], cmp, save, add_a[0], add_a[1], ci_a[0], ci_a[1],
-    ];
+    let mut w = vec![add_old[0], add_old[1], ci_old[0], ci_old[1]];
+    w.extend(exec_if_zero(mask_vgpr));
+    w.extend([add_a[0], add_a[1], ci_a[0], ci_a[1]]);
     if two_terms {
         w.push(more);
     }
-    w.extend([restore, load[0], load[1]]);
+    w.extend([RESTORE_EXEC, load[0], load[1]]);
     w
 }
 
@@ -774,11 +811,12 @@ const MASK_CASES: [[u32; 4]; 4] = [[0, 8, 20, 4], [0, 0, 0, 0], [1, 8, 20, 4], [
 /// One computed term: the shape the tracer took before the change too.
 #[test]
 fn exec_masked_address_one_term() {
-    match build(&exec_masked_select(false), None) {
-        Err(why) => eprintln!("PROBE | exec-masked A + s1 over B + s2 | REFUSED | {why}"),
+    let name = "exec-masked A + s1 over B + s2";
+    match build(&exec_masked_select(false, 8, 1), None) {
+        Err(why) => assert_reason(name, &why, MASKED),
         Ok(shader) => {
             let rows = run(&shader, &MASK_CASES, &[View::RawUav(1)], 0);
-            let ok = report("exec-masked A + s1 over B + s2", rows, |i| {
+            let ok = report(name, rows, |i| {
                 if i[0] == 0 { A(i[1] / 4) } else { B(i[2] / 4) }
             });
             assert!(ok, "the lanes the mask leaves out read the wrong buffer");
@@ -789,11 +827,12 @@ fn exec_masked_address_one_term() {
 /// Two computed terms: a shape only the wider tracer takes.
 #[test]
 fn exec_masked_address_two_terms() {
-    match build(&exec_masked_select(true), None) {
-        Err(why) => eprintln!("PROBE | exec-masked (A + s1) + s3 over B + s2 | REFUSED | {why}"),
+    let name = "exec-masked (A + s1) + s3 over B + s2";
+    match build(&exec_masked_select(true, 8, 1), None) {
+        Err(why) => assert_reason(name, &why, MASKED),
         Ok(shader) => {
             let rows = run(&shader, &MASK_CASES, &[View::RawUav(1)], 0);
-            let ok = report("exec-masked (A + s1) + s3 over B + s2", rows, |i| {
+            let ok = report(name, rows, |i| {
                 if i[0] == 0 { A((i[1] + i[3]) / 4) } else { B(i[2] / 4) }
             });
             assert!(ok, "the lanes the mask leaves out read the wrong buffer");
@@ -814,7 +853,12 @@ fn table_range(kind: ResourceType, at: u32, stride: u32) -> UsedResource {
     }
 }
 
-fn table_probe(name: &str, body: &[u32], cases: &[[u32; 4]], want: impl Fn([u32; 4]) -> u32) {
+fn table_probe(
+    name: &str,
+    body: &[u32],
+    cases: &[[u32; 4]],
+    want: impl Fn([u32; 4]) -> u32,
+) -> Result<(), String> {
     let tables = Tables {
         used: vec![
             table_range(ResourceType::Srv, 0, 8),
@@ -823,6 +867,7 @@ fn table_probe(name: &str, body: &[u32], cases: &[[u32; 4]], want: impl Fn([u32;
         ],
         out: 96,
     };
+    let shader = build(body, Some(&tables))?;
     let decoy: Vec<u32> = (0..DWORDS).map(|i| 0xDEC0_0000 + i).collect();
     let x: Vec<u32> = (0..DWORDS).map(|i| 0x1111_0000 + i).collect();
     let y: Vec<u32> = (0..DWORDS).map(|i| 0x2222_0000 + i).collect();
@@ -841,14 +886,10 @@ fn table_probe(name: &str, body: &[u32], cases: &[[u32; 4]], want: impl Fn([u32;
         },
         View::RawUav(1),
     ];
-    match build(body, Some(&tables)) {
-        Err(why) => eprintln!("PROBE | {name} | REFUSED | {why}"),
-        Ok(shader) => {
-            let rows = run(&shader, cases, &views, 0);
-            let ok = report(name, rows, want);
-            assert!(ok, "the descriptor was read with another range's record size");
-        }
-    }
+    let rows = run(&shader, cases, &views, 0);
+    let ok = report(name, rows, want);
+    assert!(ok, "the descriptor was read with another range's record size");
+    Ok(())
 }
 
 /// A table descriptor whose address two edges join: `table + 32` or
@@ -869,7 +910,8 @@ fn table_descriptor_joined_by_a_phi_keeps_its_range() {
         &body,
         &[[0, 0, 0, 0], [0, 1, 0, 0], [1, 2, 0, 0], [1, 3, 0, 0]],
         |i| (if i[0] == 0 { 0x2222_0000 } else { 0x1111_0000 }) + i[1] * 4,
-    );
+    )
+    .expect("the joined descriptor stays in one table range");
 }
 
 /// The same table descriptor through two computed terms: `(T + 32 + s2) + s3`.
@@ -892,7 +934,8 @@ fn table_descriptor_with_two_terms_keeps_its_range() {
         &body,
         &[[0, 0, 0, 0], [0, 1, 0, 0], [0, 2, 32, 0], [0, 3, 16, 16]],
         |i| (if i[2] + i[3] == 32 { 0x2222_0000 } else { 0x1111_0000 }) + i[1] * 4,
-    );
+    )
+    .expect("the descriptor with two computed terms stays in one table range");
 }
 
 /// The one-term form of the same descriptor, which the tracer took before:
@@ -910,12 +953,15 @@ fn table_descriptor_with_one_term_keeps_its_range() {
         b[0],
         b[1],
     ];
-    table_probe(
-        "table: (T + 32) + s2, 16-byte records, element s1",
+    let name = "table: (T + 32) + s2, 16-byte records, element s1";
+    if let Err(why) = table_probe(
+        name,
         &body,
         &[[0, 0, 0, 0], [0, 1, 0, 0], [0, 2, 32, 0], [0, 3, 32, 0]],
         |i| (if i[2] == 32 { 0x2222_0000 } else { 0x1111_0000 }) + i[1] * 4,
-    );
+    ) {
+        eprintln!("PROBE | {name} | REFUSED | {why}");
+    }
 }
 
 /// A root UAV written through `(C + s0) + s1` with a VGPR offset `s2`:
@@ -947,4 +993,69 @@ fn root_uav_store_through_two_terms_and_a_vgpr_offset() {
             assert!(ok, "the store landed on another dword");
         }
     }
+}
+
+/// The two edges name buffers with different record sizes. No single range
+/// supplies a stride for the joined indexed load.
+#[test]
+fn table_descriptor_joined_by_a_phi_crosses_ranges() {
+    let l = s_load_x4(24, 20, 125, 0);
+    let b = buffer_load_dword_idx(0, 2, 24); // index v2 = s1
+    let body = [
+        diamond(&[sop2(0x00, 20, 4, 0x80)], &[sop2(0x00, 20, 4, 0xA0)]),
+        vec![s_mov_b32(21, 0x80), l[0], l[1], b[0], b[1]],
+    ]
+    .concat();
+    let name = "table: phi(T, T + 32), 8- and 16-byte records, element s1";
+    let why = table_probe(name, &body, &[[0, 2, 0, 0], [1, 2, 0, 0]], |i| {
+        if i[0] == 0 { 0x1111_0000 + i[1] * 4 } else { 0xDEC0_0000 + i[1] * 2 }
+    })
+    .expect_err("the phi names two table ranges");
+    assert_reason(name, &why, "a table descriptor at an address that does not settle its range");
+}
+
+/// Runs two lanes of one group and compares their outputs in thread-id order.
+fn two_lane_probe(name: &str, body: &[u32], want: impl Fn([u32; 4]) -> [u32; 2]) {
+    let shader = build_with_threads(body, None, 2)
+        .unwrap_or_else(|why| panic!("{name}: {why}"));
+    let cases = [[0, 8, 20, 4], [0, 16, 12, 8]];
+    let rows = run_with_readback(&shader, &cases, &[View::RawUav(2)], |o| [o[0][0], o[0][1]]);
+    assert!(report(name, rows, want), "a lane read the wrong dword");
+}
+
+/// Lane 0 takes `A + s1` and lane 1 keeps `A + s2`.
+#[test]
+fn exec_masked_address_one_term_keeps_the_same_base() {
+    two_lane_probe(
+        "exec-masked A + s1 over A + s2",
+        &exec_masked_select(false, 6, 0),
+        |i| [A(i[1] / 4), A(i[2] / 4)],
+    );
+}
+
+/// Lane 0 takes `(A + s1) + s3` and lane 1 keeps `A + s2` across both writes.
+#[test]
+fn exec_masked_address_two_terms_keeps_the_same_base() {
+    two_lane_probe(
+        "exec-masked (A + s1) + s3 over A + s2",
+        &exec_masked_select(true, 6, 0),
+        |i| [A((i[1] + i[3]) / 4), A(i[2] / 4)],
+    );
+}
+
+/// Both lanes load through the unmasked address `A + s3`. The separate VGPR
+/// byte offset is plain data: lane 0 takes `s2` and lane 1 keeps `s1`.
+#[test]
+fn exec_masked_data_is_a_plain_offset() {
+    let mut body = vec![
+        sop2(0x00, 16, 6, 3),    // s16 = A.lo + s3
+        sop2(0x04, 17, 7, 0x80), // s17 = A.hi + carry
+        vop1(0x001, 5, vgpr(2)), // v5 = s1
+    ];
+    body.extend(exec_if_zero(0));
+    body.extend([vop1(0x001, 5, vgpr(3)), RESTORE_EXEC]); // v5 = s2 in lane 0
+    body.extend(global_load_dword(0, 5, 16, 0));
+    two_lane_probe("exec-masked data offset beside A + s3", &body, |i| {
+        [A((i[2] + i[3]) / 4), A((i[1] + i[3]) / 4)]
+    });
 }
