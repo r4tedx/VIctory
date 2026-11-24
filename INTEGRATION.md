@@ -39,6 +39,10 @@ turned down upstream.
   UAVs) and #346 (indirect rectangle draws). **With it the title's
   instance-culling compute programs translate for the first time: read
   "What update 9 changes at run time" before comparing runs.**
+- Update 10 adds wave64 compute groups of more than 64 threads on
+  32-lane cards (one host group per console wave; direct dispatches
+  only). 20 more compute programs validate, most of them cascade-shadow
+  programs; none is lost.
 
 ## What update 9 changes at run time
 
@@ -57,6 +61,14 @@ and the run ended in `DEVICE_HUNG` after 111 s on a compute dispatch,
 where the tree without #704 held 600 to 900 s on other cards. That is
 one run of another integration, taken before the zero-element guard
 below, so it shows a direction to check, not a fault of this update.
+
+A second report, on an RTX 5080 (MichonGoddijn231849, issue #841): an
+older branch with the same additions as update 9, on this tree at update
+5, hung about a minute into the world at a mesh dispatch (mesh
+`51ff151f75cd5759`, pixel `7fe75645c406cac6`), where the tree at update
+5 alone ran about six minutes. Both programs translate without update
+9's additions, so it is not known which addition brings the hang back.
+Update 9 has not been run there.
 
 If a run at update 9 ends sooner than one at update 8:
 
@@ -418,6 +430,8 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 10, one run of the same command: 526 passed, 0 failed, 7
+  ignored.
 - At update 9, one run of the same command: 525 passed, 0 failed, 7
   ignored.
 - At update 8, one run of the same command with the machine at 100% CPU
@@ -654,6 +668,17 @@ is described in its merge or fix commit.
   lane mask's dword undefined at a data join) is **not** in the tree:
   it turned refusals into modules by handing out an undefined value
   where the console uses the mask's value.
+- **Groups of several console waves (update 10):** the wave64 work's
+  `shader/wave-per-group` at `252a095`, taken as the difference from the
+  stack's head and applied three-way, because the stack is not a merge
+  parent of this tree. A wave64 compute program whose group is several
+  console waves runs as one host group of 64 threads per wave, and a
+  dispatch of (x, y, z) groups runs (x * waves, y, z). An indirect
+  dispatch of such a shader is still dropped, and the title sends its
+  cascade-shadow passes through indirect execution (a tester on #439),
+  so this update alone will not make those passes run. Programs that
+  need LDS or a barrier across the group's waves stay refused (20 of
+  the 43 that were stopped for group size validate now).
 - **The black-scene branch (update 9)** came in as one merge of work
   built on this tree at update 5; its own merge commits say what each
   PR's conflicts were. In short: #294's root views keep #493's tables
