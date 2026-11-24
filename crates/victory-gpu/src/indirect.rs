@@ -99,17 +99,31 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint cost = g.x * g.y * g.z * 64;
         if (cost != 0) {
             // Charge only records authorized by the count buffer and reserve
-            // their actual host work without wrapping the shared budget.
+            // their actual host work without wrapping the shared budget (a
+            // plain InterlockedAdd can: thousands of records in flight at up
+            // to 2^26 each pass 2^32). Each retry expects the value the last
+            // exchange observed, never a plain load: a load of this UAV may
+            // return a stale value every time, and the loop then never ends.
+            // The retries are bounded so that termination does not rest on
+            // the hardware's forward progress; a record that runs out of
+            // them is refused, like one past the budget.
+            uint used = 0;
+            bool charged = false;
             [allow_uav_condition]
-            while (true) {
-                uint used = budget.Load(0);
+            for (uint attempt = 0; attempt < 1024; attempt++) {
                 if (used >= BUDGET || cost > BUDGET - used) {
-                    g = 0;
                     break;
                 }
                 uint observed;
                 budget.InterlockedCompareExchange(0, used, used + cost, observed);
-                if (observed == used) break;
+                if (observed == used) {
+                    charged = true;
+                    break;
+                }
+                used = observed;
+            }
+            if (!charged) {
+                g = 0;
             }
         }
     }
