@@ -167,6 +167,18 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
     }
 }
 
+/// The dwords a `*_dword` load names by its suffix (`""`, `"x2"`, ...).
+fn dword_count(suffix: Option<&str>) -> Result<u32, Why> {
+    match suffix {
+        Some("") => Ok(1),
+        Some("x2") => Ok(2),
+        Some("x4") => Ok(4),
+        Some("x8") => Ok(8),
+        Some("x16") => Ok(16),
+        _ => Err("a scalar load"),
+    }
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -265,6 +277,9 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Loads at a constant byte of a buffer descriptor's own memory
+    /// ([`crate::resource::Resources::base_reads`]).
+    base_reads: HashMap<Site, u32>,
     scalar_descriptor_data: bool,
     /// Loads whose reconstructed descriptor has a scalar buffer user.
     scalar_buffer_views: HashMap<(Site, u8), (u32, u32)>,
@@ -934,6 +949,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            base_reads: x.res.base_reads.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1114,6 +1130,19 @@ impl<'a> Lower<'a> {
             "sshort" => (1, Some((16, true))),
             _ => return Err(name),
         };
+        if let Some(&at) = self.base_reads.get(&(b, i)) {
+            let Some(Operand::Vector { reg, .. }) = *dst else {
+                return Err("a global load result");
+            };
+            if sub.is_some() {
+                return Err(name);
+            }
+            let guard = self.guard(b, i)?;
+            for (k, x) in self.base_read((b, i), at, n)?.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let a = *self
             .scalar
             .get(&(b, i))
@@ -4016,6 +4045,16 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&at) = self.base_reads.get(&site) {
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err("a scalar load");
+            };
+            let count = dword_count(name.strip_prefix("s_load_dword"))?;
+            for (k, x) in self.base_read(site, at, count)?.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -5362,6 +5401,43 @@ impl<'a> Lower<'a> {
     /// the range the constant part of its address lies in (a computed term
     /// indexes within the range). Fails where an address recomputed at the
     /// use does not settle one ([`TABLE_RANGE`]).
+    /// `count` dwords at byte `at` of the buffer the load at `site` names
+    /// by its descriptor's base, through a raw view of it.
+    fn base_read(&mut self, site: Site, at: u32, count: u32) -> Result<Vec<V>, Why> {
+        let src = self
+            .descriptors
+            .get(&(site, false))
+            .copied()
+            .ok_or("an untracked descriptor")?;
+        let uav = match self.used_kind(src)?.map(|u| u.kind) {
+            Some(ResourceType::Srv) => 0,
+            Some(ResourceType::Uav) => 0x1000,
+            _ => return Err("a load from the memory of a descriptor that is no buffer view"),
+        };
+        let h = self.handle(site, src, false, (11 | uav, 0))?;
+        let c = self.cur;
+        let mut out = Vec::new();
+        for k in 0..count {
+            let byte = self.s.m.i32(at + 4 * k);
+            let (u, mask, al) = (
+                self.s.m.undef(self.s.t.i32),
+                self.s.m.i8(1),
+                self.s.m.i32(4),
+            );
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            out.push(self.as_int(x));
+        }
+        Ok(out)
+    }
+
     fn used_kind(&self, src: &Source) -> Result<Option<&'a UsedResource>, Why> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src

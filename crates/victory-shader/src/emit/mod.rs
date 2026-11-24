@@ -1248,6 +1248,99 @@ mod tests {
         }
     }
 
+    /// Loads at a buffer descriptor's base plus a constant read that
+    /// buffer: byte 12 by a scalar load (the base shifted out and back),
+    /// byte 16 by a global load (the base masked), stored to a UAV.
+    #[test]
+    fn loads_at_a_descriptors_base_read_its_buffer() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF408_0100, 0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0
+            0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+            0x9088_8804, // s_lshr_b64 s[8:9], s[4:5], 8
+            0xBE8A_0308, // s_mov_b32 s10, s8
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x8F8A_880A, // s_lshl_b64 s[10:11], s[10:11], 8
+            0x880A_8C0A, // s_or_b32 s10, s10, 12
+            0xF400_0405, 0xFA00_0000, // s_load_dword s16, s[10:11], null
+            0x8711_FF04, 0xFFFF_FF00, // s_and_b32 s17, s4, 0xffffff00
+            0x8712_FF05, 0x0000_00FF, // s_and_b32 s18, s5, 0xff
+            0x8811_9011, // s_or_b32 s17, s17, 16
+            0x7E04_0211, // v_mov_b32 v2, s17
+            0x7E06_0212, // v_mov_b32 v3, s18
+            0xDC30_8000, 0x017D_0002, // global_load_dword v1, v[2:3], off
+            0x7E00_0210, // v_mov_b32 v0, s16
+            0xE070_0000, 0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
+            0xE070_0004, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let input = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                input,
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    table_offset_dwords: 8,
+                    ..input
+                },
+            ],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let cs = emit_synthetic(&[], &native).unwrap();
+        #[cfg(windows)]
+        {
+            use super::host::{Dispatch, Host, Root, Stride, View};
+            validate_if_available(&cs.dxil);
+            for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {backend} device; skipped dispatch");
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(table_user_data(&cs, 32, 3)))],
+                            views: &[
+                                View::Buffer { data: &[0; 8], stride: Stride::Raw },
+                                View::Buffer { data: &[11, 22, 33, 44, 55, 66], stride: Stride::Raw },
+                                View::RawUav(2),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(out, [vec![44, 55]], "{backend}");
+                eprintln!("{backend}: read 44 and 55 at the descriptor's base");
+            }
+        }
+    }
+
     #[test]
     fn scalar_buffer_descriptor_data_requires_a_known_buffer_view() {
         use crate::ResourceType::{Cbv, Srv};

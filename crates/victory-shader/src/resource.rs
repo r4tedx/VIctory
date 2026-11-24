@@ -136,6 +136,11 @@ pub struct Resources {
     /// Root arguments: value on entry, layout index, dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Loads (`s_load_dword*`, `global_load_dword*`) whose address is a
+    /// buffer descriptor's base plus a constant: the site and the byte
+    /// offset in that buffer. Each has its descriptor in [`Self::descriptors`]
+    /// at the same site, and no entry in [`Self::scalar`].
+    pub base_reads: Vec<(Site, u32)>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -274,12 +279,32 @@ fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) => {
+                            let (source, at) = t.smem_base_read(inst).ok_or_else(|| fail(why))?;
+                            out.descriptors.push(Descriptor {
+                                site,
+                                role: Role::Resource,
+                                source,
+                            });
+                            out.base_reads.push((site, at));
+                        }
+                    }
                 }
                 Fields::Flat { .. } if inst.name().starts_with("global_") => {
-                    let address = t.flat_address(site).map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.flat_address(site) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) => {
+                            let (source, at) = t.flat_base_read(inst).ok_or_else(|| fail(why))?;
+                            out.descriptors.push(Descriptor {
+                                site,
+                                role: Role::Resource,
+                                source,
+                            });
+                            out.base_reads.push((site, at));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1868,6 +1893,149 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra, None)
     }
 
+    /// [`Self::base_read`] for a scalar load: no offset register.
+    fn smem_base_read(&self, inst: &Inst) -> Option<(Source, u32)> {
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            offset,
+            soffset: Operand::Scalar { code: NULL, .. },
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        if !inst.name().starts_with("s_load_dword") {
+            return None;
+        }
+        let lo = self.origin(inst.read(Reg::S(*code))?);
+        let hi = self.origin(inst.read(Reg::S(code + 1))?);
+        let (source, at) = self.base_read(lo, hi)?;
+        Some((source, at.checked_add(u32::try_from(*offset).ok()?)?))
+    }
+
+    /// [`Self::base_read`] for a global load from a VGPR pair.
+    fn flat_base_read(&self, inst: &Inst) -> Option<(Source, u32)> {
+        let Fields::Flat {
+            addr: Some(Operand::Vector { reg, .. }),
+            saddr,
+            offset,
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        let no_saddr = match saddr {
+            None => true,
+            Some(Operand::Scalar { code, .. }) => *code == NULL,
+            Some(_) => false,
+        };
+        if !inst.name().starts_with("global_load_dword") || !no_saddr {
+            return None;
+        }
+        let lo = self.vorigin(inst.read(Reg::V(*reg))?);
+        let hi = self.vorigin(inst.read(Reg::V(reg + 1))?);
+        let (source, at) = self.base_read(lo, hi)?;
+        Some((source, at.checked_add(u32::try_from(*offset).ok()?)?))
+    }
+
+    /// An address built from a buffer descriptor's base: its dwords 0 and 1
+    /// (the 48-bit base) with the low byte cleared, the bits past 40
+    /// dropped, and a constant below 256 OR-ed in. The console compiler
+    /// builds it with 64-bit shifts, `((d1:d0) >> 8) << 8`, or with masks,
+    /// `d0 & 0xffffff00` and `d1 & 0xff`. Returns the descriptor's source
+    /// and the constant: the byte the load reads in that buffer.
+    // shortcut: the buffer's base is taken to be 256-byte aligned and below
+    // 2^40, so the address is the base plus the constant. A load past the
+    // buffer's records reads zero, not the memory that follows.
+    fn base_read(&self, lo: Term, hi: Term) -> Option<(Source, u32)> {
+        let (lo, hi) = (self.uniform(lo), self.uniform(hi));
+        let Term::Value(lo) = lo else { return None };
+        let (_, [x, c]) = self.sop2(lo, &["s_or_b32"])?;
+        let (x, c) = (self.uniform(x), self.uniform(c));
+        let (x, at) = match (x, c) {
+            (Term::Value(x), Term::Const(c)) | (Term::Const(c), Term::Value(x)) => (x, c),
+            _ => return None,
+        };
+        if at >= 256 || at % 4 != 0 {
+            return None;
+        }
+        let words = self
+            .shifted_base(x, hi)
+            .or_else(|| self.masked_base(x, hi))?;
+        match self.loaded(&words)? {
+            source @ Source::Loaded { first, .. } if first % 4 == 0 => Some((source, at)),
+            _ => None,
+        }
+    }
+
+    /// The two 32-bit halves `inst` (named `name`) shifts by 8.
+    fn shifted_by_8(&self, inst: &Inst, name: &str) -> Option<[Term; 2]> {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        if inst.name() != name || self.term(inst, src.get(1)?)? != Term::Const(8) {
+            return None;
+        }
+        let Operand::Scalar { code, .. } = *src.first()? else {
+            return None;
+        };
+        Some([
+            self.uniform(self.origin(inst.read(Reg::S(code))?)),
+            self.uniform(self.origin(inst.read(Reg::S(code + 1))?)),
+        ])
+    }
+
+    /// `t` through lane reads of a VGPR every lane holds it in (a scalar
+    /// copied with `v_mov_b32`, then read back with `v_readlane_b32`).
+    fn uniform(&self, mut t: Term) -> Term {
+        while let Term::Value(v) = t
+            && let Some((x, true)) = self.lane_read(v)
+        {
+            t = x;
+        }
+        t
+    }
+
+    /// `[x:hi] = [a:0] << 8` with `a` the low dword of `[d0:d1] >> 8`.
+    fn shifted_base(&self, x: Value, hi: Term) -> Option<[Term; 2]> {
+        let shl = self.def(x)?;
+        if shl.writes.first()?.1 != x || hi != Term::Value(shl.writes.get(1)?.1) {
+            return None;
+        }
+        let [Term::Value(a), Term::Const(0)] = self.shifted_by_8(shl, "s_lshl_b64")? else {
+            return None;
+        };
+        let shr = self.def(a)?;
+        if shr.writes.first()?.1 != a {
+            return None;
+        }
+        let [d0, d1] = self.shifted_by_8(shr, "s_lshr_b64")?;
+        // Only the low byte of dword 1 reaches the address.
+        Some([d0, self.unmasked(d1, 0xff)])
+    }
+
+    /// `x = d0 & 0xffffff00` and `hi = d1 & 0xff`.
+    fn masked_base(&self, x: Value, hi: Term) -> Option<[Term; 2]> {
+        let (_, [d0, m0]) = self.sop2(x, &["s_and_b32"])?;
+        let hi = self.uniform(hi);
+        let Term::Value(hi) = hi else { return None };
+        let (_, [d1, m1]) = self.sop2(hi, &["s_and_b32"])?;
+        (m0 == Term::Const(0xffff_ff00) && m1 == Term::Const(0xff))
+            .then(|| [self.uniform(d0), self.uniform(d1)])
+    }
+
+    /// `t` before an `s_and_b32` that keeps at least the bits of `keep`.
+    fn unmasked(&self, t: Term, keep: u32) -> Term {
+        if let Term::Value(v) = t
+            && let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
+                self.sop2(v, &["s_and_b32"])
+            && m & keep == keep
+        {
+            return x;
+        }
+        t
+    }
+
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
     fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
@@ -2999,6 +3167,68 @@ pub(crate) mod tests {
             try_track_words(&words, &layout, HwStage::Cs),
             Err(ShaderError::Unsupported { what: MASKED, .. })
         ));
+    }
+
+    /// Loads at a buffer descriptor's base plus a constant, as the console
+    /// compiler forms the address: with 64-bit shifts for a scalar load,
+    /// with masks for a global load.
+    fn base_read_words(high: u32) -> Vec<u32> {
+        vec![
+            0xBE82_0308, // s_mov_b32 s2, s8
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000,        // s_load_dwordx4 s[4:7], s[2:3], null
+            0x9088_8804,        // s_lshr_b64 s[8:9], s[4:5], 8
+            0xBE8A_0308,        // s_mov_b32 s10, s8
+            0xBE8B_0300 | high, // s_mov_b32 s11, high
+            0x8F8A_880A,        // s_lshl_b64 s[10:11], s[10:11], 8
+            0x880A_B00A,        // s_or_b32 s10, s10, 48
+            0xF400_0305,
+            0xFA00_0000, // s_load_dword s12, s[10:11], null
+            0x870D_FF04,
+            0xFFFF_FF00, // s_and_b32 s13, s4, 0xffffff00
+            0x870E_FF05,
+            0x0000_00FF, // s_and_b32 s14, s5, 0xff
+            0x880D_B40D, // s_or_b32 s13, s13, 52
+            0x7E00_020D, // v_mov_b32 v0, s13
+            0x7E02_020E, // v_mov_b32 v1, s14
+            0xDC30_8000,
+            0x027D_0000, // global_load_dword v2, v[0:1], off
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn loads_at_a_descriptors_base_read_its_buffer() {
+        let r = track_words(&base_read_words(0x80), &[param(Table, 8, 1)], HwStage::Ps);
+        let p = crate::ir::build(
+            &base_read_words(0x80)
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
+            false,
+            256,
+        )
+        .unwrap();
+        let named = |site: Site| p.blocks[site.0].insts[site.1].name();
+        let reads: Vec<_> = r.base_reads.iter().map(|&(s, at)| (named(s), at)).collect();
+        assert_eq!(reads, [("s_load_dword", 48), ("global_load_dword", 52)]);
+        let loaded = Source::Loaded {
+            load: (0, 2),
+            first: 0,
+        };
+        for &(site, _) in &r.base_reads {
+            assert!(r.descriptors.contains(&super::Descriptor {
+                site,
+                role: Role::Resource,
+                source: loaded.clone(),
+            }));
+            assert!(r.scalar.iter().all(|s| s.0 != site));
+        }
+        // A high half that is not zero before the shift is no base.
+        assert!(
+            try_track_words(&base_read_words(0x81), &[param(Table, 8, 1)], HwStage::Ps).is_err()
+        );
     }
 
     #[test]
