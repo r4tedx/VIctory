@@ -282,6 +282,9 @@ enum Flags {
     Set(u32, u32),
     /// Dword 1 from a user SGPR: no constant.
     Computed,
+    /// Dword 1 the bit reverse of 1 (box sorting, no growing), dword 3
+    /// this constant.
+    Reversed(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -408,6 +411,10 @@ fn program(form: &Form) -> crate::NativeProgram {
         }
         // s_mov_b32 s5, s0
         Flags::Computed => w.push(0xBE80_0300 | u32::from(BVH + 1) << 16),
+        Flags::Reversed(d3) => {
+            w.push(0xBE80_0B81 | u32::from(BVH + 1) << 16); // s_brev_b32 s5, 1
+            w.extend(s_mov_literal(BVH + 3, d3));
+        }
     }
     if form.constant_base {
         w.extend(s_mov_literal(BVH, 0));
@@ -561,6 +568,7 @@ fn intersect_on(host: &Host, form: &Form, bvh: &[u32], cases: &[Case]) -> Vec<[u
 fn model_flags(form: &Form) -> (bool, u32) {
     let d1 = match form.flags {
         Flags::Set(d1, _) => d1,
+        Flags::Reversed(_) => 1 << 31,
         _ => VIEW_DWORD1,
     };
     (d1 >> 31 != 0, d1 >> 23 & 0xFF)
@@ -1235,6 +1243,7 @@ fn bvh_descriptor_flags_that_are_not_supported_are_refused_by_name() {
         Flags::Set(1 << 31, VIEW_DWORD3),
         Flags::Set(0, VIEW_DWORD3 | 1 << 27),
         Flags::Set(0, VIEW_DWORD3 | 0x3FF),
+        Flags::Reversed(VIEW_DWORD3 | 1 << 27 | 0x3FF),
     ] {
         let form = Form {
             flags,
@@ -1472,6 +1481,18 @@ fn bvh_nsa_rays_match_the_model() {
         form.mimg.nsa = true;
         parity(&format!("nsa wide {wide} a16 {a16}"), &form, &bvh, &rays);
     }
+}
+
+/// Flags the code sets with a bit reverse of a constant (box sorting in
+/// dword 1) are constants: the rays sort as with the same flags moved in.
+#[test]
+fn bvh_flags_from_a_bit_reverse_sort() {
+    let (bvh, rays) = (scene(), cases(256, false));
+    let form = Form {
+        flags: Flags::Reversed(VIEW_DWORD3),
+        ..Form::of(false, false)
+    };
+    parity("flags from a bit reverse", &form, &bvh, &rays);
 }
 
 /// EXEC: lanes it disables keep their result VGPRs.

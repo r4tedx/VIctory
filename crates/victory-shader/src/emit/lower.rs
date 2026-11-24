@@ -2581,9 +2581,15 @@ impl<'a> Lower<'a> {
             }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
+                // A constant stays one: code that needs a known value (the
+                // flags of a ray intersection's descriptor, `s_brev_b32 s1,
+                // 1` for box sorting) reads it.
+                let r = match self.s.m.int_value(a) {
+                    Some(x) => self.s.m.i32((x as u32).reverse_bits()),
+                    None => self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]),
+                };
                 (r, None)
             }
             "s_not_b32" => {
