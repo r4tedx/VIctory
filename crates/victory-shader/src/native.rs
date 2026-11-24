@@ -9,6 +9,7 @@
 //! ```text
 //! +0x18 "XDAT"  u32 entry count, u32 (0x24 seen), then per entry:
 //!               u32 kind, u32 offset, u32 size
+//! kind 0x0c     uncompressed FSSM
 //! kind 0x0d     "XBCH" u32 version (3), u64 packed size, u64 unpacked size,
 //!               zlib stream
 //! unpacked      "FSSM" u32 version (0x101), u64 payload size, payload
@@ -73,6 +74,7 @@ use crate::dxbc::{u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
+const KIND_NATIVE_RAW: u32 = 0x0c;
 const KIND_NATIVE: u32 = 0x0d;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
@@ -436,13 +438,21 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if !matches!(kind, KIND_NATIVE_RAW | KIND_NATIVE) {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        if kind == KIND_NATIVE_RAW {
+            if size > MAX_UNPACKED {
+                return Err(Malformed("implausible FSSM size"));
+            }
+            out.extend(programs(blob)?);
+        } else {
+            out.extend(programs(&unpack(blob)?)?);
+        }
     }
     Ok(out)
 }
@@ -855,6 +865,15 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_fssm_uses_the_same_program_and_io_layout_as_packed_fssm() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let raw = part(&[(KIND_NATIVE_RAW, &blob)]);
+        let packed = part(&[(KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(native_programs(&raw).unwrap(), native_programs(&packed).unwrap());
+        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..16])])).is_err());
     }
 
     #[test]
