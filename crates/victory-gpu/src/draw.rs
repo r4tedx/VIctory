@@ -2451,29 +2451,46 @@ mod tests {
             1, 1, 1, 0xBBBB, // two host groups
             2, 1, 1, 0xCCCC, // four host groups, beyond the count
         ];
-        // SAFETY: the records fit in the committed argument allocation.
-        unsafe { args.ptr.cast::<[u32; 16]>().write(words) };
-
         let list = host.new_list().expect("new_list");
+        let bytes = size_of_val(&words) as u64;
+        let (upload, mapped) = host.upload_buffer(bytes).expect("argument upload");
+        list.keep(&upload);
+        list.buffer_state(&source.buffer, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        // SAFETY: the upload and shadow ranges fit in their buffers. The
+        // upload is in its read state and the shadow is tracked as a copy
+        // destination. Title CPU memory still holds zeros.
+        unsafe {
+            mapped.cast::<[u32; 16]>().write(words);
+            list.list.CopyBufferRegion(&source.buffer, 0, &upload, 0, bytes);
+        }
+
         let heap = crate::descriptor::test_view_heap(16);
         let mut state = State::default();
-        for (count, groups) in [(Some(args.addr()), 2), (None, 4)] {
-            state.reset(pso);
-            state.set_heaps(&[heap]);
-            state.set_view(true, 2, uav.addr());
+        state.reset(pso);
+        state.set_heaps(&[heap]);
+        let cases = [(Some(args.addr()), 0, 2), (None, 32, 4)];
+        for (count, offset, _) in cases {
+            state.set_view(true, 2, uav.addr() + offset);
             assert!(state.execute_indirect(&list, (2, 16, 3), args.addr() + 16, count));
-            list.close();
-            assert_eq!(host.log_messages(), None);
-            host.execute(&[&list]);
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None);
+        host.execute(&[&list]);
+        for (_, offset, groups) in cases {
             for group in 0..4 {
                 // SAFETY: the group results are inside the committed UAV.
-                let value = unsafe { uav.ptr.add(0x18_0000).cast::<u32>().add(group).read() };
+                let value = unsafe {
+                    uav.ptr
+                        .add(0x18_0000 + offset as usize)
+                        .cast::<u32>()
+                        .add(group)
+                        .read()
+                };
                 assert_eq!(value, if group < groups { 0xA5A5_5A5A } else { 0 });
             }
-            for (word, expected) in words.iter().enumerate() {
-                assert_eq!(source.read_u32(word * 4), *expected, "argument word {word}");
-            }
-            list.reset();
+        }
+        for (word, expected) in words.iter().enumerate() {
+            assert_eq!(source.read_u32(word * 4), *expected, "argument word {word}");
         }
         crate::shadow::unregister(args.ptr as usize, args.addr());
         crate::shadow::unregister(uav.ptr as usize, uav.addr());
