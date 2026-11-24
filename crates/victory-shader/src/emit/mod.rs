@@ -322,11 +322,23 @@ pub fn emit(
     if edges.is_empty() {
         return original;
     }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res, target)
+    let mut p = ir::thread_edges(p, &edges)?;
+    let lower_threaded = |p: &ir::Program| {
+        let st = structure::structure(p)?;
+        let io = io::raise(p, native)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_program(c, native, p, &st, &io, &res, target)
+    };
+    let threaded = lower_threaded(&p);
+    // Threading rebuilds SSA from registers. Forward spill reloads when
+    // the threaded form still fails, preserving existing translations
+    // that use the explicit reloads.
+    if matches!(threaded, Err(ShaderError::Unsupported { .. }))
+        && crate::sgpr_spill::forward(&mut p)
+    {
+        return lower_threaded(&p).or(threaded);
+    }
+    threaded
 }
 
 /// Tests: the first lowering of a compute program alone, without the
@@ -3043,6 +3055,34 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn a_threaded_pixel_shader_forwards_a_scalar_reload() {
+        let [e0, e1] = exp_mrt0(3);
+        // A wave-uniform branch skips the spill. Its flag also skips the
+        // reload, so the spill supplies the only value the reload can read.
+        let words = [
+            0x7e06_0500, // v_readfirstlane_b32 s3, v0
+            0x7e02_0280, // v_mov_b32 v1, 0
+            0xbf06_8003, // s_cmp_eq_u32 s3, 0
+            0xbf85_0004, // s_cbranch_scc1 join
+            0xbe84_0381, // s_mov_b32 s4, 1
+            0xd761_0002,
+            0x0001_0004, // v_writelane_b32 v2, s4, 0
+            0x7e02_0281, // v_mov_b32 v1, 1
+            0x7d84_0280, // join: v_cmp_eq_u32 vcc, 0, v1
+            0xbf87_0004, // s_cbranch_vccnz constant
+            0xd760_0005,
+            0x0001_0102, // v_readlane_b32 s5, v2, 0
+            0x7e06_0205, // v_mov_b32 v3, s5
+            0xbf82_0001, // s_branch export
+            0x7e06_0280, // constant: v_mov_b32 v3, 0
+            e0,
+            e1,          // export: exp mrt0, v3, v3, v3, v3
+            0xbf81_0000, // s_endpgm
+        ];
+        validate(&pixel(&words, PERSP_CENTER).unwrap());
     }
 
     #[test]
