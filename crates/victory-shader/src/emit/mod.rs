@@ -441,14 +441,24 @@ fn emit_program(
         console_cf: false,
         per_lane_only: false,
     };
+    // Addresses traced for the console flow: EXEC masks more VGPR writes
+    // where every lane runs every block.
+    let console_res;
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             let console = structure::structure_console(p);
             let lowered = match &console {
                 Ok(console) => {
-                    parts.st = console;
-                    parts.console_cf = true;
-                    lower::lower(&parts)
+                    match resource::track_console(p, &native.layout, native.stage, st, console) {
+                        Ok(traced) => {
+                            console_res = traced;
+                            parts.st = console;
+                            parts.res = &console_res;
+                            parts.console_cf = true;
+                            lower::lower(&parts)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(ShaderError::Unsupported {
                     offset: 0,
@@ -464,6 +474,7 @@ fn emit_program(
                 // where that translates; else the console flow's reason.
                 Err(e) => {
                     parts.st = st;
+                    parts.res = res;
                     parts.console_cf = false;
                     parts.per_lane_only = true;
                     lower::lower(&parts).map_err(|_| e)?

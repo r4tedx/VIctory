@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, RelOffset, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -251,6 +251,12 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Relative-offset DXIL phis for address phis, keyed by `(phi_value, base_value)`.
+    addr_phis: HashMap<(Value, Value), V>,
+    /// Address phis waiting for incoming values in `fill_phis`: `(phi, ir_block, phi_idx, base)`.
+    pending_addr_phis: Vec<(V, usize, usize, Value)>,
+    /// Defining instruction `(block, inst_index)` for each non-phi, non-input IR value.
+    def_site: HashMap<Value, Site>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -374,6 +380,10 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// A table descriptor loaded through an address recomputed at the use
+/// ([`RelOffset`]) whose constant part reaches more than one of the table's
+/// ranges, or that nothing bounds.
+const TABLE_RANGE: Why = "a table descriptor at an address that does not settle its range";
 
 /// Samples whose level comes from derivatives across each quad of lanes,
 /// lowered with the quad's differences outside pixel shaders: the plain and
@@ -851,6 +861,20 @@ impl<'a> Lower<'a> {
             read_phis: HashSet::new(),
             scalar_descriptor_data,
             scalar_buffer_views: HashMap::new(),
+            addr_phis: HashMap::new(),
+            pending_addr_phis: Vec::new(),
+            def_site: p
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(b, block)| {
+                    block
+                        .insts
+                        .iter()
+                        .enumerate()
+                        .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
+                })
+                .collect(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1000,12 +1024,7 @@ impl<'a> Lower<'a> {
             }
             let guard = self.guard(b, i)?;
             let vals = self.vgprs(inst, data.as_ref().ok_or("a global store value")?, n as u8)?;
-            let c = self.cur;
-            let mut off = self.s.m.i32(a.offset);
-            if let Some(d) = a.dynamic {
-                let d = self.i32_of(d)?;
-                off = self.s.m.bin(c, Bin::Add, off, d);
-            }
+            let off = self.address_offset(a)?;
             let src = Source::Built {
                 address: a,
                 bits: 0,
@@ -1054,11 +1073,7 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         let c = self.cur;
-        let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
-            off = self.s.m.bin(c, Bin::Add, off, d);
-        }
+        let off = self.address_offset(a)?;
         let h = if a.param == CODE {
             None
         } else {
@@ -1068,7 +1083,7 @@ impl<'a> Lower<'a> {
                 words: [0, 0],
             };
             let u = if self
-                .used_kind(&src)
+                .used_kind(&src)?
                 .is_some_and(|u| u.kind == ResourceType::Uav)
             {
                 0x1000
@@ -2411,7 +2426,9 @@ impl<'a> Lower<'a> {
         together().or_else(|| self.x.st.pairs.get(&lo).copied())
     }
 
-    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+    /// The condition, beyond being there, under which a lane runs the
+    /// instruction at `(b, i)`; none where every lane that is there runs it.
+    fn mask(&self, b: usize, i: usize) -> Option<Bool> {
         if self.console_cf {
             // Every lane is here: EXEC is the guard. Lane reads and writes
             // ignore EXEC on the console.
@@ -2423,12 +2440,14 @@ impl<'a> Lower<'a> {
                 inst.fields,
                 Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
             );
-            return match self.x.st.execs[b].get(i).copied().flatten() {
-                Some(e) if !ignores && e != Bool::TRUE => Ok(Some(self.boolean(e, self.cur)?)),
-                _ => Ok(None),
-            };
+            let exec = self.x.st.execs[b].get(i).copied().flatten();
+            return exec.filter(|&e| !ignores && e != Bool::TRUE);
         }
-        match self.x.st.guards[b][i] {
+        self.x.st.guards[b][i]
+    }
+
+    fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        match self.mask(b, i) {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
@@ -3700,7 +3719,7 @@ impl<'a> Lower<'a> {
             }
             (src, addr, (!has_soff && extra.is_none()).then_some(off))
         };
-        let kind = self.used_kind(src);
+        let kind = self.used_kind(src)?;
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -3912,7 +3931,7 @@ impl<'a> Lower<'a> {
         let mut scalar_props = None;
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
-            let used = self.used_kind(&src);
+            let used = self.used_kind(&src)?;
             let mut ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             if self.scalar_descriptor_data {
                 let rich =
@@ -3995,7 +4014,7 @@ impl<'a> Lower<'a> {
             };
             if count != 8
                 || self
-                    .used_kind(&src)
+                    .used_kind(&src)?
                     .is_some_and(|u| u.kind != ResourceType::Srv)
             {
                 return Err("a descriptor read only as data");
@@ -4178,11 +4197,7 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar load from the code"),
         };
         let c = self.cur;
-        let mut addr = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, d);
-        }
+        let addr = self.address_offset(a)?;
         for k in 0..count {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4378,54 +4393,630 @@ impl<'a> Lower<'a> {
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
-                let x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
-                    None => None,
-                };
-                Ok((address.offset, x))
+                if address.rel.is_some() {
+                    Ok((0, Some(self.address_offset(*address)?)))
+                } else {
+                    let x = match address.dynamic {
+                        Some(v) => Some(self.i32_of(v)?),
+                        None => None,
+                    };
+                    Ok((address.offset, x))
+                }
             }
             _ => Ok((0, None)),
         }
     }
 
-    /// The used-resource entry a descriptor loaded from a table falls in.
-    fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
+    /// Computes the byte offset `a` adds to its root parameter (or code base).
+    fn address_offset(&mut self, a: Address) -> Result<V, Why> {
+        let c = self.cur;
+        if let Some(RelOffset {
+            value,
+            base,
+            extra_dynamic,
+            ..
+        }) = a.rel
+        {
+            let mut local = HashMap::new();
+            let mut off = self.rel_offset(value, base, &mut local)?;
+            if a.offset != 0 {
+                let k = self.s.m.i32(a.offset);
+                off = self.s.m.bin(c, Bin::Add, off, k);
+            }
+            if let Some(d) = extra_dynamic {
+                let d = self.i32_of(d)?;
+                off = self.s.m.bin(c, Bin::Add, off, d);
+            }
+            return Ok(off);
+        }
+        let mut off = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            off = self.s.m.bin(c, Bin::Add, off, d);
+        }
+        Ok(off)
+    }
+
+    fn op_value(inst: &Inst, op: &Operand) -> Option<Value> {
+        match *op {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            _ => None,
+        }
+    }
+
+    /// Follows unmodified, unguarded `v_mov_b32` chains back to an SGPR value.
+    fn uniform_vgpr_src(&self, mut inst: &'a Inst, mut op: &'a Operand) -> Option<Value> {
+        loop {
+            match *op {
+                Operand::Scalar { code, .. } if code != NULL => return inst.read(Reg::S(code)),
+                Operand::Vector { reg, .. } => {
+                    let v = inst.read(Reg::V(reg))?;
+                    let &(b, i) = self.def_site.get(&v)?;
+                    if self.mask(b, i).is_some() {
+                        return None;
+                    }
+                    let next = &self.x.p.blocks[b].insts[i];
+                    if next.name() != "v_mov_b32" {
+                        return None;
+                    }
+                    let Fields::Valu(f) = &next.fields else {
+                        return None;
+                    };
+                    if f.abs != 0
+                        || f.neg != 0
+                        || f.sdwa.is_some()
+                        || f.dpp.is_some()
+                        || f.clamp
+                        || f.omod != 0
+                    {
+                        return None;
+                    }
+                    inst = next;
+                    op = f.src.first()?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Resolves a constant-lane `v_readlane_b32` reading an SGPR spilled via `v_writelane_b32`.
+    fn spilled_value(&self, inst: &Inst, src: &Operand, lane: &Operand) -> Option<Value> {
+        let lane_idx = match *lane {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        let Operand::Vector { reg, .. } = *src else {
+            return None;
+        };
+        let v = inst.read(Reg::V(reg))?;
+        self.spilled_in_vgpr(v, lane_idx, &mut Vec::new())
+            .ok()
+            .flatten()
+    }
+
+    fn spilled_in_vgpr(
+        &self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.x.p.blocks[b].phis[i].args {
+                if let Some(m) = self.spilled_in_vgpr(a, lane, seen)? {
+                    if found.is_some_and(|f| f != m) {
+                        return Err(());
+                    }
+                    found = Some(m);
+                }
+            }
+            seen.pop();
+            return Ok(found);
+        }
+        let &(b, i) = self.def_site.get(&v).ok_or(())?;
+        let inst = &self.x.p.blocks[b].insts[i];
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        let at_lane = match *at {
+            Operand::Const(c) => crate::resource::inline(c).ok_or(())?,
+            Operand::Literal(x) => x,
+            _ => return Err(()),
+        };
+        if at_lane != lane {
+            return self.spilled_in_vgpr(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => Ok(inst.read(Reg::S(code))),
+            _ => Err(()),
+        }
+    }
+
+    fn op_reaches_base(&self, inst: &Inst, op: &Operand, base: Value) -> bool {
+        Self::op_value(inst, op).is_some_and(|v| self.reaches_base(v, base))
+    }
+
+    fn reaches_base(&self, v: Value, base: Value) -> bool {
+        fn rec(
+            l: &Lower<'_>,
+            v: Value,
+            base: Value,
+            visiting: &mut Vec<Value>,
+            memo: &mut HashMap<Value, bool>,
+        ) -> bool {
+            if v == base {
+                return true;
+            }
+            if let Some(&hit) = memo.get(&v) {
+                return hit;
+            }
+            if visiting.contains(&v) {
+                return false;
+            }
+            let r = if let Some(&(b, i)) = l.phi_at.get(&v) {
+                visiting.push(v);
+                let hit = l.x.p.blocks[b].phis[i]
+                    .args
+                    .iter()
+                    .any(|&a| rec(l, a, base, visiting, memo));
+                visiting.pop();
+                hit
+            } else if let Some(&(b, i)) = l.def_site.get(&v) {
+                let inst = &l.x.p.blocks[b].insts[i];
+                let name = inst.name();
+                let mut op_reaches = |op: &Operand| {
+                    Lower::op_value(inst, op).is_some_and(|x| rec(l, x, base, visiting, memo))
+                };
+                match &inst.fields {
+                    Fields::Sop { dst, src, .. } => match name {
+                        "s_mov_b32" => src.first().is_some_and(&mut op_reaches),
+                        "s_mov_b64" => {
+                            let k = inst.writes.iter().position(|w| w.1 == v);
+                            match (k, src.first()) {
+                                (Some(k), Some(&Operand::Scalar { code, .. })) if code != NULL => {
+                                    inst.read(Reg::S(code + k as u8))
+                                        .is_some_and(|x| rec(l, x, base, visiting, memo))
+                                }
+                                _ => false,
+                            }
+                        }
+                        "s_addk_i32" => match dst {
+                            Some(Operand::Scalar { code, .. }) if *code != NULL => inst
+                                .read(Reg::S(*code))
+                                .is_some_and(|x| rec(l, x, base, visiting, memo)),
+                            _ => false,
+                        },
+                        "s_add_u32" | "s_add_i32" | "s_or_b32" => {
+                            src.first().is_some_and(&mut op_reaches)
+                                || src.get(1).is_some_and(&mut op_reaches)
+                        }
+                        "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32"
+                        | "s_lshl4_add_u32" => src.get(1).is_some_and(&mut op_reaches),
+                        "s_sub_u32" | "s_sub_i32" => src.first().is_some_and(&mut op_reaches),
+                        _ => false,
+                    },
+                    Fields::Valu(f)
+                        if f.abs == 0
+                            && f.neg == 0
+                            && f.sdwa.is_none()
+                            && f.dpp.is_none()
+                            && !f.clamp
+                            && f.omod == 0 =>
+                    {
+                        match name {
+                            "v_mov_b32" | "v_readfirstlane_b32" => {
+                                f.src.first().is_some_and(&mut op_reaches)
+                            }
+                            "v_readlane_b32" => match (f.src.first(), f.src.get(1)) {
+                                (Some(op0), Some(op1)) => {
+                                    if let Some(sv) = l.spilled_value(inst, op0, op1) {
+                                        rec(l, sv, base, visiting, memo)
+                                    } else {
+                                        op_reaches(op0)
+                                    }
+                                }
+                                _ => false,
+                            },
+                            "v_add_co_u32" | "v_add_nc_u32" | "v_add_nc_i32" | "v_or_b32" => {
+                                f.src.first().is_some_and(&mut op_reaches)
+                                    || f.src.get(1).is_some_and(&mut op_reaches)
+                            }
+                            "v_lshl_add_u32" => f.src.get(2).is_some_and(&mut op_reaches),
+                            "v_add3_u32" => f.src.iter().take(3).any(&mut op_reaches),
+                            "v_sub_co_u32" | "v_sub_nc_u32" => {
+                                f.src.first().is_some_and(&mut op_reaches)
+                            }
+                            "v_subrev_co_u32" | "v_subrev_nc_u32" => {
+                                f.src.get(1).is_some_and(&mut op_reaches)
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if visiting.is_empty() {
+                memo.insert(v, r);
+            }
+            r
+        }
+        rec(self, v, base, &mut Vec::new(), &mut HashMap::new())
+    }
+
+    fn rel_offset_op(
+        &mut self,
+        inst: &Inst,
+        op: &Operand,
+        base: Value,
+        local: &mut HashMap<Value, V>,
+    ) -> Result<V, Why> {
+        let v = Self::op_value(inst, op).ok_or("an untracked relative address")?;
+        self.rel_offset(v, base, local)
+    }
+
+    /// Emits `v - base` in `self.cur`, caching non-phi nodes only in `local`
+    /// (per block / edge) and phi nodes globally in `self.addr_phis`.
+    fn rel_offset(
+        &mut self,
+        v: Value,
+        base: Value,
+        local: &mut HashMap<Value, V>,
+    ) -> Result<V, Why> {
+        if v == base {
+            return Ok(self.s.m.i32(0));
+        }
+        if let Some(&x) = local.get(&v) {
+            return Ok(x);
+        }
+        if let Some(&(phi_b, phi_idx)) = self.phi_at.get(&v) {
+            if let Some(&phi) = self.addr_phis.get(&(v, base)) {
+                return Ok(phi);
+            }
+            let blk = self.block[phi_b].ok_or("an unreachable address phi")?;
+            let phi = self.s.m.phi(blk, self.s.t.i32);
+            self.addr_phis.insert((v, base), phi);
+            self.pending_addr_phis.push((phi, phi_b, phi_idx, base));
+            return Ok(phi);
+        }
+        let &(ib, ii) = self
+            .def_site
+            .get(&v)
+            .ok_or("an untracked relative address")?;
+        let inst: &'a Inst = &self.x.p.blocks[ib].insts[ii];
+        let name = inst.name();
+        let c = self.cur;
+        let x = match &inst.fields {
+            Fields::Sop { dst, src, imm } => match name {
+                "s_mov_b32" => {
+                    let op0 = src.first().ok_or("a missing operand")?;
+                    self.rel_offset_op(inst, op0, base, local)?
+                }
+                "s_mov_b64" => {
+                    let k = inst
+                        .writes
+                        .iter()
+                        .position(|w| w.1 == v)
+                        .ok_or("an untracked relative address")?;
+                    match src.first() {
+                        Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                            let prev = inst
+                                .read(Reg::S(code + k as u8))
+                                .ok_or("an unread operand")?;
+                            self.rel_offset(prev, base, local)?
+                        }
+                        _ => return Err("an untracked relative address"),
+                    }
+                }
+                "s_addk_i32" => {
+                    let Some(Operand::Scalar { code, .. }) = dst else {
+                        return Err("a missing operand");
+                    };
+                    let prev = inst.read(Reg::S(*code)).ok_or("an unread operand")?;
+                    let a = self.rel_offset(prev, base, local)?;
+                    let b = self.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
+                    self.s.m.bin(c, Bin::Add, a, b)
+                }
+                "s_add_u32" | "s_add_i32" | "s_or_b32" => {
+                    let (op0, op1) = (
+                        src.first().ok_or("a missing operand")?,
+                        src.get(1).ok_or("a missing operand")?,
+                    );
+                    match (
+                        self.op_reaches_base(inst, op0, base),
+                        self.op_reaches_base(inst, op1, base),
+                    ) {
+                        (true, false) => {
+                            let a = self.rel_offset_op(inst, op0, base, local)?;
+                            let b = self.operand(inst, op1)?;
+                            self.s.m.bin(c, Bin::Add, a, b)
+                        }
+                        (false, true) => {
+                            let a = self.rel_offset_op(inst, op1, base, local)?;
+                            let b = self.operand(inst, op0)?;
+                            self.s.m.bin(c, Bin::Add, a, b)
+                        }
+                        _ => return Err("an untracked relative address"),
+                    }
+                }
+                "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                    let (op0, op1) = (
+                        src.first().ok_or("a missing operand")?,
+                        src.get(1).ok_or("a missing operand")?,
+                    );
+                    if self.op_reaches_base(inst, op0, base)
+                        || !self.op_reaches_base(inst, op1, base)
+                    {
+                        return Err("an untracked relative address");
+                    }
+                    let a = self.operand(inst, op0)?;
+                    let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                    let sh = self.s.m.bin(c, Bin::Shl, a, k);
+                    let b = self.rel_offset_op(inst, op1, base, local)?;
+                    self.s.m.bin(c, Bin::Add, sh, b)
+                }
+                "s_sub_u32" | "s_sub_i32" => {
+                    let (op0, op1) = (
+                        src.first().ok_or("a missing operand")?,
+                        src.get(1).ok_or("a missing operand")?,
+                    );
+                    if !self.op_reaches_base(inst, op0, base)
+                        || self.op_reaches_base(inst, op1, base)
+                    {
+                        return Err("an untracked relative address");
+                    }
+                    let a = self.rel_offset_op(inst, op0, base, local)?;
+                    let b = self.operand(inst, op1)?;
+                    self.s.m.bin(c, Bin::Sub, a, b)
+                }
+                _ => return Err("an untracked relative address"),
+            },
+            Fields::Valu(f)
+                if f.abs == 0
+                    && f.neg == 0
+                    && f.sdwa.is_none()
+                    && f.dpp.is_none()
+                    && !f.clamp
+                    && f.omod == 0 =>
+            {
+                let mut raw = match name {
+                    "v_mov_b32" => {
+                        let op0 = f.src.first().ok_or("a missing operand")?;
+                        self.rel_offset_op(inst, op0, base, local)?
+                    }
+                    "v_readfirstlane_b32" => {
+                        let op0 = f.src.first().ok_or("a missing operand")?;
+                        if let Some(sv) = self.uniform_vgpr_src(inst, op0) {
+                            self.rel_offset(sv, base, local)?
+                        } else {
+                            let a = self.rel_offset_op(inst, op0, base, local)?;
+                            self.s.flags |= flags::WAVE_OPS;
+                            self.s.op(
+                                c,
+                                "waveReadLaneFirst.i32",
+                                Attr::NoUnwind,
+                                self.s.t.i32,
+                                118,
+                                &[a],
+                            )
+                        }
+                    }
+                    "v_readlane_b32" => {
+                        let (op0, op1) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                        );
+                        if let Some(sv) = self
+                            .spilled_value(inst, op0, op1)
+                            .or_else(|| self.uniform_vgpr_src(inst, op0))
+                        {
+                            self.rel_offset(sv, base, local)?
+                        } else {
+                            let a = self.rel_offset_op(inst, op0, base, local)?;
+                            let lane = self.operand(inst, op1)?;
+                            if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                                self.s.flags |= flags::WAVE_OPS;
+                            } else {
+                                self.cross_lane(false)?;
+                            }
+                            self.read_lane(a, lane)
+                        }
+                    }
+                    "v_add_co_u32" | "v_add_nc_u32" | "v_add_nc_i32" | "v_or_b32" => {
+                        let (op0, op1) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                        );
+                        match (
+                            self.op_reaches_base(inst, op0, base),
+                            self.op_reaches_base(inst, op1, base),
+                        ) {
+                            (true, false) => {
+                                let a = self.rel_offset_op(inst, op0, base, local)?;
+                                let b = self.operand(inst, op1)?;
+                                self.s.m.bin(c, Bin::Add, a, b)
+                            }
+                            (false, true) => {
+                                let a = self.rel_offset_op(inst, op1, base, local)?;
+                                let b = self.operand(inst, op0)?;
+                                self.s.m.bin(c, Bin::Add, a, b)
+                            }
+                            _ => return Err("an untracked relative address"),
+                        }
+                    }
+                    "v_lshl_add_u32" => {
+                        let (op0, op1, op2) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                            f.src.get(2).ok_or("a missing operand")?,
+                        );
+                        if self.op_reaches_base(inst, op0, base)
+                            || self.op_reaches_base(inst, op1, base)
+                            || !self.op_reaches_base(inst, op2, base)
+                        {
+                            return Err("an untracked relative address");
+                        }
+                        let a = self.operand(inst, op0)?;
+                        let sh = self.operand(inst, op1)?;
+                        let k31 = self.s.m.i32(31);
+                        let sh = self.s.m.bin(c, Bin::And, sh, k31);
+                        let t = self.s.m.bin(c, Bin::Shl, a, sh);
+                        let b = self.rel_offset_op(inst, op2, base, local)?;
+                        self.s.m.bin(c, Bin::Add, t, b)
+                    }
+                    "v_add3_u32" => {
+                        let (op0, op1, op2) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                            f.src.get(2).ok_or("a missing operand")?,
+                        );
+                        let ops = [op0, op1, op2];
+                        let reaches: Vec<usize> = (0..3)
+                            .filter(|&k| self.op_reaches_base(inst, ops[k], base))
+                            .collect();
+                        let [base_idx] = reaches[..] else {
+                            return Err("an untracked relative address");
+                        };
+                        let mut acc = self.rel_offset_op(inst, ops[base_idx], base, local)?;
+                        for (k, op) in ops.into_iter().enumerate() {
+                            if k != base_idx {
+                                let term = self.operand(inst, op)?;
+                                acc = self.s.m.bin(c, Bin::Add, acc, term);
+                            }
+                        }
+                        acc
+                    }
+                    "v_sub_co_u32" | "v_sub_nc_u32" => {
+                        let (op0, op1) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                        );
+                        if !self.op_reaches_base(inst, op0, base)
+                            || self.op_reaches_base(inst, op1, base)
+                        {
+                            return Err("an untracked relative address");
+                        }
+                        let a = self.rel_offset_op(inst, op0, base, local)?;
+                        let b = self.operand(inst, op1)?;
+                        self.s.m.bin(c, Bin::Sub, a, b)
+                    }
+                    "v_subrev_co_u32" | "v_subrev_nc_u32" => {
+                        let (op0, op1) = (
+                            f.src.first().ok_or("a missing operand")?,
+                            f.src.get(1).ok_or("a missing operand")?,
+                        );
+                        if self.op_reaches_base(inst, op0, base)
+                            || !self.op_reaches_base(inst, op1, base)
+                        {
+                            return Err("an untracked relative address");
+                        }
+                        let a = self.operand(inst, op0)?;
+                        let b = self.rel_offset_op(inst, op1, base, local)?;
+                        self.s.m.bin(c, Bin::Sub, b, a)
+                    }
+                    _ => return Err("an untracked relative address"),
+                };
+                // Lanes the write's mask leaves out keep the old address
+                // (the tracer took the write only over one of this base
+                // where they go on to use it).
+                if let Some(Operand::Vector { reg, .. }) = f.dst
+                    && let Some(g) = self.mask(ib, ii)
+                    && let Some(old) = inst.read(Reg::V(reg))
+                    && self.reaches_base(old, base)
+                {
+                    let cond = self.boolean(g, c)?;
+                    let fallback = self.rel_offset(old, base, local)?;
+                    raw = self.s.m.select(c, cond, raw, fallback);
+                }
+                raw
+            }
+            _ => return Err("an untracked relative address"),
+        };
+        local.insert(v, x);
+        Ok(x)
+    }
+
+    /// The used-resource entry a descriptor loaded from a table falls in:
+    /// the range the constant part of its address lies in (a computed term
+    /// indexes within the range). Fails where an address recomputed at the
+    /// use does not settle one ([`TABLE_RANGE`]).
+    fn used_kind(&self, src: &Source) -> Result<Option<&'a UsedResource>, Why> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
         {
-            return self.used_kind(args.first()?);
+            return args.first().map_or(Ok(None), |a| self.used_kind(a));
         }
         if let Source::LanePhi { args, .. } = src {
-            return args.iter().flatten().find_map(|a| self.used_kind(a));
+            for a in args.iter().flatten() {
+                if let Some(used) = self.used_kind(a)? {
+                    return Ok(Some(used));
+                }
+            }
+            return Ok(None);
         }
         if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
+            let Some(rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            return Ok(self
                 .x
                 .native
                 .used
                 .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data));
         }
         let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
+            return Ok(None);
         };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
+        let Some(a) = self.scalar.get(load) else {
+            return Ok(None);
+        };
+        let rp = match self.x.native.layout.get(a.param) {
+            Some(rp) if rp.root == RootType::Table => rp,
+            _ => return Ok(None),
+        };
+        // The least and greatest constant part: one, unless phi edges (or
+        // writes under an EXEC mask) reach the address with different ones.
+        let (least, most) = match a.rel {
+            None => (a.offset, a.offset),
+            Some(rel) => {
+                let (least, spread) = rel.constant.ok_or(TABLE_RANGE)?;
+                let least = least.wrapping_add(a.offset);
+                (least, least.checked_add(spread).ok_or(TABLE_RANGE)?)
+            }
+        };
+        let range = |byte: u32| {
+            let dword = (byte / 4) + u32::from(*first);
+            self.x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.user_data == rp.user_data
+                        && u.table_offset_dwords <= dword
+                })
+                .max_by_key(|u| u.table_offset_dwords)
+        };
+        let used = range(least);
+        // Ranges are contiguous: both ends in one, and all between are.
+        if range(most).map(|u| u.table_offset_dwords) != used.map(|u| u.table_offset_dwords) {
+            return Err(TABLE_RANGE);
         }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
+        Ok(used)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -6201,14 +6792,14 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_add_nc_i32"
+            | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
+                    "v_add_nc_u32" | "v_add_nc_i32" => (Bin::Add, a, b),
                     "v_sub_nc_u32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
@@ -7137,7 +7728,7 @@ impl<'a> Lower<'a> {
         let store = name.starts_with("image_store");
         let uav = store
             || self
-                .used_kind(src)
+                .used_kind(src)?
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
@@ -8058,7 +8649,7 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
-        let used = self.used_kind(src);
+        let used = self.used_kind(src)?;
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -8946,6 +9537,26 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        while let Some((phi, b, i, base)) = self.pending_addr_phis.pop() {
+            let ir_phi = &p.blocks[b].phis[i];
+            let offset = p.blocks[b].offset;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let saved_cur = self.cur;
+                let saved_ir = self.cur_ir;
+                self.cur = qb;
+                self.cur_ir = q;
+                let mut local = HashMap::new();
+                let x = self.rel_offset(ir_phi.args[n], base, &mut local);
+                self.cur = saved_cur;
+                self.cur_ir = saved_ir;
+                let x = x.map_err(|w| unsupported(offset, w))?;
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(phi, incoming);
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;

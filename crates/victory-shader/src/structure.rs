@@ -271,6 +271,27 @@ impl Bools {
         self.and(a, nb) == Bool::FALSE
     }
 
+    /// Whether `b` holds wherever `a` does, as [`Self::implies`] tells, for
+    /// readers of a finished [`Structured`]: no node is added.
+    pub fn within(&self, a: Bool, b: Bool) -> bool {
+        fn rec(s: &Bools, a: Bool, b: Bool, held: &mut HashSet<(Bool, Bool)>) -> bool {
+            if a == Bool::FALSE || b == Bool::TRUE || a == b {
+                return true;
+            }
+            if a == Bool::TRUE || b == Bool::FALSE {
+                return false;
+            }
+            // A pair seen before held, or the search ended there.
+            if !held.insert((a, b)) {
+                return true;
+            }
+            let v = s.nodes[a.0 as usize].0.min(s.nodes[b.0 as usize].0);
+            let ((a0, a1), (b0, b1)) = (s.split(a, v), s.split(b, v));
+            rec(s, a0, b0, held) && rec(s, a1, b1, held)
+        }
+        rec(self, a, b, &mut HashSet::new())
+    }
+
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
