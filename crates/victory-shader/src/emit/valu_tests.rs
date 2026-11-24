@@ -208,6 +208,15 @@ fn lower_cs(words: &[u32]) -> HostShader {
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with_uav(shader, cases, 1, check);
+}
+
+fn run_cases_with_uav(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     // One test at a time: with these tests on the hardware adapter and WARP
@@ -240,7 +249,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -279,6 +288,22 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+#[test]
+fn raw_buffer_halfwords_read_across_dwords_and_handle_end_of_view() {
+    let mut words = Vec::new();
+    words.extend(buffer_store_dword(1, 8, 0));
+    words.extend(buffer_store_dword(2, 8, 4));
+    // buffer_load_ushort v0, v3, s[8:11], 0 offen
+    words.extend([0xe028_1000, 0x8002_0003]);
+    let shader = build_valu_cs(&words);
+    let offsets = [0, 1, 2, 3, 4, 6, 7, 8, u32::MAX];
+    let cases = offsets.map(|offset| [0x4433_2211, 0x8877_6655, offset, 0]);
+    let expected = [0x2211, 0x3322, 0x4433, 0x5544, 0x6655, 0x8877, 0, 0, 0];
+    run_cases_with_uav(&shader, &cases, 2, |host, n, _, result| {
+        assert_eq!(result, expected[n], "{host}, byte offset {:#x}", offsets[n]);
+    });
 }
 
 #[test]

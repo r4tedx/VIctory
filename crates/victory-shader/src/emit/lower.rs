@@ -4449,6 +4449,60 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Reads a raw little-endian halfword, including one crossing a dword.
+    fn raw_buffer_u16(&mut self, h: V, off: V, bounded: bool) -> V {
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let unused = self.s.m.undef(self.s.t.i32);
+        // A bound view reports its byte size. A root SRV does not.
+        let in_range = bounded.then(|| {
+            let c = self.cur;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![self.s.t.i32; 4]);
+            let r = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, unused]);
+            let size = self.s.m.extract(c, r, 0);
+            let last = self.s.m.bin(c, Bin::Add, off, one);
+            let fits = self.s.m.cmp(c, pred::IULT, last, size);
+            let no_wrap = self.s.m.cmp(c, pred::IUGE, last, off);
+            self.s.m.bin(c, Bin::And, fits, no_wrap)
+        });
+        let range = self.begin_guarded(in_range);
+        let load = |l: &mut Self, addr: V| {
+            let c = l.cur;
+            let mask = l.s.m.i8(1);
+            let align = l.s.m.i32(4);
+            let r = l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[h, addr, unused, mask, align],
+            );
+            let f = l.s.m.extract(c, r, 0);
+            l.as_int(f)
+        };
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let not_three = self.s.m.i32(!3);
+        let byte = self.s.m.bin(c, Bin::And, off, three);
+        let addr = self.s.m.bin(c, Bin::And, off, not_three);
+        let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+        let word = load(self, addr);
+        let lo = self.s.m.bin(c, Bin::LShr, word, shift);
+        let split = self.s.m.cmp(c, pred::EQ, byte, three);
+        let part = self.begin_guarded(Some(split));
+        let four = self.s.m.i32(4);
+        let next = self.s.m.bin(self.cur, Bin::Add, addr, four);
+        let hi = load(self, next);
+        let eight = self.s.m.i32(8);
+        let hi = self.s.m.bin(self.cur, Bin::Shl, hi, eight);
+        let both = self.s.m.bin(self.cur, Bin::Or, lo, hi);
+        let x = self.end_guarded(part, &[(both, lo)])[0];
+        let mask = self.s.m.i32(0xffff);
+        let x = self.s.m.bin(self.cur, Bin::And, x, mask);
+        self.end_guarded(range, &[(x, zero)])[0]
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -8836,13 +8890,14 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
         let d16 = name.contains("_format_d16_");
+        let ushort = name == "buffer_load_ushort";
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || ushort => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8887,6 +8942,20 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        if ushort {
+            if index.is_some() || used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                return Err("a halfword load from an indexed or constant buffer");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let x = self.raw_buffer_u16(h, off, !matches!(src, Source::Built { .. }));
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
@@ -8911,8 +8980,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
