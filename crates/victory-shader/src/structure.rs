@@ -439,9 +439,7 @@ pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
-        while let Some(key) = l.console_pending.pop() {
-            l.mask(key);
-        }
+        l.resolve_pending();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -460,7 +458,8 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
-    console_pending: Vec<Key>,
+    /// Incoming masks of joins, including values defined on back edges.
+    pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -538,7 +537,7 @@ impl<'a> Lanes<'a> {
         Ok(Lanes {
             p,
             console,
-            console_pending: Vec::new(),
+            pending: Vec::new(),
             order,
             index,
             incoming,
@@ -634,6 +633,12 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    fn resolve_pending(&mut self) {
+        while let Some(key) = self.pending.pop() {
+            self.mask(key);
+        }
+    }
+
     /// Joins whose constant fails on some edge, given what lanes know.
     fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
         let mut wrong = Vec::new();
@@ -654,6 +659,7 @@ impl<'a> Lanes<'a> {
                 }
             }
             j += 1;
+            self.resolve_pending();
         }
         wrong
     }
@@ -854,9 +860,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
-        if self.console {
-            self.console_pending.extend(args);
-        }
+        self.pending.extend(args);
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
@@ -1281,6 +1285,31 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    #[test]
+    fn a_loop_mask_tracks_the_join_on_its_back_edge() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE84_036A, // s_mov_b32 s4, vcc_lo
+                0xD501_0001,
+                0x0011_0280, // header: v_cndmask_b32 v1, 0, 1, s4
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_0005, // s_cbranch_scc1 end
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0002, // s_cbranch_scc1 latch
+                0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+                0xBE84_036A, // s_mov_b32 s4, vcc_lo
+                0xBF82_FFF7, // latch: s_branch header
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let latch = p.blocks.iter().find(|b| b.offset == 40).unwrap();
+        let mask = latch.phis.iter().find(|p| p.reg == Reg::S(4)).unwrap();
+        let s = structure(&p).unwrap();
+        assert!(s.mask_bits(mask.value, None).is_some());
     }
 
     #[test]
