@@ -1025,6 +1025,404 @@ mod tests {
         emit(&c, native, &p, &st, &io, &res, Target::ANY)
     }
 
+    fn scalar_descriptor_program(kind: crate::ResourceType, stride: u32) -> NativeProgram {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF408_0100, 0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0
+            0xF420_0202, 0xFA00_000C, // s_buffer_load_dword s8, s[4:7], 12
+            0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+            0x7E00_0208, // v_mov_b32 v0, s8 (the scalar load)
+            0x7E02_0206, // v_mov_b32 v1, s6 (descriptor dword 2)
+            0xE070_0000, 0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
+            0xE070_0004, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let input = UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                input,
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    stride: 0,
+                    table_offset_dwords: 8,
+                    ..input
+                },
+            ],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// The user data of a shader whose one table starts at byte `table` of
+    /// the view heap, dispatched with `views` views: the table's address and
+    /// the heap's guard slot (the null slot the dispatch keeps after them).
+    #[cfg(windows)]
+    fn table_user_data(cs: &HostShader, table: u32, views: usize) -> Vec<u32> {
+        let mut data = vec![0; cs.user_data_dwords().max(1) as usize];
+        for u in &cs.user_data {
+            data[u.index as usize] = match u.root {
+                RootType::Table => table,
+                root => super::host::guard(root, views, 0)
+                    .unwrap_or_else(|| panic!("user data of {root:?}")),
+            };
+        }
+        data
+    }
+
+    #[test]
+    fn scalar_buffer_descriptor_data_loads_values_and_record_count() {
+        for (stride, count) in [(0, 24), (8, 3)] {
+            let native = scalar_descriptor_program(crate::ResourceType::Srv, stride);
+            let cs = emit_synthetic(&[], &native).unwrap();
+            #[cfg(windows)]
+            {
+                use super::host::{Dispatch, Host, Root, Stride, View};
+                validate_if_available(&cs.dxil);
+                for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                    let Ok(host) = Host::new(warp) else {
+                        eprintln!("no SM 6.6 {backend} device; skipped dispatch");
+                        continue;
+                    };
+                    let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                    let view_stride = if stride == 0 {
+                        Stride::Raw
+                    } else {
+                        Stride::Structured(stride)
+                    };
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(table_user_data(&cs, 32, 3)))],
+                                views: &[
+                                    View::Buffer { data: &[0; 8], stride: view_stride },
+                                    View::Buffer { data: &[11, 22, 33, 44, 55, 66], stride: view_stride },
+                                    View::RawUav(2),
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(out, [vec![44, count]], "{backend}, stride {stride}");
+                    eprintln!("{backend}, stride {stride}: loaded 44 and record count {count}");
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = (cs, count);
+        }
+    }
+
+    #[test]
+    fn scalar_buffer_descriptor_data_requires_a_known_buffer_view() {
+        use crate::ResourceType::{Cbv, Srv};
+        let cbv = scalar_descriptor_program(Cbv, 0);
+        let mut wrong_slot = scalar_descriptor_program(Srv, 0);
+        wrong_slot.used[0].slot = 1;
+        let mut unaligned = scalar_descriptor_program(Srv, 0);
+        unaligned.code[8..12].copy_from_slice(&0xFA00_0010u32.to_le_bytes());
+        let invalid_stride = scalar_descriptor_program(Srv, 6);
+        for (native, what) in [
+            (cbv, "a constant buffer's descriptor read as data"),
+            (wrong_slot, "a scalar buffer descriptor without a known table view"),
+            (unaligned, "a scalar buffer descriptor without a known table view"),
+            (invalid_stride, "a scalar buffer descriptor with an unsupported stride"),
+        ] {
+            assert_eq!(
+                emit_synthetic(&[], &native),
+                Err(ShaderError::Unsupported { offset: 44, what })
+            );
+        }
+    }
+
+    /// Programs around a reconstructed scalar view that could translate
+    /// wrongly: each reads back the right values on the hosts or is refused.
+    #[cfg(windows)]
+    mod scalar_views {
+        use super::*;
+        use crate::ResourceType::{Srv, Uav};
+        use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        const NO_SOFFSET: u32 = 125;
+        const S_LOAD_DWORDX4: u32 = 2;
+        const S_BUFFER_LOAD_DWORD: u32 = 8;
+        const S_BUFFER_LOAD_DWORDX4: u32 = 10;
+        /// `s_add_u32` and `s_lshl_b32`.
+        const ADD: u32 = 0;
+        const SHL: u32 = 0x1E;
+
+        /// `s_mov_b32 s[sdst], n` for a constant up to 64.
+        const fn s_mov(sdst: u32, n: u32) -> u32 {
+            0xBE80_0300 | sdst << 16 | (128 + n)
+        }
+
+        /// SOP2 `op s[sdst], a, b` (an SGPR, or 128 + n for the constant n).
+        const fn sop2(op: u32, sdst: u32, a: u32, b: u32) -> u32 {
+            0x8000_0000 | op << 23 | sdst << 16 | b << 8 | a
+        }
+
+        /// SMEM `op s[sdata..], s[sbase..], soffset, offset`.
+        const fn smem(op: u32, sdata: u32, sbase: u32, offset: u32, soffset: u32) -> [u32; 2] {
+            [
+                0x3D << 26 | op << 18 | sdata << 6 | sbase >> 1,
+                soffset << 25 | offset,
+            ]
+        }
+
+        /// `v_mov_b32 v[vdst], src` (an SGPR, or 128 + n for the constant n).
+        const fn v_mov(vdst: u32, src: u32) -> u32 {
+            0x7E00_0200 | vdst << 17 | src
+        }
+
+        /// `buffer_store_dword v[vdata], off, s[srsrc..], 0 offset:offset`.
+        const fn store(vdata: u32, srsrc: u32, offset: u32) -> [u32; 2] {
+            [
+                0xE070_0000 | offset,
+                0x80 << 24 | (srsrc >> 2) << 16 | vdata << 8,
+            ]
+        }
+
+        /// The descriptor at the table's byte 0 into `s[4:7]`, the output
+        /// UAV's at byte 32 into `s[12:15]`.
+        const LOADS: [u32; 5] = {
+            let d = smem(S_LOAD_DWORDX4, 4, 0, 0, NO_SOFFSET);
+            let out = smem(S_LOAD_DWORDX4, 12, 0, 32, NO_SOFFSET);
+            [s_mov(1, 0), d[0], d[1], out[0], out[1]]
+        };
+
+        /// `code` in [`scalar_descriptor_program`]'s layout: a table at
+        /// `s0` holding a buffer view of `kind` and `stride` at byte 0 and
+        /// a raw UAV at byte 32.
+        fn translate(
+            code: &[&[u32]],
+            kind: crate::ResourceType,
+            stride: u32,
+        ) -> Result<HostShader, ShaderError> {
+            let mut native = scalar_descriptor_program(kind, stride);
+            native.vgprs = 4;
+            native.code = code
+                .iter()
+                .copied()
+                .flatten()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            emit_synthetic(&[], &native)
+        }
+
+        /// What the UAVs among `views` hold after `cs` runs on each
+        /// available host, its table at heap slot 1.
+        fn run(cs: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+            // One dispatch at a time, as in `valu_tests::run_cases`.
+            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            validate_if_available(&cs.dxil);
+            let mut out = Vec::new();
+            for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {backend} device; skipped dispatch");
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(cs).unwrap();
+                let user_data = table_user_data(cs, 32, views.len());
+                let got = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(user_data))],
+                            views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                out.push((backend, got));
+            }
+            out
+        }
+
+        /// A decoy at heap slot 0, six dwords viewed with `stride` at slot 1
+        /// and an output UAV of `out` dwords at slot 2.
+        fn run_over_six_dwords(
+            cs: &HostShader,
+            stride: u32,
+            out: u32,
+        ) -> Vec<(&'static str, Vec<u32>)> {
+            let stride = match stride {
+                0 => Stride::Raw,
+                n => Stride::Structured(n),
+            };
+            let views = [
+                View::Buffer { data: &[0; 8], stride },
+                View::Buffer { data: &[11, 22, 33, 44, 55, 66], stride },
+                View::RawUav(out),
+            ];
+            run(cs, &views)
+                .into_iter()
+                .map(|(backend, mut uavs)| (backend, uavs.remove(0)))
+                .collect()
+        }
+
+        /// A descriptor the program stores through is a UAV: scalar loads
+        /// of it, before and after the store, read through the same view,
+        /// whether lowering reconstructs the descriptor (the scalar load is
+        /// its first use) or takes the table's word that it is a UAV.
+        #[test]
+        fn a_scalar_load_of_a_descriptor_the_program_stores_through() {
+            let early = smem(S_BUFFER_LOAD_DWORD, 8, 4, 8, NO_SOFFSET);
+            let program = |first_use_is_scalar: bool| -> [Vec<u32>; 5] {
+                [
+                    LOADS.to_vec(),
+                    // s8 = dword 2 of the buffer before the store, or 0.
+                    if first_use_is_scalar { early.to_vec() } else { vec![s_mov(8, 0)] },
+                    // Dword 2 of the buffer = 55, then s9 reads it back.
+                    [&[v_mov(2, 128 + 55)][..], &store(2, 4, 8)].concat(),
+                    smem(S_BUFFER_LOAD_DWORD, 9, 4, 8, NO_SOFFSET).to_vec(),
+                    // Out: s8, s9 and the descriptor's dword 2 (its bytes).
+                    [
+                        &[v_mov(0, 8), v_mov(1, 9), v_mov(3, 6)][..],
+                        &store(0, 12, 0),
+                        &store(1, 12, 4),
+                        &store(3, 12, 8),
+                        &[S_ENDPGM],
+                    ]
+                    .concat(),
+                ]
+            };
+            for first_use_is_scalar in [true, false] {
+                let code = program(first_use_is_scalar);
+                let code: Vec<&[u32]> = code.iter().map(Vec::as_slice).collect();
+                let cs = translate(&code, Uav, 0).unwrap();
+                let views = [
+                    View::Buffer { data: &[0; 8], stride: Stride::Raw },
+                    View::RawUav(4),
+                    View::RawUav(3),
+                ];
+                for (backend, got) in run(&cs, &views) {
+                    assert_eq!(
+                        got,
+                        [vec![0, 0, 55, 0], vec![0, 55, 16]],
+                        "{backend}, scalar use first: {first_use_is_scalar}"
+                    );
+                }
+            }
+            // A structured UAV: the store wants a raw view, the scalar load
+            // the table's structured one.
+            let code = program(true);
+            let code: Vec<&[u32]> = code.iter().map(Vec::as_slice).collect();
+            assert_eq!(
+                translate(&code, Uav, 8),
+                Err(ShaderError::Unsupported {
+                    offset: 76,
+                    what: "incompatible scalar and vector views of a buffer descriptor",
+                })
+            );
+        }
+
+        /// A scalar load ignores the low two bits of its address: at byte
+        /// 13 it reads dword 3, from an immediate or a register offset or
+        /// their sum, and a wide load at byte 6 reads dwords 1 to 4 across
+        /// the elements of a structured view. This holds the values read,
+        /// not the masking: the hardware host and WARP both round an
+        /// unaligned load down themselves.
+        #[test]
+        fn scalar_loads_of_a_reconstructed_descriptor_at_unaligned_offsets() {
+            let end: [&[u32]; 4] = [
+                &[v_mov(0, 8), v_mov(1, 6)],
+                &store(0, 12, 0),
+                &store(1, 12, 4),
+                &[S_ENDPGM],
+            ];
+            let cases: [(&str, [u32; 2], u32); 3] = [
+                ("immediate 13", smem(S_BUFFER_LOAD_DWORD, 8, 4, 13, NO_SOFFSET), 44),
+                ("register 13", smem(S_BUFFER_LOAD_DWORD, 8, 4, 0, 9), 44),
+                ("immediate 6 + register 13", smem(S_BUFFER_LOAD_DWORD, 8, 4, 6, 9), 55),
+            ];
+            for (stride, count) in [(0, 24), (8, 3)] {
+                for (name, load, value) in &cases {
+                    let code = [&LOADS[..], &[s_mov(9, 13)], load, end[0], end[1], end[2], end[3]];
+                    let cs = translate(&code, Srv, stride).unwrap();
+                    for (backend, got) in run_over_six_dwords(&cs, stride, 2) {
+                        assert_eq!(got, [*value, count], "{backend}, stride {stride}, {name}");
+                    }
+                }
+                let code: [&[u32]; 10] = [
+                    &LOADS,
+                    &smem(S_BUFFER_LOAD_DWORDX4, 8, 4, 6, NO_SOFFSET),
+                    &[v_mov(0, 8), v_mov(1, 9), v_mov(2, 10), v_mov(3, 11)],
+                    &store(0, 12, 0),
+                    &store(1, 12, 4),
+                    &store(2, 12, 8),
+                    &store(3, 12, 12),
+                    &[v_mov(0, 6)],
+                    &store(0, 12, 16),
+                    &[S_ENDPGM],
+                ];
+                let cs = translate(&code, Srv, stride).unwrap();
+                for (backend, got) in run_over_six_dwords(&cs, stride, 5) {
+                    assert_eq!(got, [22, 33, 44, 55, count], "{backend}, stride {stride}, wide");
+                }
+            }
+        }
+
+        /// One load of the descriptor gives the record count that bounds a
+        /// loop, a twin load of the same dwords inside the loop gives the
+        /// descriptor each pass reads a dword through: the count comes from
+        /// the view the twin's scalar loads use.
+        #[test]
+        fn a_twin_load_in_a_loop_reads_the_descriptor_the_count_came_from() {
+            // Raw: byte offsets 0, 4 .. below the 24 bytes. Structured: the
+            // first dword of each of the 3 records of 8 bytes.
+            for (stride, shift, step, sum, count) in [(0, 0, 4, 231, 24), (8, 3, 1, 99, 3)] {
+                let code: [&[u32]; 9] = [
+                    &LOADS,                                      // words 0-4
+                    &[s_mov(20, 0), s_mov(21, 0)],               // 5-6: index, sum
+                    &smem(S_LOAD_DWORDX4, 16, 0, 0, NO_SOFFSET), // 7-8: the twin
+                    &[sop2(SHL, 22, 20, 128 + shift)],           // 9: byte offset
+                    &smem(S_BUFFER_LOAD_DWORD, 8, 16, 0, 22),    // 10-11
+                    &[
+                        sop2(ADD, 21, 21, 8),          // 12: sum += the dword
+                        sop2(ADD, 20, 20, 128 + step), // 13: the next index
+                        0xBF0A_0614,                   // 14: s_cmp_lt_u32 s20, s6
+                        0xBF85_FFF7,                   // 15: s_cbranch_scc1, to 7
+                        v_mov(0, 21),
+                        v_mov(1, 6),
+                    ],
+                    &store(0, 12, 0),
+                    &store(1, 12, 4),
+                    &[S_ENDPGM],
+                ];
+                let cs = translate(&code, Srv, stride).unwrap();
+                for (backend, got) in run_over_six_dwords(&cs, stride, 2) {
+                    assert_eq!(got, [sum, count], "{backend}, stride {stride}");
+                }
+            }
+        }
+    }
+
     fn sig_elem(
         name: &str,
         index: u32,
