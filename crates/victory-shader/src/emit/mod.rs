@@ -312,7 +312,22 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program(c, native, p, st, io, res, target);
+    let emit =
+        |p: &ir::Program, st: &structure::Structured, io: &io::Io, res: &resource::Resources| {
+            let first = emit_program(c, native, p, st, io, res, target);
+            if matches!(
+                first,
+                Err(ShaderError::Unsupported {
+                    what: lower::FIRST_INTERP_HALF,
+                    ..
+                })
+            ) && let Ok(explicit) = io::raise_interps(p, native, true)
+            {
+                return emit_program(c, native, p, st, &explicit, res, target).or(first);
+            }
+            first
+        };
+    let original = emit(p, st, io, res);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -327,7 +342,7 @@ pub fn emit(
         let st = structure::structure(p)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-        emit_program(c, native, p, &st, &io, &res, target)
+        emit(p, &st, &io, &res)
     };
     let threaded = lower_threaded(&p);
     // Threading rebuilds SSA from registers. Forward spill reloads when
@@ -3055,6 +3070,21 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn a_first_interpolation_half_can_be_exported_directly() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xc808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            e0,
+            e1,          // exp mrt0, v2, v2, v2, v2
+            0xbf81_0000, // s_endpgm
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert!(inputs.iter().any(|e| e.kind == 28));
+        validate(&shader);
     }
 
     #[test]

@@ -387,6 +387,7 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+pub(super) const FIRST_INTERP_HALF: Why = "the first half of an interpolation";
 /// A table descriptor loaded through an address recomputed at the use
 /// ([`RelOffset`]) whose constant part reaches more than one of the table's
 /// ranges, or that nothing bounds.
@@ -7595,7 +7596,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_INTERP_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
