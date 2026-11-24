@@ -1708,3 +1708,6 @@ fn root_srv_loop_carried_pointer_induction_phi() {
         );
     });
 }
+
+#[path = "addr_probe_tests.rs"]
+mod addr_probe_tests;
