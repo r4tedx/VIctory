@@ -133,6 +133,9 @@ fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShad
 
 #[test]
 fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     let mut ran = 0;
     for (wave, lane) in [(32, 20), (64, 40)] {
@@ -187,6 +190,9 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
 /// loop t times and stores t + 40.
 #[test]
 fn lane_read_loop_with_a_joined_exec_back_edge() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     const WAVE: u32 = 64;
     const LANE: u32 = 40;
     let native = program(WAVE, LANE, true);

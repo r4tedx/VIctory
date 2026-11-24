@@ -67,6 +67,9 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
