@@ -468,6 +468,24 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
     (c < extent(b)?).then_some((b, c))
 }
 
+/// A packed pixel input half, or `None` for padding explicitly described by
+/// the metadata. With an inferred partner, a missing half instead remains an
+/// error: the inference must not turn real data into zeroes.
+fn packed_input_half(
+    elements: &[SigElement],
+    a: u8,
+    b: Option<u8>,
+    h: u8,
+    explicit_second_row: bool,
+) -> Result<Option<(u8, u8)>, Why> {
+    let half = packed_half(elements, a, b, h);
+    if half.is_none() && !explicit_second_row {
+        Err("a packed input half no element holds")
+    } else {
+        Ok(half)
+    }
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
@@ -7639,16 +7657,21 @@ impl<'a> Lower<'a> {
                 self.as_int(x)
             }
             Some((pack2, b)) => {
+                let explicit_second_row = matches!(&self.x.native.io, StageIo::Ps { inputs, .. }
+                    if inputs.iter().any(|i| i.row == attribute.row && i.fp16 && i.pack2 && i.row2 != i.row));
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
+                    let src = if pack2 && f16 {
+                        packed_input_half(&l.s.inputs, attribute.row, b, h, explicit_second_row)?
+                    } else if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
                     match src {
                         Some((row, ch)) => total(l, row, ch).map(Some),
+                        None if f16 && explicit_second_row => Ok(Some(l.s.m.f32(0))),
                         None => Ok(None),
                     }
                 };
@@ -9795,6 +9818,36 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn explicit_packed_input_tail_is_padding() {
+        use super::super::container::SigElement;
+        use super::packed_input_half;
+        let element = |row, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: true,
+        };
+        // Four halves in row 6 followed by only two in its explicit partner
+        // row 7. The next two reads address the packing's zero padding.
+        let sig = vec![element(6, 4), element(7, 2)];
+        assert_eq!(
+            packed_input_half(&sig, 6, Some(7), 5, true),
+            Ok(Some((7, 1)))
+        );
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 6, true), Ok(None));
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 7, true), Ok(None));
+        // With an inferred partner the same gap is not assumed to be zero.
+        assert!(packed_input_half(&sig, 6, Some(7), 6, false).is_err());
+        assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
+    }
 
     /// Lowers a compute program of constants and returns the lowered result.
     fn lower_words(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
