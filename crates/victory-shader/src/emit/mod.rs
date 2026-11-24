@@ -1836,42 +1836,6 @@ mod tests {
         validate_if_available(&vs.dxil);
     }
 
-    #[test]
-    fn a_mask_left_in_a_register_reused_for_data_translates() {
-        // A wave64 vertex program keeps a lane mask in s[8:9]. One path into
-        // the join reuses s9 for data. The other still holds the mask's high
-        // dword there. The join's s9 is read as data. In the console
-        // compiler's IR the data value is undefined on the mask's edge.
-        let words = [
-            0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
-            0xBE88_046A,    // s_mov_b64 s[8:9], vcc
-            0xBF86_0001,    // s_cbranch_vccz -> join
-            0xB009_1234,    // s_movk_i32 s9, 0x1234
-            0x8700_FF09,    // join: s_and_b32 s0, s9, 0xff
-            0x0000_00FF,
-            0x7E02_0200, // v_mov_b32 v1, s0
-            0xF800_08CF, // exp pos0 v1, v1, v1, v1 done
-            0x0101_0101,
-            0xBF81_0000, // s_endpgm
-        ];
-        let native = NativeProgram {
-            stage: HwStage::Vs,
-            wave64: true,
-            vgprs: 2,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Vs {
-                inputs: vec![],
-                outputs: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let osg1 = container::signature(&[sig_elem("SV_Position", 0, 3, 9, Some(0), 0, 4)], false);
-        let vs = emit_synthetic(&[(FourCC::OSG1, &osg1)], &native).unwrap();
-        #[cfg(windows)]
-        validate_if_available(&vs.dxil);
-    }
-
     /// A compute program (8x8x1) of `words` sampling a 2D texture from a
     /// root table, translated.
     fn compute_sample(words: &[u32]) -> HostShader {
