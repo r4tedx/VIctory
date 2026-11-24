@@ -219,6 +219,22 @@ fn present_1440p_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
 }
 
+/// The color-target size `VICTORY_PRESENT_1440P` looks for: a `WxH` value
+/// (`1280x720`: the Series S world targets, two thirds of its 1080p output,
+/// as 2560x1440 is of Series X's 2160p), else `2560x1440`.
+fn present_size() -> (u64, u32) {
+    static SIZE: std::sync::OnceLock<(u64, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_1440P")
+            .ok()
+            .and_then(|v| {
+                let (w, h) = v.trim().split_once(['x', 'X'])?;
+                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            })
+            .unwrap_or((2560, 1440))
+    })
+}
+
 /// Takes the latest `2560x1440` color render target noted this frame, if
 /// `VICTORY_PRESENT_1440P` is enabled.
 pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
@@ -245,8 +261,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
         let d = unsafe { copy.texture.GetDesc() };
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
             && d.SampleDesc.Count == 1
-            && d.Width == 2560
-            && d.Height == 1440
+            && (d.Width, d.Height) == present_size()
             && matches!(d.Format.0, 28 | 29 | 87 | 91)
         {
             *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
