@@ -54,6 +54,18 @@
 //!   atomically is declared a 32-bit unsigned single-channel view; the
 //!   host's view at that index must be an R32 integer view (64-bit atomics
 //!   stop the translation). Global loads from a root SRV read it raw.
+//! * **Ray intersection** (added 2026-11-24): `image_bvh_intersect_ray`
+//!   and `image_bvh64_intersect_ray` read the BVH through the view at the
+//!   heap index of their descriptor, declared a raw buffer. The host's
+//!   view there must start at the console descriptor's base address and
+//!   span the structure; its size bounds the node fetches (a node that
+//!   does not lie in it whole returns all ones). The descriptor's flags
+//!   are the constants the code sets in dwords 1 and 3; a descriptor
+//!   loaded from a table reads as box sorting on, 6 ULPs of box growing
+//!   and triangle return mode 1, with the node count from the view's size
+//!   in dword 2. Its base address (dword 0) has no host value: a program
+//!   that computes the structure's address from it does not translate
+//!   (see `lower/bvh.rs` for what else is open).
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -76,6 +88,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;

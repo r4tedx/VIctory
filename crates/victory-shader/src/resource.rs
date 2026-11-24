@@ -193,7 +193,7 @@ pub fn track(
             };
             match &inst.fields {
                 Fields::Image { rsrc, sampler, .. } => {
-                    descriptor(rsrc, Role::Resource)?;
+                    descriptor(&view_words(inst, rsrc), Role::Resource)?;
                     if let Some(s) = sampler {
                         descriptor(s, Role::Sampler)?;
                     }
@@ -268,6 +268,27 @@ pub fn track(
         }
     }
     Ok(out)
+}
+
+/// Whether `inst` is a ray intersection (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`; RDNA2 ISA 8.2.10).
+pub(crate) fn is_bvh(inst: &Inst) -> bool {
+    inst.name().starts_with("image_bvh")
+}
+
+/// The dwords of the resource operand `rsrc` of an image instruction that
+/// say which view it reads. A BVH descriptor is not an image's (RDNA2 ISA,
+/// table 49): dword 0 is its base address in 256-byte units, dwords 1 and 3
+/// carry flags the code may set itself (box sorting, box growing, the
+/// triangle return mode) and dwords 2 and 3 its size in nodes. Only dword 0
+/// is traced to the table or heap; the emitter reads the others as numbers.
+// shortcut: bits 39:32 of the base address (dword 1 bits 7:0) are taken
+// with the view too: code that replaced them would read another view.
+fn view_words(inst: &Inst, rsrc: &Operand) -> Operand {
+    match *rsrc {
+        Operand::Scalar { code, .. } if is_bvh(inst) => Operand::Scalar { code, dwords: 1 },
+        op => op,
+    }
 }
 
 /// A dword after copy propagation.

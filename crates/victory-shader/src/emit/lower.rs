@@ -20,6 +20,8 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+pub(crate) mod bvh;
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -2295,6 +2297,9 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+            // Not an image access: the ordinary path would take the ray for
+            // coordinates and the BVH descriptor for a 1D texture.
+            Fields::Image { .. } if crate::resource::is_bvh(inst) => self.bvh(inst, b, i),
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
@@ -2962,6 +2967,9 @@ impl<'a> Lower<'a> {
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+        if crate::resource::is_bvh(ui) {
+            return self.bvh_descriptor_data(inst, site, &src, (code, count, first));
+        }
         let un = ui.name();
         let uav = un.contains("store")
             || un.contains("atomic")
