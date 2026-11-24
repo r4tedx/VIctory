@@ -237,15 +237,8 @@ fn trace(t: Tracer) -> Result<Resources, ShaderError> {
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
-                Fields::Flat {
-                    addr,
-                    saddr,
-                    offset,
-                    ..
-                } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
+                Fields::Flat { .. } if inst.name().starts_with("global_") => {
+                    let address = t.flat_address(site).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -1441,18 +1434,22 @@ impl<'a> Tracer<'a> {
 
     /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
     /// pair.
-    fn flat_address(
-        &self,
-        inst: &Inst,
-        addr: Option<&Operand>,
-        saddr: Option<&Operand>,
-        offset: i16,
-    ) -> Result<Address, &'static str> {
-        let Some(&Operand::Vector { reg, .. }) = addr else {
+    fn flat_address(&self, site: Site) -> Result<Address, &'static str> {
+        let inst = self.inst(site);
+        let Fields::Flat {
+            addr,
+            saddr,
+            offset,
+            ..
+        } = &inst.fields
+        else {
+            return Err("a global load");
+        };
+        let Some(Operand::Vector { reg, .. }) = *addr else {
             return Err("a global address not in VGPRs");
         };
-        let off = offset as i32 as u32;
-        match saddr {
+        let off = *offset as i32 as u32;
+        match saddr.as_ref() {
             Some(&Operand::Scalar { code, .. }) if code != NULL => {
                 let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
@@ -1464,7 +1461,7 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.address(lo, hi, extra, None)
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -1481,15 +1478,58 @@ impl<'a> Tracer<'a> {
                         multi: false,
                         spread: Some(0),
                     },
+                    Some(site),
                 )
             }
         }
     }
 
+    /// Whether this access only uses lanes that wrote the value earlier in
+    /// the same block. Other reads of the register may still see its old
+    /// value. The same block restriction keeps the proof within one pass
+    /// through a loop.
+    fn local_write_covers(&self, use_site: Option<Site>, term: Term) -> bool {
+        let (Some((b, read)), Term::Value(v)) = (use_site, term) else {
+            return false;
+        };
+        let Some((def_block, write)) = self.defs[v.0 as usize] else {
+            return false;
+        };
+        if def_block != b || write >= read {
+            return false;
+        }
+        let (Some((st, _)), Some(read), Some(write)) = (
+            self.structured(),
+            self.exec((b, read)),
+            self.exec((b, write)),
+        ) else {
+            return false;
+        };
+        st.bools.within(read, write)
+    }
+
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+    fn address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        site: Option<Site>,
+    ) -> Result<Address, &'static str> {
+        let mut s = self.sum(lo);
+        if s.base.is_none()
+            && let Term::Value(v) = lo
+            && self.local_write_covers(site, lo)
+        {
+            // Trace what the write computed without merging in the masked
+            // register's old value. Keep the general trace in its cache.
+            let (written, _) = self.sum_value(v, &mut Vec::new(), &mut Vec::new());
+            if written.sum.base.is_some() {
+                s = written.sum;
+            }
+        }
+        let covers_hi = self.local_write_covers(site, hi);
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         let use_rel = s.multi || (s.dynamic.is_some() && extra.dynamic.is_some());
         let lo_val = match lo {
@@ -1511,8 +1551,8 @@ impl<'a> Tracer<'a> {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             let want = high.map_or(Term::Const(0), Term::Value);
-            if !self.high_half(hi, high)
-                && !(high.is_some() && self.carried(hi, want, &mut Vec::new()))
+            if !self.high_half(hi, high, covers_hi)
+                && !(high.is_some() && self.carried(hi, want, covers_hi))
             {
                 return Err("an address with an untracked high half");
             }
@@ -1550,8 +1590,8 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let want = high.map_or(Term::Const(0), Term::Value);
-        if !self.high_half(hi, high)
-            && !(dynamic.is_some() && self.carried(hi, want, &mut Vec::new()))
+        if !self.high_half(hi, high, covers_hi)
+            && !(dynamic.is_some() && self.carried(hi, want, covers_hi))
         {
             return Err("an address with an untracked high half");
         }
@@ -1569,9 +1609,9 @@ impl<'a> Tracer<'a> {
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
-    fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+    fn high_half(&self, term: Term, high: Option<Value>, written: bool) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
-        let hi = self.strip_va_mask(hi);
+        let hi = self.strip_va_mask(term);
         if hi == want {
             return true;
         }
@@ -1579,13 +1619,14 @@ impl<'a> Tracer<'a> {
             return false;
         };
         // Lanes an EXEC mask left with the old high half use that one.
-        if let Some(old) = self.kept(v)
-            && !self.high_half(self.vorigin(old), high)
+        if !(written && hi == term)
+            && let Some(old) = self.kept(v)
+            && !self.high_half(self.vorigin(old), high, false)
         {
             return false;
         }
         if let Some(src) = self.moved(v) {
-            return self.high_half(src, high);
+            return self.high_half(src, high, false);
         }
         let Some([a, b]) = self
             .sop2(v, &["s_addc_u32"])
@@ -1595,14 +1636,14 @@ impl<'a> Tracer<'a> {
             return false;
         };
         let (a, b) = (self.strip_va_mask(a), self.strip_va_mask(b));
-        a == Term::Const(0) && self.high_half(b, high)
-            || b == Term::Const(0) && self.high_half(a, high)
+        a == Term::Const(0) && self.high_half(b, high, false)
+            || b == Term::Const(0) && self.high_half(a, high, false)
     }
 
     /// `hi` adds something (with carry) to `want` (`high` or 0 for a table),
     /// through carry-adds, adds, subtractions (minuend), VA-preserving masks,
     /// and high-half phis.
-    fn carried(&self, hi: Term, want: Term, seen: &mut Vec<Value>) -> bool {
+    fn carried(&self, hi: Term, want: Term, written: bool) -> bool {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Carry {
             No,
@@ -1616,8 +1657,14 @@ impl<'a> Tracer<'a> {
                 _ => Carry::No,
             }
         }
-        fn rec(t: &Tracer<'_>, hi: Term, want: Term, seen: &mut Vec<Value>) -> Carry {
-            let hi = t.strip_va_mask(hi);
+        fn rec(
+            t: &Tracer<'_>,
+            term: Term,
+            want: Term,
+            seen: &mut Vec<Value>,
+            written: bool,
+        ) -> Carry {
+            let hi = t.strip_va_mask(term);
             if hi == want {
                 return Carry::Yes;
             }
@@ -1628,16 +1675,18 @@ impl<'a> Tracer<'a> {
                 return Carry::Cycle;
             }
             // Lanes an EXEC mask left with the old high half use that one.
-            if let Some(old) = t.kept(v) {
+            if !(written && hi == term)
+                && let Some(old) = t.kept(v)
+            {
                 seen.push(v);
-                let old = rec(t, t.vorigin(old), want, seen);
+                let old = rec(t, t.vorigin(old), want, seen, false);
                 seen.pop();
                 if old == Carry::No {
                     return Carry::No;
                 }
             }
             if let Some(src) = t.moved(v) {
-                return rec(t, src, want, seen);
+                return rec(t, src, want, seen, false);
             }
             if let Some((phi_b, phi_i)) = t.phis[v.0 as usize] {
                 if t.p.blocks[phi_b].phis[phi_i].args.is_empty() {
@@ -1646,7 +1695,7 @@ impl<'a> Tracer<'a> {
                 seen.push(v);
                 let mut any_yes = false;
                 for &arg in &t.p.blocks[phi_b].phis[phi_i].args {
-                    match rec(t, t.vorigin(arg), want, seen) {
+                    match rec(t, t.vorigin(arg), want, seen, false) {
                         Carry::No => {
                             seen.pop();
                             return Carry::No;
@@ -1673,7 +1722,7 @@ impl<'a> Tracer<'a> {
                     )
                 })
             {
-                return best(rec(t, a, want, seen), rec(t, b, want, seen));
+                return best(rec(t, a, want, seen, false), rec(t, b, want, seen, false));
             }
             if let Some(minuend) = t
                 .sop2(v, &["s_subb_u32", "s_sub_u32", "s_sub_i32"])
@@ -1690,11 +1739,11 @@ impl<'a> Tracer<'a> {
                     .map(|[_, b]| b)
                 })
             {
-                return rec(t, minuend, want, seen);
+                return rec(t, minuend, want, seen, false);
             }
             Carry::No
         }
-        rec(self, hi, want, seen) == Carry::Yes
+        rec(self, hi, want, &mut Vec::new(), written) == Carry::Yes
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -1757,7 +1806,7 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra, None)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -1835,6 +1884,7 @@ impl<'a> Tracer<'a> {
                     multi: false,
                     spread: Some(0),
                 },
+                None,
             )?;
             return Ok(Source::Built {
                 address,
@@ -2200,24 +2250,11 @@ impl<'a> Tracer<'a> {
         let Some(sites) = words.iter().map(at).collect::<Option<Vec<_>>>() else {
             return Ok(None);
         };
-        let address = |site: Site| {
-            let inst = self.inst(site);
-            let Fields::Flat {
-                addr,
-                saddr,
-                offset,
-                ..
-            } = &inst.fields
-            else {
-                return Err("a global load");
-            };
-            self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-        };
         let (load, first) = sites[0];
-        let a0 = address(load)?;
+        let a0 = self.flat_address(load)?;
         for (k, &(site, dword)) in sites.iter().enumerate() {
             self.runs(site, known)?;
-            let a = address(site)?;
+            let a = self.flat_address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
             if (a.param, a.dynamic, a.rel) != (a0.param, a0.dynamic, a0.rel)
                 || a.offset.wrapping_add(4 * dword as u32) != want
@@ -2869,6 +2906,40 @@ pub(crate) mod tests {
     }
     const fn vgpr(n: u8) -> u16 {
         256 + n as u16
+    }
+
+    #[test]
+    fn traces_a_masked_global_address_before_data_reuse() {
+        let layout = [param(Descriptor, 6, 2)];
+        let mut words = vec![
+            vop1(0x001, 5, 0x84), // v5 = 4 in every lane
+            vop1(0x001, 6, 0x81), // v6 = 1 in every lane
+            0x7D84_0080,          // v_cmp_eq_u32 vcc, 0, v0
+            0xBE94_3C6A,          // s_and_saveexec_b32 s20, vcc_lo
+        ];
+        words.extend(vop3b(0x30F, 5, 106, sgpr(6), vgpr(0), 0));
+        words.extend(vop3b(0x128, 6, 106, sgpr(7), 0x80, sgpr(106)));
+        let access = words.len();
+        let load = global_load(4, 5, 125, 12);
+        let restore = sop2(0x10, 126, 126, 20); // s_or_b32 exec_lo, exec_lo, s20
+        words.extend(load);
+        words.push(restore);
+        words.extend([
+            vop2(0x25, 7, vgpr(5), 6), // read v5 and v6 as data under full EXEC
+            S_ENDPGM,
+        ]);
+
+        let res = track_words(&words, &layout, HwStage::Cs);
+        let address = res.scalar[0].1;
+        assert_eq!(address.param, 0);
+        assert_eq!(address.offset, 12);
+        assert!(address.dynamic.is_some());
+
+        words[access..access + 3].copy_from_slice(&[restore, load[0], load[1]]);
+        assert!(matches!(
+            try_track_words(&words, &layout, HwStage::Cs),
+            Err(ShaderError::Unsupported { what: MASKED, .. })
+        ));
     }
 
     #[test]
