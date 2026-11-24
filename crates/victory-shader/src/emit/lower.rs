@@ -6469,8 +6469,7 @@ impl<'a> Lower<'a> {
                     }
                     self.s.flags |= flags::WAVE_OPS;
                     let scale = if op == 61 {
-                        let bias = addr_val(self, 0)?;
-                        let bias = self.as_float(bias);
+                        let bias = float(self, bias_at)?;
                         Some(self.unary(21, bias))
                     } else {
                         None
@@ -6478,7 +6477,7 @@ impl<'a> Lower<'a> {
                     let g = self.quad_gradients(&cs[..spatial], scale);
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
