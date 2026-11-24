@@ -183,7 +183,16 @@ fn create() -> windows::core::Result<Host> {
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            eprintln!("host device on the software adapter (WARP)");
             tracing::info!("host device on the software adapter (WARP)");
+        } else if cfg!(feature = "diagnostics")
+            && let Ok(want) = std::env::var("VICTORY_D3D12_ADAPTER")
+        {
+            // Diagnostics: the first adapter whose description holds `want`
+            // (a second GPU in the same machine, say).
+            let adapter = named_adapter(&want)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %want, "host device on a named adapter");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -237,6 +246,25 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// The first DXGI adapter whose description contains `want`.
+fn named_adapter(want: &str) -> windows::core::Result<IDXGIAdapter> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        for i in 0.. {
+            let adapter: IDXGIAdapter = factory.EnumAdapters(i)?;
+            let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            if name.contains(want) {
+                eprintln!("host device on adapter {i}: {name}");
+                return Ok(adapter);
+            }
+        }
+        unreachable!()
     }
 }
 

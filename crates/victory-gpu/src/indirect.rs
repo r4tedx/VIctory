@@ -72,62 +72,66 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-// Keep the host group and list budget limits of the ordinary clamp.
+// Keep the host group and list budget limits of the ordinary clamp. The
+// scheme is the one fork PR #11 measured on an RTX 5070, a Radeon iGPU and
+// WARP with 6,000 records: the legacy word 0 counts threads; this pass
+// charges a second word, in groups of 64 threads, with one InterlockedAdd
+// per record and a refund on refusal. A record's cost is at most 2^20 groups
+// and a batch has at most 63 groups (4,032 records), so the word peaks below
+// 2^21 + 4,032 * 2^20 < 2^32 even with every refund still pending. Phase 0
+// seeds the word from word 0, phase 2 writes the accepted groups back.
+// (An earlier compare-exchange loop retried after a plain load of the
+// budget and never ended on an RTX 5070; bounding its retries refused most
+// records under contention on 64-lane waves.)
 const SPLIT_DISPATCH: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
-cbuffer Dispatch : register(b0) { uint stride; uint records; uint waves; uint has_count; };
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Dispatch : register(b0) {
+    uint stride; uint records; uint waves; uint has_count; uint first; uint phase;
+};
 ByteAddressBuffer source : register(t0);
 ByteAddressBuffer count : register(t1);
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+static const uint BUDGET = 1u << 21; // in groups of 64 threads
 static const uint GROUPS = 1u << 20;
 
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
+    if (phase != 1) {
+        if (id.x != 0) return;
+        uint threads = budget.Load(0);
+        uint initial = (min(threads, BUDGET * 64) + 63) / 64;
+        if (phase == 0) {
+            budget.Store(4, initial);
+        } else if (threads < BUDGET * 64) {
+            budget.Store(0, threads + (budget.Load(4) - initial) * 64);
+        }
+        return;
+    }
+    uint record = first + id.x;
+    if (record >= records) return;
     uint3 g = 0;
-    if (has_count == 0 || id.x < count.Load(0)) {
-        g = source.Load3(id.x * stride);
+    if (has_count == 0 || record < count.Load(0)) {
+        g = source.Load3(record * stride);
         // An oversized X dispatch runs empty, as with a direct dispatch.
         g.x = g.x <= 65535u / waves ? g.x * waves : 0;
         g.yz = min(g.yz, uint2(65535, 65535));
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = 0;
         }
-        uint cost = g.x * g.y * g.z * 64;
+        uint cost = g.x * g.y * g.z;
         if (cost != 0) {
-            // Charge only records authorized by the count buffer and reserve
-            // their actual host work without wrapping the shared budget (a
-            // plain InterlockedAdd can: thousands of records in flight at up
-            // to 2^26 each pass 2^32). Each retry expects the value the last
-            // exchange observed, never a plain load: a load of this UAV may
-            // return a stale value every time, and the loop then never ends.
-            // The retries are bounded so that termination does not rest on
-            // the hardware's forward progress; a record that runs out of
-            // them is refused, like one past the budget.
-            uint used = 0;
-            bool charged = false;
-            [allow_uav_condition]
-            for (uint attempt = 0; attempt < 1024; attempt++) {
-                if (used >= BUDGET || cost > BUDGET - used) {
-                    break;
-                }
-                uint observed;
-                budget.InterlockedCompareExchange(0, used, used + cost, observed);
-                if (observed == used) {
-                    charged = true;
-                    break;
-                }
-                used = observed;
-            }
-            if (!charged) {
+            uint used;
+            budget.InterlockedAdd(4, cost, used);
+            // A pending refund can make a refusal conservative.
+            if (used + cost > BUDGET) {
+                budget.InterlockedAdd(4, 0u - cost);
                 g = 0;
             }
         }
     }
-    args.Store3(id.x * 12, g);
+    args.Store3(record * 12, g);
 }
 "#;
 
@@ -395,7 +399,10 @@ pub(crate) fn split_dispatch(
         list.buffer_state(buffer, BUFFER_READ);
     }
     list.buffer_state(&output, BUFFER_WRITE);
-    let constants = [stride, records, waves, u32::from(count.is_some())];
+    let mut constants = [stride, records, waves, u32::from(count.is_some()), 0, 0];
+    // See SPLIT_DISPATCH: batches of at most 63 groups keep the budget word
+    // below 2^32 with every refund pending.
+    const BATCH_GROUPS: u32 = 63;
 
     // SAFETY: an open list, with aligned addresses in live buffers that the
     // list tracks. The packed output has one full record per thread.
@@ -404,13 +411,23 @@ pub(crate) fn split_dispatch(
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&expand.root);
         l.SetPipelineState(&expand.pso);
-        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootShaderResourceView(2, count.map_or(gpu, |(_, gpu)| gpu));
         l.SetComputeRootUnorderedAccessView(3, output.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, budget);
-        l.Dispatch(groups, 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
+        let launch = |constants: &[u32; 6], groups| {
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.Dispatch(groups, 1, 1);
+            l.ResourceBarrier(&[uav_barrier()]);
+        };
+        launch(&constants, 1);
+        constants[5] = 1;
+        for group in (0..groups).step_by(BATCH_GROUPS as usize) {
+            constants[4] = group * 64;
+            launch(&constants, (groups - group).min(BATCH_GROUPS));
+        }
+        constants[5] = 2;
+        launch(&constants, 1);
     }
     Some(output)
 }
@@ -458,6 +475,95 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    /// Thousands of split-dispatch records in one pass, every thread
+    /// reserving its cost in the one budget word: each record comes out
+    /// exactly (its X times the wave count, or zero) and the accepted costs
+    /// stay within the budget. Small records alone must all be accepted, so
+    /// refusals under contention would show; with large ones mixed in the
+    /// budget must still fill past half. A GPU stress (the shape that took
+    /// an RTX 5070's driver down with an unbounded loop), so it runs only
+    /// when asked for, one device at a time.
+    #[test]
+    #[ignore = "GPU stress: run on its own, one device at a time"]
+    fn split_dispatch_charges_thousands_of_records_exactly() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        const RECORDS: u32 = 6000;
+        const WAVES: u32 = 2;
+        const BUDGET: u64 = 1 << 27;
+        let Some(host) = super::host() else {
+            eprintln!("no D3D12 host: the stress was skipped");
+            return;
+        };
+        for big in [false, true] {
+            // Small records (1-7, 1, 1); with `big`, every 500th is the
+            // largest the pass accepts: X 32767 (65534 after the waves) by
+            // Y 16, about 2^26 of cost, so only one or two of them fit.
+            let record = |k: u32| -> [u32; 3] {
+                if big && k.is_multiple_of(500) {
+                    [32767, 16, 1]
+                } else {
+                    [1 + k % 7, 1, 1]
+                }
+            };
+            let (source, src): (ID3D12Resource, *mut u8) =
+                host.shared_buffer(u64::from(RECORDS) * 12).expect("source");
+            let (readback, out): (ID3D12Resource, *mut u8) =
+                host.shared_buffer(u64::from(RECORDS) * 12).expect("readback");
+            for k in 0..RECORDS {
+                // SAFETY: inside the mapped source buffer.
+                unsafe { src.cast::<[u32; 3]>().add(k as usize).write(record(k)) };
+            }
+            let list = host.new_list().expect("new_list");
+            // SAFETY: a live buffer.
+            let gpu = unsafe { source.GetGPUVirtualAddress() };
+            let output = super::split_dispatch(&list, (&source, gpu), None, (12, RECORDS, WAVES))
+                .expect("split dispatch pass");
+            list.buffer_state(
+                &output,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+            );
+            // SAFETY: both buffers hold RECORDS * 12 bytes; the readback is
+            // in the common state, promoted to a copy destination.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&readback, 0, &output, 0, u64::from(RECORDS) * 12);
+            }
+            list.keep(&source);
+            list.keep(&readback);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: a live device.
+            unsafe { host.device.GetDeviceRemovedReason() }.expect("the device was removed");
+            let cost = |g: [u32; 3]| u64::from(g[0]) * u64::from(g[1]) * u64::from(g[2]) * 64;
+            let mut accepted = 0u64;
+            let mut refused = Vec::new();
+            for k in 0..RECORDS {
+                // SAFETY: inside the mapped readback buffer.
+                let got = unsafe { out.cast::<[u32; 3]>().add(k as usize).read() };
+                let [x, y, z] = record(k);
+                let want = [x * WAVES, y, z];
+                if got == want {
+                    accepted += cost(want);
+                } else {
+                    assert_eq!(got, [0, 0, 0], "record {k}: neither expanded nor refused");
+                    refused.push(cost(want));
+                }
+            }
+            eprintln!(
+                "big {big}: {} of {RECORDS} records accepted, {accepted} of {BUDGET} budget",
+                RECORDS as usize - refused.len()
+            );
+            assert!(accepted <= BUDGET, "the budget was overspent");
+            if big {
+                // A pending refund can make a refusal near the limit
+                // conservative, but the budget still fills past half.
+                assert!(accepted > BUDGET / 2, "the budget was barely used");
+            } else {
+                assert!(refused.is_empty(), "records refused under the budget");
+            }
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
