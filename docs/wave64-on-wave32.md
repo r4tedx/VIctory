@@ -188,10 +188,10 @@ by a wave64 group of a multiple of 64 threads with no LDS and no
 `s_barrier`. The emitted shader says its k (`HostShader::group_waves`,
 kept in the shader cache); `victory-gpu` multiplies a direct dispatch's x
 and drops the dispatch if that passes D3D12's 65535 groups per dimension.
-Open: indirect dispatches of such a shader are dropped until the records'
-x is multiplied on the GPU. The clamp pass rewrites the records in place,
-so a multiplication there has to be undone after the execution, or a
-record executed twice would be multiplied twice.
+Indirect compute dispatches use a GPU pass to expand X into packed
+arguments owned by the command list. The pass honors the title's count
+buffer, bounds and budgets the resulting host groups, and leaves the
+title's arguments and count intact so the same records can run again.
 
 **With LDS and `s_barrier`:** the waves of a group do meet there, so they
 must stay one host group. Open; candidates are group barriers where every

@@ -798,12 +798,14 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// Per-list GPU-writable buffers for indirect rectangle expansion
 /// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
 /// its VB -> UAV barrier), one rewritten-arguments buffer (grown if a draw
-/// has more records), and chunks of 4-byte atomic counters zeroed before
+/// has more records), a separate buffer for rewritten compute dispatches,
+/// and chunks of 4-byte atomic counters zeroed before
 /// submission.
 #[derive(Default)]
 struct RectScratch {
     vertices: Option<ID3D12Resource>,
     args: Option<(ID3D12Resource, u64)>,
+    dispatch_args: Option<(ID3D12Resource, u64)>,
     counters: Vec<(ID3D12Resource, usize, u64)>,
     counter_chunk: usize,
     counter_used: u32,
@@ -816,7 +818,7 @@ unsafe impl Send for RectScratch {}
 /// Counters per chunk (4 KiB = 1024 words).
 const RECT_COUNTER_CHUNK: u32 = 1024;
 /// Initial rewritten-arguments buffer size (64 KiB = 4096 draw records).
-const RECT_ARGS_MIN: u64 = 64 << 10;
+const REWRITTEN_ARGS_MIN: u64 = 64 << 10;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1770,17 +1772,32 @@ impl HostList {
     /// A GPU-writable buffer of at least `bytes` for rewritten indirect
     /// draw arguments, kept alive until the list is reset.
     pub(crate) fn rect_args(&self, bytes: u64) -> Option<ID3D12Resource> {
-        let want = bytes.max(RECT_ARGS_MIN).next_multiple_of(256);
-        let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buf, len)) = &rect.args
+        self.rewritten_args(bytes, |scratch| &mut scratch.args)
+    }
+
+    /// Scratch for rewritten compute dispatches. Its tracked buffer state
+    /// is independent of the rectangle expander's explicit transitions.
+    pub(crate) fn dispatch_args(&self, bytes: u64) -> Option<ID3D12Resource> {
+        self.rewritten_args(bytes, |scratch| &mut scratch.dispatch_args)
+    }
+
+    fn rewritten_args(
+        &self,
+        bytes: u64,
+        select: impl FnOnce(&mut RectScratch) -> &mut Option<(ID3D12Resource, u64)>,
+    ) -> Option<ID3D12Resource> {
+        let want = bytes.max(REWRITTEN_ARGS_MIN).next_multiple_of(256);
+        let mut scratch = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = select(&mut scratch);
+        if let Some((buf, len)) = slot
             && *len >= want
         {
             return Some(buf.clone());
         }
         let buffer = host()?.default_buffer(want)?;
-        name(&buffer, || format!("rect args {want:#x}"));
-        let old = rect.args.replace((buffer.clone(), want));
-        drop(rect);
+        name(&buffer, || format!("rewritten indirect args {want:#x}"));
+        let old = slot.replace((buffer.clone(), want));
+        drop(scratch);
         if let Some((old, _)) = old {
             self.keep(&old);
         }

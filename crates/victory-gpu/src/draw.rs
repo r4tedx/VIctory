@@ -1561,8 +1561,14 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+        let dispatch = (kind == DISPATCH)
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
+            .flatten()
+            .filter(|p| p.compute);
+        let waves = dispatch.map_or(1, group_waves);
+        let host_stride = if waves > 1 { 12 } else { stride };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(kind, host_stride))
             .flatten()
         else {
             why("no host signature");
@@ -1572,23 +1578,36 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        }
+        // The rewrite and the clamp both bind their own compute pipeline.
+        let rewritten;
+        let host_args = if waves > 1 {
+            if max == 0 {
+                return true;
+            }
+            let Some(buffer) = crate::indirect::split_dispatch(
+                list,
+                (&args.buffer, args.gpu(arguments)),
+                counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at))),
+                (stride, max, waves),
+            ) else {
+                why("split dispatch arguments could not be rewritten");
+                return false;
+            };
+            rewritten = buffer;
+            (&rewritten, 0)
+        } else {
+            if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            }
+            (&args.buffer, args.offset(arguments))
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                // shortcut: a shader emitted as one console wave per host
-                // group needs the records' x multiplied on the GPU; until
-                // the clamp does that, its indirect dispatches are dropped.
-                Some(p) if p.compute && group_waves(p) == 1 => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => dispatch.is_some_and(|p| self.bind(list, p, true)),
             _ => false,
         };
         if !ran {
@@ -1613,7 +1632,7 @@ impl State {
             list,
             &signature,
             max,
-            (&args.buffer, args.offset(arguments)),
+            host_args,
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
         if crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.has_root_uavs())
@@ -1851,7 +1870,7 @@ mod tests {
 
     /// Synthetic GFX10 compute shader reading Root CBV (slot 0, dword 0) and
     /// Root SRV (slot 1, byte offset `+1.5 MiB`), and storing `cbv ^ srv ^
-    /// 0xA5A5_5A5A` to Root UAV (slot 2, byte offset `+1.5 MiB`).
+    /// 0xA5A5_5A5A` to Root UAV (slot 2, at `+1.5 MiB + 4 * group_id.x`).
     fn build_root_view_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
         let s_mov_b32 =
             |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
@@ -1881,7 +1900,8 @@ mod tests {
         };
 
         let mut words = Vec::new();
-        // s[0:1] = CBV 0, s[2:3] = SRV 1, s[4:5] = UAV 2.
+        // s[0:1] = CBV 0, s[2:3] = SRV 1, s[4:5] = UAV 2, s6 = group id X.
+        words.push(vop1(0x001, 3, 6));
         words.extend_from_slice(&s_load_dword(6, 0, 0));
         // SRV descriptor in s[8:11], UAV descriptor in s[12:15].
         words.push(s_mov_b32(8, 2));
@@ -1900,7 +1920,9 @@ mod tests {
         words.extend_from_slice(&buffer_load_dword_offen(1, 0, 8));
         words.push(vop2(0x1D, 2, 6, 1)); // v_xor_b32 v2, s6, v1
         words.extend_from_slice(&[vop2(0x1D, 2, 0xFF, 2), 0xA5A5_5A5A]); // v_xor_b32 v2, literal, v2
-        words.extend_from_slice(&buffer_store_dword_offen(2, 0, 12));
+        words.push(vop2(0x1A, 3, 0x82, 3)); // v3 = group id X * 4
+        words.push(vop2(0x25, 3, 256, 3)); // v3 += 1.5 MiB
+        words.extend_from_slice(&buffer_store_dword_offen(2, 3, 12));
         words.push(0xBF81_0000); // s_endpgm
 
         let used = vec![
@@ -1967,7 +1989,7 @@ mod tests {
             ],
             used: used.clone(),
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 6 << 1,
+                rsrc2: (6 << 1) | (1 << 7),
                 threads: [1, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -2403,6 +2425,58 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    #[test]
+    fn indirect_split_dispatch_expands_groups_and_preserves_arguments() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 host for the split dispatch test");
+            return;
+        };
+        let (mut shader, used) = build_root_view_cs();
+        // Test the host launch protocol with a shader that records the
+        // host group IDs. The shader crate tests its own wave relabelling.
+        shader.group_waves = 2;
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        let args = Allocation::watched(64 << 10);
+        let uav = Allocation::watched(2 << 20);
+        crate::shadow::register(args.ptr as usize, args.addr(), 64 << 10);
+        crate::shadow::register(uav.ptr as usize, uav.addr(), 2 << 20);
+        let source = crate::shadow::find(args.addr(), 64).expect("argument shadow");
+        let words = [
+            2, 0, 0, 0, // count, then padding before the arguments
+            32768, 1, 1, 0xAAAA, // expanded X would exceed the host limit
+            1, 1, 1, 0xBBBB, // two host groups
+            2, 1, 1, 0xCCCC, // four host groups, beyond the count
+        ];
+        // SAFETY: the records fit in the committed argument allocation.
+        unsafe { args.ptr.cast::<[u32; 16]>().write(words) };
+
+        let list = host.new_list().expect("new_list");
+        let heap = crate::descriptor::test_view_heap(16);
+        let mut state = State::default();
+        for (count, groups) in [(Some(args.addr()), 2), (None, 4)] {
+            state.reset(pso);
+            state.set_heaps(&[heap]);
+            state.set_view(true, 2, uav.addr());
+            assert!(state.execute_indirect(&list, (2, 16, 3), args.addr() + 16, count));
+            list.close();
+            assert_eq!(host.log_messages(), None);
+            host.execute(&[&list]);
+            for group in 0..4 {
+                // SAFETY: the group results are inside the committed UAV.
+                let value = unsafe { uav.ptr.add(0x18_0000).cast::<u32>().add(group).read() };
+                assert_eq!(value, if group < groups { 0xA5A5_5A5A } else { 0 });
+            }
+            for (word, expected) in words.iter().enumerate() {
+                assert_eq!(source.read_u32(word * 4), *expected, "argument word {word}");
+            }
+            list.reset();
+        }
+        crate::shadow::unregister(args.ptr as usize, args.addr());
+        crate::shadow::unregister(uav.ptr as usize, uav.addr());
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
     }

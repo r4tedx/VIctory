@@ -6,7 +6,8 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //! Non-indexed rectangle-list draws follow the clamp with GPU-side
-//! rectangle expansion in [`crate::rectangles`].
+//! rectangle expansion in [`crate::rectangles`]. Split-wave compute
+//! dispatches instead get bounded and expanded into a separate buffer.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -68,6 +69,51 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
+}
+"#;
+
+// Keep the host group and list budget limits of the ordinary clamp.
+const SPLIT_DISPATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Dispatch : register(b0) { uint stride; uint records; uint waves; uint has_count; };
+ByteAddressBuffer source : register(t0);
+ByteAddressBuffer count : register(t1);
+RWByteAddressBuffer args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint GROUPS = 1u << 20;
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= records) return;
+    uint3 g = 0;
+    if (has_count == 0 || id.x < count.Load(0)) {
+        g = source.Load3(id.x * stride);
+        // An oversized X dispatch runs empty, as with a direct dispatch.
+        g.x = g.x <= 65535u / waves ? g.x * waves : 0;
+        g.yz = min(g.yz, uint2(65535, 65535));
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = 0;
+        }
+        uint cost = g.x * g.y * g.z * 64;
+        if (cost != 0) {
+            // Charge only records authorized by the count buffer and reserve
+            // their actual host work without wrapping the shared budget.
+            [allow_uav_condition]
+            while (true) {
+                uint used = budget.Load(0);
+                if (used >= BUDGET || cost > BUDGET - used) {
+                    g = 0;
+                    break;
+                }
+                uint observed;
+                budget.InterlockedCompareExchange(0, used, used + cost, observed);
+                if (observed == used) break;
+            }
+        }
+    }
+    args.Store3(id.x * 12, g);
 }
 "#;
 
@@ -150,7 +196,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
                     errors.GetBufferSize(),
                 );
                 tracing::warn!(
-                    "argument clamp: DXC: {}",
+                    "indirect argument shader: DXC: {}",
                     String::from_utf8_lossy(text).trim()
                 );
             }
@@ -177,7 +223,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match make(SOURCE) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -187,16 +233,16 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+fn make(source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            s!("indirect"),
             None,
             None,
             s!("main"),
@@ -220,10 +266,10 @@ fn make() -> windows::core::Result<Clamp> {
                     errors.GetBufferSize(),
                 )
             };
-            tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
+            tracing::info!(error = %e, "indirect argument shader: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
         }
-        fallback = dxc_compile(SOURCE)
-            .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
+        fallback = dxc_compile(source)
+            .inspect_err(|e| tracing::warn!(error = %e, "indirect argument shader: DXC failed too"))?;
     } else {
         fallback = Vec::new();
     }
@@ -297,6 +343,62 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> bool {
     clamp_uav(list, buffer, gpu, spec)
+}
+
+/// Rewrites split-wave dispatch records into packed D3D12 arguments while
+/// preserving the source and count buffers. The caller binds the title's
+/// pipeline after this pass replaces the compute root signature and PSO.
+pub(crate) fn split_dispatch(
+    list: &HostList,
+    (source, gpu): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (stride, records, waves): (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    let groups = records.div_ceil(64);
+    // The shader addresses source records with a 32-bit byte offset.
+    if groups == 0
+        || groups > 65535
+        || !gpu.is_multiple_of(4)
+        || count.is_some_and(|(_, gpu)| !gpu.is_multiple_of(4))
+        || stride < 12
+        || !stride.is_multiple_of(4)
+        || u64::from(records - 1) * u64::from(stride) + 11 > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    static EXPAND: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    let expand = EXPAND
+        .get_or_init(|| {
+            make(SPLIT_DISPATCH)
+                .inspect_err(|e| tracing::warn!(error = %e, "no split dispatch argument shader"))
+                .ok()
+        })
+        .as_ref()?;
+    let budget = list.budget()?;
+    let output = list.dispatch_args(u64::from(records) * 12)?;
+    list.buffer_state(source, BUFFER_READ);
+    if let Some((buffer, _)) = count {
+        list.buffer_state(buffer, BUFFER_READ);
+    }
+    list.buffer_state(&output, BUFFER_WRITE);
+    let constants = [stride, records, waves, u32::from(count.is_some())];
+
+    // SAFETY: an open list, with aligned addresses in live buffers that the
+    // list tracks. The packed output has one full record per thread.
+    unsafe {
+        let l = &list.list;
+        l.ResourceBarrier(&[uav_barrier()]);
+        l.SetComputeRootSignature(&expand.root);
+        l.SetPipelineState(&expand.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, gpu);
+        l.SetComputeRootShaderResourceView(2, count.map_or(gpu, |(_, gpu)| gpu));
+        l.SetComputeRootUnorderedAccessView(3, output.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(groups, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    Some(output)
 }
 
 /// Runs `max` records of `signature` from `args` (a host copy of title
