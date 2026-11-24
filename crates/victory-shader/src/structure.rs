@@ -292,6 +292,12 @@ impl Bools {
         rec(self, a, b, &mut HashSet::new())
     }
 
+    /// Whether every atom of `b` was defined before reverse-postorder index
+    /// `at`, so a back edge to that block cannot redefine any of them.
+    pub(crate) fn defined_before(&self, b: Bool, at: usize) -> bool {
+        self.vars(b).into_iter().all(|v| self.born[v as usize] < at)
+    }
+
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {

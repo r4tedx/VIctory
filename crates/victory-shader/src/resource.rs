@@ -323,7 +323,7 @@ const MASKED: &str = "an address written under an EXEC mask over another base";
 /// What reads a value.
 #[derive(Debug, Clone, Copy)]
 enum Reader {
-    Phi(Value),
+    Phi(usize, Value),
     Inst(Site),
 }
 
@@ -749,7 +749,7 @@ impl<'a> Tracer<'a> {
             for (b, block) in self.p.blocks.iter().enumerate() {
                 for phi in &block.phis {
                     for &a in &phi.args {
-                        readers.entry(a).or_default().push(Reader::Phi(phi.value));
+                        readers.entry(a).or_default().push(Reader::Phi(b, phi.value));
                     }
                 }
                 for (i, inst) in block.insts.iter().enumerate() {
@@ -764,7 +764,15 @@ impl<'a> Tracer<'a> {
             return false;
         };
         readers.iter().any(|&r| match r {
-            Reader::Phi(phi) => self.leaks(phi, None, seen),
+            Reader::Phi(b, phi) => {
+                // A loop can redefine mask atoms on the back edge. Keep
+                // coverage only if all its atoms predate the join.
+                let cover = cover.filter(|&c| {
+                    self.structured()
+                        .is_some_and(|(st, _)| st.bools.defined_before(c, self.rpo[b]))
+                });
+                self.leaks(phi, cover, seen)
+            }
             Reader::Inst(site) => {
                 let inst = self.inst(site);
                 // Lane reads by index take a lane whatever EXEC is.

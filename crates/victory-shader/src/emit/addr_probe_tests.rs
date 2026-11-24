@@ -88,14 +88,26 @@ fn build_with_threads(
     tables: Option<&Tables>,
     threads: u32,
 ) -> Result<HostShader, String> {
-    let mut words = Vec::new();
-    let mut store = buffer_store_dword(0, 12, 0);
+    let mut body = body.to_vec();
+    body.extend(output_store(0, threads));
+    build_program(&probe_program(&body, tables, threads), super::super::Target::ANY)
+}
+
+fn output_store(vdata: u8, threads: u32) -> [u32; 2] {
+    let mut store = buffer_store_dword(vdata, 12, 0);
     if threads > 1 {
-        // v0 starts as the thread id in X. v7 is reserved for its byte
-        // offset in the output UAV before the body puts the result in v0.
-        words.push(vop2(0x1A, 7, 0x82, 0)); // v_lshlrev_b32 v7, 2, v0
         store[0] |= 1 << 12; // offen
         store[1] |= 7;       // vaddr = v7
+    }
+    store
+}
+
+fn probe_program(body: &[u32], tables: Option<&Tables>, threads: u32) -> NativeProgram {
+    let mut words = Vec::new();
+    if threads > 1 {
+        // v0 starts as the thread id in X. v7 is reserved for its byte
+        // offset in the output UAV.
+        words.push(vop2(0x1A, 7, 0x82, 0)); // v_lshlrev_b32 v7, 2, v0
     }
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_x4(12, 4, 125, tables.map_or(0, |t| t.out)));
@@ -103,7 +115,6 @@ fn build_with_threads(
         words.push(vop1(0x001, i + 1, sgpr(i)));
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let rp = |root, user_data, sgprs, slot| RootParam {
@@ -142,7 +153,7 @@ fn build_with_threads(
         kind: ResourceType::Uav,
         ..srv(10, 4)
     });
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 16,
@@ -159,7 +170,10 @@ fn build_with_threads(
             threads: [threads, 1, 1],
         }),
         code,
-    };
+    }
+}
+
+fn build_program(native: &NativeProgram, target: super::super::Target) -> Result<HostShader, String> {
     let p = ir::build(&native.code, native.wave64, native.vgprs)
         .map_err(|e| format!("ir::build: {e:?}"))?;
     // The order `emit::translate` has: the tracer's refusal is reported
@@ -167,11 +181,11 @@ fn build_with_threads(
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
         .map_err(|e| format!("refused by the tracer: {e:?}"))?;
-    let io = io::raise(&p, &native).map_err(|e| format!("io::raise: {e:?}"))?;
+    let io = io::raise(&p, native).map_err(|e| format!("io::raise: {e:?}"))?;
     let st = st.map_err(|e| format!("structure: {e:?}"))?;
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).map_err(|e| format!("container: {e:?}"))?;
-    let shader = super::super::emit(&c, &native, &p, &st, &io, &res, super::super::Target::ANY)
+    let shader = super::super::emit(&c, native, &p, &st, &io, &res, target)
         .map_err(|e| format!("refused by lowering: {e:?}"))?;
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -189,7 +203,7 @@ fn run(
     views: &[View],
     out_view: usize,
 ) -> Vec<(&'static str, [u32; 4], Result<u32, String>)> {
-    run_with_readback(shader, cases, views, |o| match out_view {
+    run_with_readback(shader, cases, views, None, |o| match out_view {
         // The root UAV: the index of the one dword written, and
         // the dword, as `index << 24 | low bits`.
         usize::MAX => {
@@ -208,6 +222,7 @@ fn run_with_readback<T>(
     shader: &HostShader,
     cases: &[[u32; 4]],
     views: &[View],
+    wave_size: Option<u32>,
     readback: impl Fn(Vec<Vec<u32>>) -> T,
 ) -> Vec<(&'static str, [u32; 4], Result<T, String>)> {
     assert!(shader.root_cbvs.is_empty(), "unexpected root CBV");
@@ -219,6 +234,16 @@ fn run_with_readback<T>(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if let Some(wave) = wave_size {
+            let target = host.target();
+            if !target.runs(wave) {
+                eprintln!(
+                    "{label} wave sizes {}..{} exclude wave{wave}; skipped",
+                    target.lanes_min, target.lanes_max
+                );
+                continue;
+            }
+        }
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(x) => x,
             Err(e) => {
@@ -274,7 +299,7 @@ fn run_with_readback<T>(
             out.push((label, inputs, r));
         }
     }
-    assert!(!out.is_empty(), "no SM 6.6 device");
+    assert!(wave_size.is_some() || !out.is_empty(), "no SM 6.6 device");
     out
 }
 
@@ -1019,7 +1044,7 @@ fn two_lane_probe(name: &str, body: &[u32], want: impl Fn([u32; 4]) -> [u32; 2])
     let shader = build_with_threads(body, None, 2)
         .unwrap_or_else(|why| panic!("{name}: {why}"));
     let cases = [[0, 8, 20, 4], [0, 16, 12, 8]];
-    let rows = run_with_readback(&shader, &cases, &[View::RawUav(2)], |o| [o[0][0], o[0][1]]);
+    let rows = run_with_readback(&shader, &cases, &[View::RawUav(2)], None, |o| [o[0][0], o[0][1]]);
     assert!(report(name, rows, want), "a lane read the wrong dword");
 }
 
@@ -1058,4 +1083,146 @@ fn exec_masked_data_is_a_plain_offset() {
     two_lane_probe("exec-masked data offset beside A + s3", &body, |i| {
         [A((i[2] + i[3]) / 4), A((i[1] + i[3]) / 4)]
     });
+}
+
+const SENTINEL: u32 = 0x51_E171;
+
+/// Seed the output in all lanes, then replace it only under the address
+/// write's EXEC. The wave64 form uses LDS so wave32 hosts need console flow.
+fn same_mask_program(threads: u32, counted_loop: bool, load_after_restore: bool) -> NativeProgram {
+    let wave64 = threads == 64;
+    let store = output_store(8, threads);
+    let mut body = vec![vop1(0x001, 8, 0xFF), SENTINEL]; // v8 = sentinel
+    if wave64 {
+        body.extend([
+            0xD834_0000, 0x0000_0807, // ds_write_b32 v7, v8
+            0xD8D8_0000, 0x0800_0007, // ds_read_b32 v8, v7
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ]);
+    }
+    body.extend(store);
+    body.extend([
+        vop1(0x001, 5, vgpr(2)), // old v5 = s1
+        vop1(0x001, 6, vgpr(3)), // old v6 = s2
+    ]);
+    if wave64 {
+        body.extend([
+            0x7D88_00A1, // v_cmp_gt_u32 vcc, 33, v0
+            0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        ]);
+    } else {
+        body.extend(exec_if_zero(0));
+    }
+    let skip = body.len();
+    if wave64 {
+        body.push(0); // s_cbranch_execz restore
+    }
+    if counted_loop {
+        body.push(s_mov_b32(16, 0x82)); // s16 = 2
+    }
+    let loop_start = body.len();
+    if counted_loop && !load_after_restore {
+        body.push(vop2(0x26, 9, vgpr(5), 6)); // v9 = v5 - v6, use the loop-carried data
+    }
+    body.extend([
+        vop1(0x001, 5, sgpr(6)), // v5 = A.lo
+        vop1(0x001, 6, sgpr(7)), // v6 = A.hi
+    ]);
+    let load = global_load_dword(8, 5, 125, 12); // v8 = A(3)
+    if !load_after_restore {
+        body.extend(load);
+        if counted_loop {
+            body.extend([
+                vop2(0x25, 8, vgpr(9), 8), // add the difference (zero on the second trip)
+                vop1(0x001, 5, vgpr(2)),  // reuse both halves as data
+                vop1(0x001, 6, vgpr(2)),
+            ]);
+        }
+        body.extend(store);
+    }
+    if counted_loop {
+        body.push(sop2(0x01, 16, 16, 0x81)); // s_sub_u32 s16, s16, 1
+        body.push(sopc(0x06, 16, 0x80)); // s_cmp_eq_u32 s16, 0
+        body.push(sopp(0x04, loop_start as i16 - body.len() as i16 - 1)); // s_cbranch_scc0 loop
+    }
+    if wave64 {
+        body[skip] = sopp(0x08, (body.len() - skip - 1) as i16);
+    }
+    body.push(if wave64 {
+        0x88FE_147E // s_or_b64 exec, exec, s[20:21]
+    } else {
+        RESTORE_EXEC
+    });
+    if load_after_restore {
+        body.extend(load);
+        body.extend(store);
+    }
+    let mut native = probe_program(&body, None, threads);
+    if wave64 {
+        native.wave64 = true;
+        let StageIo::Cs(io) = &mut native.io else {
+            unreachable!()
+        };
+        io.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+fn same_mask_probe(name: &str, threads: u32, counted_loop: bool) {
+    let console = threads == 64;
+    let (target, wave_size) = if console {
+        (
+            super::super::Target {
+                lanes_min: 32,
+                lanes_max: 32,
+            },
+            Some(32),
+        )
+    } else {
+        (super::super::Target::ANY, None)
+    };
+    let native = same_mask_program(threads, counted_loop, false);
+    let shader = build_program(&native, target).unwrap_or_else(|why| panic!("{name}: {why}"));
+    let rows = run_with_readback(
+        &shader,
+        &[[0, 11, 4, 0]],
+        &[View::RawUav(threads)],
+        wave_size,
+        |o| o.into_iter().next().unwrap(),
+    );
+    if rows.is_empty() {
+        eprintln!("PROBE | {name} | TRANSLATED | no adapter supports the required wave size");
+        return;
+    }
+    let active = if console { 33 } else { 1 };
+    let want = |_| {
+        (0..threads)
+            .map(|lane| if lane < active { A(3) } else { SENTINEL })
+            .collect()
+    };
+    assert!(report(name, rows, want), "a lane read the wrong dword or lost its sentinel");
+}
+
+#[test]
+fn exec_address_loaded_under_the_same_mask() {
+    same_mask_probe("same EXEC", 2, false);
+}
+
+#[test]
+fn exec_address_loaded_under_the_same_mask_in_a_loop() {
+    same_mask_probe("same EXEC in a loop", 2, true);
+}
+
+#[test]
+fn exec_address_loaded_under_the_same_mask_in_a_console_loop() {
+    same_mask_probe("same EXEC in a console loop", 64, true);
+}
+
+#[test]
+fn exec_address_loaded_after_the_loop_restores_exec() {
+    let native = same_mask_program(2, true, true);
+    let why = build_program(&native, super::super::Target::ANY)
+        .err()
+        .expect("the restored lanes have a data value in the address VGPRs");
+    assert_reason("loop restores EXEC before the load", &why, MASKED);
 }
