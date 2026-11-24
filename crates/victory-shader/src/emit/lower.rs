@@ -280,6 +280,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// See [`mask_spills`].
+    mask_spills: HashSet<Value>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -317,6 +319,120 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
+/// A lane mask the compiler spills to a VGPR lane and reads back, by the
+/// values written: the `v_writelane_b32`s to leave out, and the
+/// `v_readlane_b32`s the
+/// lane pass took for the mask itself (see `structure`). A write is left
+/// out when that VGPR lane is read only by such reads: no vector
+/// instruction or computed-lane read sees it.
+fn mask_spills(p: &Program, st: &Structured) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut reads = HashSet::new();
+    let mut readers: HashMap<Value, Vec<Site>> = HashMap::new();
+    let mut joins: HashMap<Value, Vec<Value>> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            for &a in &phi.args {
+                joins.entry(a).or_default().push(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(r, v) in &inst.reads {
+                if matches!(r, Reg::V(_)) {
+                    readers.entry(v).or_default().push((b, i));
+                }
+            }
+            if inst.name() == "v_readlane_b32" && inst.writes.iter().any(|&(_, w)| is_mask(w)) {
+                reads.insert((b, i));
+            }
+        }
+    }
+    let lane_of = |inst: &Inst, n: usize| match &inst.fields {
+        Fields::Valu(v)
+            if v.abs == 0 && v.neg == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none() =>
+        {
+            match *v.src.get(n)? {
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(x) => Some(x),
+                _ => None,
+            }
+            .map(|l| l & if p.wave64 { 63 } else { 31 })
+        }
+        _ => None,
+    };
+    let (mut writes, mut spills) = (Vec::new(), HashSet::new());
+    for (b, block) in p.blocks.iter().enumerate() {
+        'write: for (i, inst) in block.insts.iter().enumerate() {
+            let Fields::Valu(w) = &inst.fields else {
+                continue;
+            };
+            let (Some(Operand::Vector { reg, .. }), Some(&Operand::Scalar { code, .. })) =
+                (w.dst, w.src.first())
+            else {
+                continue;
+            };
+            if inst.name() != "v_writelane_b32" || !inst.read(Reg::S(code)).is_some_and(is_mask) {
+                continue;
+            }
+            let Some(lane) = lane_of(inst, 1) else {
+                continue;
+            };
+            let Some(out) = inst.write(Reg::V(reg)) else {
+                continue;
+            };
+            // The VGPR values holding the mask in that lane.
+            let (mut todo, mut seen) = (vec![out], HashSet::from([out]));
+            while let Some(v) = todo.pop() {
+                for &at in readers.get(&v).into_iter().flatten() {
+                    let r = &p.blocks[at.0].insts[at.1];
+                    match r.name() {
+                        "v_readlane_b32" => match lane_of(r, 1) {
+                            Some(l) if l != lane => {}
+                            Some(_) if reads.contains(&at) => {}
+                            _ => continue 'write,
+                        },
+                        // A write of another lane keeps this one; one of
+                        // this lane ends what holds the mask.
+                        "v_writelane_b32" => {
+                            let Fields::Valu(x) = &r.fields else {
+                                continue 'write;
+                            };
+                            let Some(Operand::Vector { reg: d, .. }) = x.dst else {
+                                continue 'write;
+                            };
+                            if r.read(Reg::V(d)) != Some(v) {
+                                continue 'write;
+                            }
+                            match lane_of(r, 1) {
+                                None => continue 'write,
+                                Some(l) if l == lane => {}
+                                Some(_) => {
+                                    if let Some(n) = r.write(Reg::V(d))
+                                        && seen.insert(n)
+                                    {
+                                        todo.push(n);
+                                    }
+                                }
+                            }
+                        }
+                        _ => continue 'write,
+                    }
+                }
+                for &j in joins.get(&v).into_iter().flatten() {
+                    if seen.insert(j) {
+                        todo.push(j);
+                    }
+                }
+            }
+            writes.push((b, i));
+        }
+    }
+    for (b, i) in reads.into_iter().chain(writes) {
+        spills.extend(p.blocks[b].insts[i].writes.iter().map(|w| w.1));
+    }
+    spills
+}
+
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -417,6 +533,7 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let mask_spills = mask_spills(p, x.st);
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
@@ -441,7 +558,8 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
             };
-            let reads_whole = insts().any(whole);
+            let live_lane_op = |i: &Inst| !i.writes.iter().any(|w| mask_spills.contains(&w.1));
+            let reads_whole = insts().any(|i| live_lane_op(i) && whole(i));
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -543,7 +661,8 @@ impl<'a> Lower<'a> {
             let lane_access_outside_sections = p.blocks.iter().enumerate().any(|(b, block)| {
                 let sections = super::wave::sections(p, b);
                 block.insts.iter().enumerate().any(|(i, inst)| {
-                    matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+                    live_lane_op(inst)
+                        && matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
                         && !sections
                             .iter()
                             .any(|(&start, s)| (start..=s.end).contains(&i))
@@ -685,6 +804,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            mask_spills,
         }
     }
 
@@ -4611,6 +4731,13 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            // A spilled lane mask read back: its readers take the lanes' bits.
+            "v_readlane_b32" if inst.writes.iter().any(|w| self.mask_spills.contains(&w.1)) => {
+                for &(_, w) in &inst.writes {
+                    self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
+                }
+                Ok(())
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -4628,11 +4755,19 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_writelane_b32" => {
-                // The lane given takes the scalar; the others keep their value.
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
+                // A lane mask spilled where only its read-back sees it.
+                if inst.writes.iter().any(|w| self.mask_spills.contains(&w.1)) {
+                    let old = match inst.read(Reg::V(reg)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.undef(self.s.t.i32),
+                    };
+                    return int(self, old);
+                }
+                // The lane given takes the scalar; the others keep their value.
+                let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let old = match inst.read(Reg::V(reg)) {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
