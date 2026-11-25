@@ -127,6 +127,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 held.push(this as usize, Item::Segment(segment, waits));
             }
         }
+        // Before running them: the title may release a list as soon as it
+        // sees the submission done.
+        for &l in lists {
+            crate::list::with_state(l, |_, state| state.submitted());
+        }
         account().submissions += 1;
         pump(&mut held, Why::Submission);
         return;

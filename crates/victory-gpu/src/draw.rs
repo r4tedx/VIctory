@@ -89,12 +89,17 @@ pub(crate) struct State {
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
-    /// The run of dynamic slots root views take from (view heap, next
-    /// slot, end): taken [`ROOT_VIEW_RUN`] at a time where the heap has a
-    /// run that long, so that single slots do not break up the runs fresh
-    /// tables need; what it has left goes back when the list closes or
-    /// takes another run ([`State::trim_root_run`]).
-    root_run: (usize, u32, u32),
+    /// The run of dynamic slots root views and fresh tables take from
+    /// (view heap, next slot, end), [`State::take_slots`]: [`LIST_RUN`] at a
+    /// time where the heap has a run that long, so that a list's slots lie
+    /// together and come back together, not scattered among other lists'
+    /// where they leave holes too short for a table; what it has left goes
+    /// back when the list closes or takes another run
+    /// ([`State::trim_run`]).
+    run: (usize, u32, u32),
+    /// The dynamic slots the list held when first submitted since its
+    /// reset (counted in [`HELD_BY_RAN`] until it is reset or released).
+    ran: Option<u64>,
     /// Slots made for unordered access clears in this list
     /// ([`State::clear_view`]): (view heap, view, host resource) → dynamic
     /// slot, so that clears of one view (a stand-in's, at each dispatch of
@@ -125,6 +130,9 @@ impl Drop for State {
         for &(heap, first, n) in &self.dynamic {
             give_back(heap, first, n);
         }
+        if let Some(n) = self.ran {
+            HELD_BY_RAN.fetch_sub(n, Ordering::Relaxed);
+        }
     }
 }
 
@@ -144,28 +152,57 @@ const MEMORY_HEAP: usize = crate::memory::OURS;
 /// address takes).
 const SAMPLERS_OURS: usize = usize::MAX;
 
-/// Dynamic slots taken at a time for root views; fewer, down to the one
-/// the view needs, where the heap has no free run this long (a capped
-/// heap's 2^16 dynamic slots held by many lists).
-const ROOT_VIEW_RUN: u32 = 256;
+/// Dynamic slots a list takes at a time for its root views and fresh
+/// tables; fewer, down to what is needed, where the heap has no free run
+/// this long (a capped heap's 2^16 dynamic slots held by many lists).
+const LIST_RUN: u32 = 256;
 
 /// Why draws and dispatches were dropped for want of dynamic slots: root
-/// views, fresh tables. With the root-view runs shorter than
-/// [`ROOT_VIEW_RUN`] taken instead of dropping.
+/// views, fresh tables. With the list runs taken shorter than
+/// [`LIST_RUN`] instead of dropping, and the tables refused while as many
+/// slots as they need were free, only not in a row (fragmented), or were
+/// not (exhausted).
 static DYNAMIC_DROPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-static SHORT_ROOT_RUNS: AtomicU64 = AtomicU64::new(0);
+static SHORT_RUNS: AtomicU64 = AtomicU64::new(0);
+static TABLE_REFUSALS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 const NO_ROOT_VIEW_SLOTS: usize = 0;
 const NO_TABLE_SLOTS: usize = 1;
+const FRAGMENTED: usize = 0;
+const EXHAUSTED: usize = 1;
+
+/// Dynamic slots held by lists submitted since their last reset (each
+/// submission is waited for): once it returns the GPU no longer reads
+/// them unless the title submits the list again, but they come back only
+/// at the reset.
+static HELD_BY_RAN: AtomicU64 = AtomicU64::new(0);
+
+/// What [`take_dynamic_drops`] counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DynamicDrops {
+    pub(crate) root_views: u64,
+    pub(crate) tables: u64,
+    pub(crate) short_runs: u64,
+    pub(crate) fragmented: u64,
+    pub(crate) exhausted: u64,
+}
 
 /// Draws and dispatches dropped since the last call for want of dynamic
-/// slots, for root views and for tables, and the root-view runs taken
-/// shorter than [`ROOT_VIEW_RUN`].
-pub(crate) fn take_dynamic_drops() -> (u64, u64, u64) {
-    (
-        DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS].swap(0, Ordering::Relaxed),
-        DYNAMIC_DROPS[NO_TABLE_SLOTS].swap(0, Ordering::Relaxed),
-        SHORT_ROOT_RUNS.swap(0, Ordering::Relaxed),
-    )
+/// slots, the list runs taken shorter than [`LIST_RUN`], and table
+/// refusals by cause.
+pub(crate) fn take_dynamic_drops() -> DynamicDrops {
+    let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    DynamicDrops {
+        root_views: take(&DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS]),
+        tables: take(&DYNAMIC_DROPS[NO_TABLE_SLOTS]),
+        short_runs: take(&SHORT_RUNS),
+        fragmented: take(&TABLE_REFUSALS[FRAGMENTED]),
+        exhausted: take(&TABLE_REFUSALS[EXHAUSTED]),
+    }
+}
+
+/// Dynamic slots held now by lists already submitted ([`HELD_BY_RAN`]).
+pub(crate) fn held_by_ran() -> u64 {
+    HELD_BY_RAN.load(Ordering::Relaxed)
 }
 
 /// Dynamic slots taken for root views ([`State::root_view`]) since the last
@@ -989,24 +1026,12 @@ impl State {
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
         }
-        let (run_heap, next, end) = self.root_run;
-        if run_heap != key || next >= end {
-            self.trim_root_run();
-            let Some((first, n)) = host.dynamic_run(ROOT_VIEW_RUN, 1) else {
-                once!("no dynamic slots for root views: dropped");
-                DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS].fetch_add(1, Ordering::Relaxed);
-                not_run("no dynamic slots for root views");
-                return None;
-            };
-            if n < ROOT_VIEW_RUN {
-                once!(n, "dynamic slots short: root views take runs under {ROOT_VIEW_RUN} slots");
-                SHORT_ROOT_RUNS.fetch_add(1, Ordering::Relaxed);
-            }
-            self.dynamic.push((key, first, n));
-            self.root_run = (key, first, first + n);
-        }
-        let index = self.root_run.1;
-        self.root_run.1 += 1;
+        let Some(index) = self.take_slots(key, host, 1) else {
+            once!("no dynamic slots for root views: dropped");
+            DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS].fetch_add(1, Ordering::Relaxed);
+            not_run("no dynamic slots for root views");
+            return None;
+        };
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
         if uav {
@@ -1016,11 +1041,34 @@ impl State {
         Some((index, offset))
     }
 
-    /// Gives back the slots of the root-view run no root view took: the
-    /// list closed (it records nothing more until reset) or takes another
-    /// run. No command names them, so another list may have them at once.
-    fn trim_root_run(&mut self) {
-        let (heap, next, end) = self.root_run;
+    /// `n` consecutive dynamic slots of the view heap keyed `key` (`host`)
+    /// from the list's run, held until the list is reset: the first. A run
+    /// with fewer left is trimmed and another taken, [`LIST_RUN`] slots
+    /// (or `n` if more) where the heap has a free run that long, else its
+    /// longest free run of at least `n`.
+    fn take_slots(&mut self, key: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        let (heap, next, end) = self.run;
+        if heap != key || end - next < n {
+            self.trim_run();
+            let want = LIST_RUN.max(n);
+            let (first, got) = host.dynamic_run(want, n)?;
+            if got < want {
+                once!(got, n, "dynamic slots short: lists take runs under {LIST_RUN} slots");
+                SHORT_RUNS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.dynamic.push((key, first, got));
+            self.run = (key, first, first + got);
+        }
+        let first = self.run.1;
+        self.run.1 += n;
+        Some(first)
+    }
+
+    /// Gives back the slots of the list's run nothing took: the list closed
+    /// (it records nothing more until reset) or takes another run. No
+    /// command names them, so another list may have them at once.
+    fn trim_run(&mut self) {
+        let (heap, next, end) = self.run;
         if next >= end {
             return;
         }
@@ -1029,12 +1077,24 @@ impl State {
             run.2 = next - run.1;
         }
         self.dynamic.retain(|d| d.2 > 0);
-        self.root_run = (heap, next, next);
+        self.run = (heap, next, next);
     }
 
     /// The title closed the list.
     pub(crate) fn close(&mut self) {
-        self.trim_root_run();
+        self.trim_run();
+    }
+
+    /// The list is submitted (closed; its submission is waited for): its
+    /// dynamic slots are counted as held by a list that ran until it is
+    /// reset. Once per recording.
+    pub(crate) fn submitted(&mut self) {
+        if self.ran.is_some() {
+            return;
+        }
+        let n = self.dynamic.iter().map(|d| u64::from(d.2)).sum();
+        HELD_BY_RAN.fetch_add(n, Ordering::Relaxed);
+        self.ran = Some(n);
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -1149,10 +1209,12 @@ impl State {
         let slot = match self.clear_slots.get(&key) {
             Some(&slot) => slot,
             None => {
-                let Some(slot) = visible.dynamic(1) else {
+                // From the list's run, as root views and fresh tables take
+                // theirs ([`Self::take_slots`]).
+                let Some(slot) = self.take_slots(key.0, visible, 1) else {
+                    once!("an unordered access clear without a dynamic slot: not run");
                     return false;
                 };
-                self.dynamic.push((key.0, slot, 1));
                 visible.make_at(slot, view);
                 self.clear_slots.insert(key, slot);
                 slot
@@ -1721,18 +1783,19 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_slots(std::ptr::from_ref(heap) as usize, host, n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
+                once!(n, "no dynamic slots for a table: a draw or dispatch is dropped");
+                let cause = if host.dynamic_free().0 >= n { FRAGMENTED } else { EXHAUSTED };
+                TABLE_REFUSALS[cause].fetch_add(1, Ordering::Relaxed);
                 self.table_failed = true;
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3062,7 +3125,7 @@ uint ps() : SV_Target { return 1; }
         list.close();
         state.close();
         assert_eq!(heap_host.dynamic_free().0, 4, "the 4 no view took come back at close");
-        assert_eq!(take_dynamic_drops(), (0, 0, 1), "one short run, no drops");
+        assert_eq!(take_dynamic_drops(), DynamicDrops { short_runs: 1, ..Default::default() }, "one short run, no drops");
 
         // No slot left: the draw is dropped, and counted with its reason.
         let other = host.new_list().unwrap();
@@ -3075,7 +3138,7 @@ uint ps() : SV_Target { return 1; }
         assert_eq!(starved.root_view(&other, true, 0, false), None);
         #[cfg(feature = "diagnostics")]
         assert_eq!(NOT_RUN.with(|w| w.replace("")), "no dynamic slots for root views");
-        assert_eq!(take_dynamic_drops(), (1, 0, 0));
+        assert_eq!(take_dynamic_drops(), DynamicDrops { root_views: 1, ..Default::default() });
         drop(starved);
         other.close();
         heap_host.release(held, 4);
@@ -3087,6 +3150,56 @@ uint ps() : SV_Target { return 1; }
         assert_eq!(heap_host.dynamic_free().0, 5);
         heap_host.release(all, total);
         assert_eq!(heap_host.dynamic_free(), (total, total));
+    }
+
+    /// Two lists making 8-slot tables in turn take them from runs of their
+    /// own, so when one is reset its slots come back as one free run, not
+    /// as 8-slot holes between the other's: a 200-slot table fits then.
+    /// A run's unused tail comes back at close, and a submitted list's
+    /// slots are counted as held by a list that ran until its reset.
+    #[test]
+    fn tables_of_two_lists_come_back_as_one_run() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let key = std::ptr::from_ref(title_heap) as usize;
+        let host = title_heap.host().expect("a host view heap");
+        let (_, total) = host.dynamic_free();
+        // Every dynamic slot held elsewhere but 512 in a row.
+        let all = host.dynamic(total).unwrap();
+        let base = all + 1000;
+        host.release(base, 512);
+
+        let (mut a, mut b) = (State::default(), State::default());
+        let (mut tables_a, mut tables_b) = (Vec::new(), Vec::new());
+        for _ in 0..16 {
+            tables_a.push(a.take_slots(key, host, 8).expect("a table of 8"));
+            tables_b.push(b.take_slots(key, host, 8).expect("a table of 8"));
+        }
+        assert_eq!(tables_a, (0..16).map(|k| base + 8 * k).collect::<Vec<_>>(), "one run");
+        assert_eq!(tables_b, (0..16).map(|k| base + 256 + 8 * k).collect::<Vec<_>>(), "another");
+        assert_eq!(host.dynamic_free().0, 0);
+        a.close();
+        b.close();
+        assert_eq!(host.dynamic_free().0, 256, "both runs' tails come back at close");
+
+        let held = held_by_ran();
+        a.submitted();
+        a.submitted();
+        assert_eq!(held_by_ran(), held + 128, "a's tables, counted once");
+        drop(a);
+        assert_eq!(held_by_ran(), held, "back at the reset");
+        let mut c = State::default();
+        assert_eq!(c.take_slots(key, host, 200), Some(base), "a's slots and its tail are one run");
+        drop((b, c));
+        assert_eq!(host.dynamic_free().0, 512);
+        host.release(all, total);
     }
 
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
