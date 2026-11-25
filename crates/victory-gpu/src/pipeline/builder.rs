@@ -128,7 +128,12 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    let open = all_made(&states);
+    // On a host without 64-lane waves the builder stays held back even with
+    // every pipeline made: its wave64 programs then run as 32-lane halves,
+    // and the whole builder hung an RTX 4070 SUPER within two minutes
+    // (#2118 thread, comment 7170996858: device removed in its submission).
+    let wide = wide_waves();
+    let open = all_made(&states) && wide;
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -142,6 +147,8 @@ pub(crate) fn runs() -> bool {
             "BVH builder {}",
             if open {
                 "runs"
+            } else if !wide && all_made(&states) {
+                "held back: the host has no 64-lane waves"
             } else {
                 "held back: not all its pipelines are made"
             }
@@ -153,6 +160,12 @@ pub(crate) fn runs() -> bool {
         tracing::info!(frame, "BVH builder ran whole: programs that walk its structures run from here on");
     }
     open
+}
+
+/// Whether the host runs 64-lane waves (no host device: assumed so, as in
+/// tests without one).
+fn wide_waves() -> bool {
+    crate::host::host().is_none_or(|h| h.target().runs(64))
 }
 
 /// Whether every pipeline is made (`Some(true)`); refused ones are
