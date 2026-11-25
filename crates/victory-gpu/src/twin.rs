@@ -16,8 +16,8 @@
 //! shortcut: uses the lists do not name (shaders indexing the heap
 //! themselves) move nothing; a whole twin is copied for any use of either
 //! plane, also when the next pass overwrites all of it; console 24-bit
-//! depth gets no twin. Upgrade when a frame trace shows such a use, or the
-//! copies (counted on the frame-rate line) cost.
+//! depth and multisample depth get no twin. Upgrade when a frame trace
+//! shows such a use, or the copies (counted on the frame-rate line) cost.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
@@ -114,6 +114,15 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     };
     // SAFETY: a live resource.
     let dd = unsafe { depth.GetDesc() };
+    if dd.SampleDesc.Count > 1 {
+        once(
+            console,
+            0,
+            0,
+            "a multisample depth texture gets no writable twin: its unordered writes are dropped",
+        );
+        return None;
+    }
     let subs = u32::from(dd.MipLevels) * u32::from(dd.DepthOrArraySize).max(1);
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -147,6 +156,15 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let mut drows = vec![0u32; n as usize];
     // SAFETY: outputs sized for `n` subresources.
     unsafe { host.device.GetCopyableFootprints(&dd, 0, n, 0, Some(df.as_mut_ptr()), Some(drows.as_mut_ptr()), None, None) };
+    // A depth texture the host keeps typed (the title denies shader reads)
+    // has its plane's bytes: one 16- or 32-bit depth, no stencil.
+    for f in &mut df {
+        f.Footprint.Format = match f.Footprint.Format {
+            DXGI_FORMAT_D16_UNORM => DXGI_FORMAT_R16_TYPELESS,
+            DXGI_FORMAT_D32_FLOAT => DXGI_FORMAT_R32_TYPELESS,
+            other => other,
+        };
+    }
     let mut routes = Vec::new();
     let mut at = 0u64;
     let mut place = |mut f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32| {
