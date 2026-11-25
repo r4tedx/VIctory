@@ -177,3 +177,63 @@ branch takes `VICTORY_SKIP_PIPELINES=f607780aa8e502d0`, as `main` does.
 --profile diag -p victory --features diagnostics` at `0ab7ca3`:
 `diag\victory.exe`, sha256
 `5b8bf42def4777099794b9a9ce2ef64330c0edf0a2a0a9dd507ee3de0e155a30`.
+
+## Layer 2 (`gpu-run/layer2`)
+
+Built on `gpu-run/layer1-2118` at `2fde53b`: this file's list above, plus
+#2136 `f85763e`, #2147 `f2ca086`, #1819, #2168 and #2118 (the BVH builder
+gate reverted). Twelve more upstream PRs, each as its own `--no-ff` merge
+in this order. Every head is the PR's current head as of 2026-11-25, the
+same SHA the plan named. `cargo check --locked -p victory --features
+diagnostics` passed after each merge.
+
+| PR | Author | Head | What it does |
+|---|---|---|---|
+| #2175 | wbkepler | `82ae414a` | title memory page bitmaps live in video memory |
+| #2242 | wbkepler | `09595753` | copy-backs put back only the bytes the GPU changed |
+| #2280 | wbkepler | `7ef96fa9` | copy-backs compare a block at a time (stacked on #2242) |
+| #2051 | 0xkn0wh3r3 | `e004f357` | a submission's refreshes copy on several threads |
+| #2120 | 0xkn0wh3r3 | `772c5670` | copies of read-only title buffers in GPU upload heaps; opt-in, `VICTORY_GPU_UPLOAD=1`, **off by default** |
+| #2276 | denkencar-sketch | `14e872b7` | a depth texture used before it got a twin is copied to the twin in the list |
+| #2173 | fuzeofficlal | `cdd11bd2` | typed D16/D32 and multisample depth twins |
+| #1933 | mgunes1311-lab | `4be6b961` | depth-twin UAVs stay in concrete UAV formats; default views |
+| #2098 | moe-miau | `619b694a` | an acceleration structure's view address is its location |
+| #2163 | 0xkn0wh3r3 | `cd4402f4` | BCPack: BC7 dictionary indices read where each entry has them |
+| #2031 | 0xkn0wh3r3 | `4036fbe4` | heap samplers keep point mips when anisotropic, as static samplers do |
+| #1978 | 0xkn0wh3r3 | `392b3963` | no texture layouts or name copies per draw for unchanged answers |
+
+### Conflicts
+
+- #2175 with #159 in `crates/victory-gpu/src/host.rs`, both behaviours kept.
+  `HostList::close` first ends the queries still running (#159), then
+  makes #2175's read-back copies (a barrier from unordered access to copy
+  source, then the copy), both before the diagnostics timestamp end.
+  `Host::readback_buffer` is #2175's (on its `buffer_in` helper,
+  `pub(crate)`, returns `*const u8`), with its `uav_buffer`; #159's
+  caller `HostList::readback` passes that pointer on without its old
+  `cast_const`.
+- #2051, tests only, `host.rs`: #2136's test
+  `a_copy_nothing_wrote_is_not_asked_for` and #2051's ignored benchmark
+  `world_frame_refreshes` were added at the same place; both are kept.
+- #2098, doc comment only, `descriptor/host.rs` `write_address`: #1906's
+  clause (the caller keeps `index` below `HostHeap::address_slots`) and
+  #2098's (an acceleration structure's address is written too) are both in it.
+
+No PR was skipped.
+
+### Shader translator
+
+`git diff 2fde53b 3797434 --stat -- crates/victory-shader` is empty: no
+PR in this layer changes `victory-shader`, so the layer 1 shader cache
+still holds. The layer touches `crates/victory-gpu` (11 files) and
+`crates/victory-formats/src/bcpack.rs`. The one change in
+`pipeline/host.rs` (#2031) moves the anisotropic point-mip support
+query into `sampler::aniso_point_mip` and leaves the result as it was.
+
+### Build
+
+`CARGO_TARGET_DIR=C:\Users\PC\.t3\targets\layer2` (seeded from
+`targets\layer1-2118`, its `diag\victory.exe` deleted first), `cargo
+build --locked --profile diag -p victory --features diagnostics` at
+`3797434`: `diag\victory.exe`, sha256
+`f159c53db4397226259cfeb2303dd09ec95fbee8b999085f0ad37465df97d95f`.
