@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_SKIP_SHIFT, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_ALIASES, VIEW_SKIP_SHIFT, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -206,6 +206,10 @@ struct Lower<'a> {
     /// The heap index [`Lower::buffer_guard`] checked, by the index it
     /// gave (which may be the null view's).
     guarded: HashMap<V, V>,
+    /// Set by [`Lower::aliased_handle`] for [`Lower::handle`]: a heap
+    /// slot's handle names its raw alias (the view-alias table,
+    /// [`VIEW_ALIASES`]).
+    alias: bool,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -615,6 +619,7 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             skips: HashMap::new(),
             guarded: HashMap::new(),
+            alias: false,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -4002,7 +4007,18 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
-            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            let (h, addr) = if self.reads_alias(src, kind) {
+                // The alias starts at the 16 bytes at or below the view, its
+                // view-stride entry saying how far (module notes, "Raw reads
+                // of typed views").
+                let h = self.aliased_handle(site, src, (11, 0))?;
+                match self.view_skip(src, h) {
+                    Some(skip) => (h, self.s.m.bin(self.cur, Bin::Add, addr, skip)),
+                    None => (h, addr),
+                }
+            } else {
+                self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?
+            };
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -4975,12 +4991,20 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let aliased = self.alias;
+                let key = (
+                    self.cur,
+                    *load,
+                    *first,
+                    sampler,
+                    props.0 | u32::from(aliased) << 31,
+                );
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
+                let index = self.alias_slot(index);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -5102,6 +5126,7 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 let index = self.buffer_guard(src, phi, sampler, props);
+                let index = self.alias_slot(index);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
@@ -5121,6 +5146,7 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
+                let index = self.alias_slot(index);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -5129,9 +5155,68 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
+                let index = self.alias_slot(index);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// Whether a raw read through `src` (`used` its used-resource entry)
+    /// may meet a typed buffer view in its slot, and so reads the slot's raw
+    /// alias (module notes, "Raw reads of typed views"): a table SRV or UAV
+    /// whose entry has a stride (1, a typed buffer of bytes, included), or
+    /// a descriptor from the resource heap itself. Stride 0, constant
+    /// buffers, root views and descriptors the code builds read their own.
+    fn reads_alias(&self, src: &Source, used: Option<&UsedResource>) -> bool {
+        if matches!(src, Source::Built { .. } | Source::Constant(_)) {
+            return false;
+        }
+        let strided = used.is_some_and(|u| {
+            u.root == RootType::Table && u.kind != ResourceType::Cbv && u.stride >= 1
+        });
+        strided || self.is_heap_direct(src)
+    }
+
+    /// [`Self::handle`] of a buffer read raw at byte addresses through the
+    /// raw alias of its slot's view. The bytes the alias starts before the
+    /// view are in the alias slot's view-stride entry
+    /// ([`Self::view_skip`] of the handle).
+    fn aliased_handle(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<V, Why> {
+        self.alias = true;
+        let h = self.handle(site, src, false, props);
+        self.alias = false;
+        h
+    }
+
+    /// With an alias asked for ([`Self::aliased_handle`]): the heap index of
+    /// the raw alias of the view at `index`, from the view-alias table
+    /// (`t`[`VIEW_ALIASES`]: 0 for the slot itself, else the alias's
+    /// distance above it). Else `index`.
+    fn alias_slot(&mut self, index: V) -> V {
+        if !self.alias {
+            return index;
+        }
+        let c = self.cur;
+        // The slot the guard checked, where the null view stands in: its
+        // entry is 0 (it holds no typed view), and the null view's index
+        // lies past the tables a test binds.
+        let checked = self.guarded.get(&index).copied().unwrap_or(index);
+        // The table is a root view, which has no bounds: an index from data
+        // past it reads the entry of the last slot shaders reach (no alias),
+        // and the heap handle clamps the index itself.
+        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, checked, last);
+        let entry_at = self.s.m.select(c, over, last, checked);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, entry_at, four);
+        let table = self.s.root_srv_handle(VIEW_ALIASES);
+        let up = self.raw_dword(table, at);
+        let aliased = self.s.m.bin(c, Bin::Add, index, up);
+        // `view_skip` reads the alias slot's view-stride entry, or the
+        // checked slot's where the null view stands in.
+        let entry = self.s.m.bin(c, Bin::Add, entry_at, up);
+        self.guarded.insert(aliased, entry);
+        aliased
     }
 
     /// The heap index to read a buffer view at, for a descriptor `src` from
@@ -9171,6 +9256,23 @@ impl<'a> Lower<'a> {
                         self.s.t.res_ret,
                         139,
                         &[h, at, elem, mask, align],
+                    )
+                }
+                None if self.reads_alias(src, used) => {
+                    // A raw read where the slot may hold a typed view: its
+                    // raw alias (module notes, "Raw reads of typed views").
+                    let h = self.aliased_handle(site, src, (11 | u, 0))?;
+                    let off = match self.view_skip(src, h) {
+                        Some(skip) => self.s.m.bin(self.cur, Bin::Add, off, skip),
+                        None => off,
+                    };
+                    self.s.op(
+                        self.cur,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, off, iu, mask, align],
                     )
                 }
                 None => {

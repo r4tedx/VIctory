@@ -8,7 +8,9 @@
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_SKIP_SHIFT, VIEW_STRIDES, lower, validator};
+use super::{
+    HostShader, StaticSampler, VIEW_ALIASES, VIEW_SKIP_SHIFT, VIEW_STRIDES, lower, validator,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -182,6 +184,13 @@ fn entry(kind: ResourceType, dwords: u8, user_data: u8) -> UsedResource {
         user_data,
         slot: user_data,
     }
+}
+
+/// The root parameter of the host's table `slot` (root SRV
+/// [`VIEW_STRIDES`] or [`VIEW_ALIASES`]) in `shader`'s root signature: after
+/// the user data, in slot order (`Host::root_signature_for`).
+fn table_param(shader: &HostShader, slot: u8) -> u32 {
+    1 + shader.root_srvs.iter().filter(|&&s| s < slot).count() as u32
 }
 
 fn build(
@@ -366,6 +375,202 @@ fn a_buffer_descriptors_record_count_reads_as_its_views_kind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Raw reads at byte addresses of a table slot holding a typed buffer view
+/// (scalar buffer loads, an unindexed dword load) go through the slot the
+/// view-alias table names: the host's raw view of the typed view's bytes
+/// (`victory_gpu::descriptor::host`, `Aliases`), which starts up to 12
+/// bytes before them (raw views start on 16 bytes), the alias slot's
+/// view-stride entry saying how many ([`VIEW_SKIP_SHIFT`], as for a
+/// structured view off 16 bytes). Through a raw
+/// handle on the typed view itself WARP reads 0 past the view's element
+/// count taken as dwords: the RGBA32F reads here, of 4 elements, read 0
+/// there without the alias.
+/// The cases, each view from an element past the buffer's start (the
+/// console descriptor's base is the view's first byte): an RGBA32F view
+/// read at byte 20 (element 1, dword 1) by `s_buffer_load_dwordx2`; a typed
+/// buffer of bytes (R8_UINT, used-resource stride 1, as a title reads loop
+/// counts from) at byte 8; an RGBA32F view read
+/// by `buffer_load_dwordx2 ... offen` at byte 20. A slot of stride 0 reads
+/// its own view and no table.
+#[test]
+fn raw_reads_of_typed_views_go_through_their_aliases() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    };
+    // 48 dwords 100, 101, ...
+    let data: Vec<u32> = (100..148).collect();
+    let scalar_x2 = |at: u32| {
+        vec![
+            0xF424_0504,
+            0xFA00_0000 | at,
+            0xBF8C_C07F,
+            0x7E02_0214,
+            0x7E04_0215,
+        ]
+    };
+    // v3 = 20; buffer_load_dwordx2 v[1:2], v3, s[8:11], 0 offen.
+    let vector_x2 = vec![0x7E06_0294, 0xE034_1000, 0x8002_0103];
+    // 4 elements (64 bytes) from element `first`.
+    let rgba = |first| Stride::FormatFrom(DXGI_FORMAT_R32G32B32A32_FLOAT, 16, first, 4);
+    // (what, the access, the view, its used-resource stride, its first
+    // dword, the alias's bias, the two dwords).
+    type Case<'a> = (&'a str, Vec<u32>, Stride, u32, usize, usize, [u32; 2]);
+    let cases: [Case; 3] = [
+        (
+            "RGBA32F from element 1 by a scalar load at byte 20",
+            scalar_x2(20),
+            rgba(1),
+            16,
+            4,
+            4,
+            [data[9], data[10]],
+        ),
+        (
+            "R8_UINT (stride 1) from byte 4 by a scalar load at byte 8",
+            scalar_x2(8),
+            Stride::FormatFrom(DXGI_FORMAT_R8_UINT, 1, 4, 64),
+            1,
+            1,
+            0,
+            [data[3], data[4]],
+        ),
+        (
+            "RGBA32F from element 2 by an unindexed dword load at byte 20",
+            vector_x2,
+            rgba(2),
+            16,
+            8,
+            8,
+            [data[13], data[14]],
+        ),
+    ];
+    let program = |access: &[u32]| {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0402,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        words.extend_from_slice(access);
+        words.extend([
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x8004_0100, // buffer_store_dword v1, v0, s[16:19], 0 offen
+            0xE070_1004,
+            0x8004_0200, // buffer_store_dword v2, v0, s[16:19], 0 offen offset:4
+            0xBF81_0000, // s_endpgm
+        ]);
+        words
+    };
+    let output = UsedResource {
+        table_offset_dwords: 8,
+        ..entry(ResourceType::Uav, 4, 0)
+    };
+    let shader = |access: &[u32], stride| {
+        let used = vec![
+            UsedResource {
+                stride,
+                ..entry(ResourceType::Srv, 4, 0)
+            },
+            output,
+        ];
+        build(&program(access), vec![param(RootType::Table, 0)], used, 1)
+    };
+    // Stride 0 (a byte-addressed buffer): its own view, no table.
+    for (what, access, ..) in &cases {
+        assert!(
+            shader(access, 0).root_srvs.is_empty(),
+            "{what} at stride 0 reads a table"
+        );
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, h)))
+        .collect();
+    assert!(
+        !hosts.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    let mut wrong = Vec::new();
+    for (name, access, view, stride, first, bias, want) in cases {
+        let shader = shader(&access, stride);
+        let aliased = shader.root_srvs.contains(&VIEW_ALIASES);
+        if !aliased {
+            wrong.push(format!(
+                "{name}: no view-alias table ({:?})",
+                shader.root_srvs
+            ));
+        }
+        // The alias in slot 2: `bias` bytes, then the view's.
+        let alias: Vec<u32> = std::iter::repeat_n(0xDEAD, bias / 4)
+            .chain(data[first..].iter().copied())
+            .collect();
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: view,
+            },
+            View::RawUav(2),
+            View::Buffer {
+                data: &alias,
+                stride: Stride::Raw,
+            },
+        ];
+        for (label, host) in &hosts {
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} {name}: compute_pipeline failed: {e}"));
+            let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            let mut roots = vec![(0, Root::Constants(ud))];
+            if aliased {
+                // Slot 0's alias is 2 slots up.
+                roots.push((
+                    table_param(&shader, VIEW_ALIASES),
+                    Root::View {
+                        srv: true,
+                        data: vec![2, 0, 0],
+                    },
+                ));
+            }
+            if shader.root_srvs.contains(&VIEW_STRIDES) {
+                // The alias is raw and starts `bias` bytes early.
+                let alias = 4 | (bias as u32) << VIEW_SKIP_SHIFT;
+                roots.push((
+                    table_param(&shader, VIEW_STRIDES),
+                    Root::View {
+                        srv: true,
+                        data: vec![stride, 0, alias],
+                    },
+                ));
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: dispatch failed: {e}"));
+            let got = out.last().cloned().unwrap_or_default();
+            eprintln!("{label} {name}: read {got:?}, want {want:?}");
+            if got != want {
+                wrong.push(format!("{label} {name}: read {got:?}, want {want:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     let shader = build(
@@ -378,7 +583,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         vec![entry(ResourceType::Uav, 4, 2)],
         32,
     );
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+    // The stride table, and the alias table of a raw read of the heap
+    // (zeros from the test host: each slot reads itself).
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES, VIEW_ALIASES]);
     // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
     let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
     let views = [
@@ -419,7 +626,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                     roots: vec![
                         (0, Root::Constants(ud.clone())),
                         (
-                            1,
+                            table_param(&shader, VIEW_STRIDES),
                             Root::View {
                                 srv: true,
                                 data: vec![4, 12],
@@ -452,7 +659,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                     roots: vec![
                         (0, Root::Constants(ud)),
                         (
-                            1,
+                            table_param(&shader, VIEW_STRIDES),
                             Root::View {
                                 srv: true,
                                 data: vec![4, 12 | 8 << VIEW_SKIP_SHIFT],
@@ -597,7 +804,9 @@ fn scalar_loads_of_structured_views_add_the_bytes_their_views_start_early() {
         vec![structured(ResourceType::Srv, 0, 12), entry(ResourceType::Uav, 4, 2)],
         32,
     );
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the view's skip");
+    // The skip, and the alias table of a scalar read of a slot that may
+    // hold a typed view (zeros from the test host: each slot itself).
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES, VIEW_ALIASES], "the view's skip");
     let raw = build(
         STRUCTURED_SCALAR_WAVE32,
         vec![param(RootType::Table, 0), param(RootType::Table, 2)],
@@ -641,7 +850,7 @@ fn scalar_loads_of_structured_views_add_the_bytes_their_views_start_early() {
                         roots: vec![
                             (0, Root::Constants(ud.clone())),
                             (
-                                1,
+                                table_param(&shader, VIEW_STRIDES),
                                 Root::View {
                                     srv: true,
                                     data: vec![4, 12 | skip << VIEW_SKIP_SHIFT],
@@ -698,7 +907,16 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            roots: vec![
+                (0, Root::Constants(ud)),
+                (
+                    table_param(&shader, VIEW_STRIDES),
+                    Root::View {
+                        srv: true,
+                        data: vec![4, 0],
+                    },
+                ),
+            ],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
@@ -727,7 +945,13 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         32,
     );
     assert!(shader.heap && !shader.heap_writes, "reads the heap itself, writes through a table");
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the guard's stride table");
+    // The guard's stride table, and the alias table of a raw read of the
+    // heap (zeros from the test host: each slot reads itself).
+    assert_eq!(
+        shader.root_srvs,
+        [VIEW_STRIDES, VIEW_ALIASES],
+        "the guard's stride table, the alias table"
+    );
     let data: Vec<u32> = vec![7, 8, 9, 10];
     let views = [
         View::RawUav(32),
@@ -764,7 +988,16 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            table_param(&shader, VIEW_STRIDES),
+                            Root::View {
+                                srv: true,
+                                data: vec![4, 4],
+                            },
+                        ),
+                    ],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
