@@ -951,7 +951,7 @@ impl Host {
             eprintln!("D3D12 debug layer checked: no errors");
         } else if !cfg!(feature = "diagnostics") {
             eprintln!("D3D12 debug layer check skipped: diagnostics feature disabled");
-        } else if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+        } else if !crate::switch::on("VICTORY_D3D12_DEBUG") {
             eprintln!("D3D12 debug layer check skipped: VICTORY_D3D12_DEBUG unset");
         } else {
             eprintln!("D3D12 debug layer check skipped: debug layer or info queue unavailable");

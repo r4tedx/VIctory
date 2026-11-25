@@ -438,7 +438,7 @@ pub(crate) fn dispatch(
                 .ok()
         })
         .as_ref()?;
-    let budget = list.budget()?;
+    let (_, budget) = list.budget()?;
     let output = list.dispatch_args(u64::from(records) * 12 + 4)?;
     let mut constants = [stride, records, waves, u32::from(count.is_some()), 0, 0];
     // At most 2^21 groups carried in and 2^20 per record, even if every

@@ -1720,9 +1720,6 @@ impl State {
         // the others clamped in place.
         let rewritten;
         let (host_args, host_offset, clamped) = if rewrite {
-            if max == 0 {
-                return true;
-            }
             let Some(buffer) = crate::indirect::dispatch(
                 list,
                 args.gpu(arguments),
