@@ -492,6 +492,11 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Indirect clamps batched per window of indirect executions
+    /// (`crate::indirect`, `VICTORY_BATCH_CLAMPS`), and whether a window is
+    /// open (checked without the lock by every command that may write).
+    pub(crate) clamps: Mutex<crate::indirect::Batch>,
+    pub(crate) clamps_open: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -614,7 +619,7 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 
 struct ScratchChunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     mapped: usize,
     gpu: u64,
     capacity: u64,
@@ -750,6 +755,13 @@ impl Host {
         })
     }
 
+    /// Ticks per second of the queue's timestamps (tests time GPU work).
+    #[cfg(test)]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -787,6 +799,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                clamps: Mutex::default(),
+                clamps_open: false.into(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1345,6 +1359,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // A window of batched indirect clamps ends with the list.
+        crate::indirect::end(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1366,6 +1382,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        crate::indirect::reset(self);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1698,6 +1715,19 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_at(len).map(|(_, _, gpu, data)| (gpu, data))
+    }
+
+    /// As [`HostList::scratch`]: the upload buffer holding the memory, the
+    /// offset in it and the CPU pointer (for commands that take a buffer,
+    /// such as indirect arguments).
+    pub(crate) fn scratch_in(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_at(len)
+            .map(|(buffer, at, _, data)| (buffer, at, data))
+    }
+
+    /// Scratch memory: its buffer, offset, host GPU address and CPU pointer.
+    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
@@ -1706,8 +1736,8 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu, data));
         }
         while let Some(chunk) = s.chunks.get(s.current) {
             if len <= chunk.capacity - s.used {
@@ -1725,12 +1755,13 @@ impl HostList {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
                 chunk = s.current, requested = len, capacity, "allocated list scratch");
-            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
+            s.chunks.push(ScratchChunk { buffer, mapped: data as usize, gpu, capacity });
             s.used = 0;
         }
         let chunk = &s.chunks[s.current];
         let at = s.used;
-        let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
+        let data = (chunk.mapped + at as usize) as *mut u8;
+        let result = (chunk.buffer.clone(), at, chunk.gpu + at, data);
         s.used += len;
         Some(result)
     }
