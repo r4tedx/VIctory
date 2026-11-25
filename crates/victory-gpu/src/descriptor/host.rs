@@ -2253,6 +2253,49 @@ mod tests {
         assert_eq!(view.records, u32::MAX);
     }
 
+    /// The view-address table entry a shader reads a buffer descriptor's
+    /// dwords 0-3 from holds the console's fields: the title address, the
+    /// record count (elements; bytes for raw views) and the GFX10 buffer
+    /// format in dword 3 bits 12-18. The API view description's own words 2
+    /// and 3 (component mapping, padding or the high half of the first
+    /// element) are not these. A texture view's entry keeps its size fields.
+    #[test]
+    fn buffer_view_table_entries_hold_the_record_count_and_format() {
+        let mut buffer = [0; 14];
+        buffer[0] = 1;
+        let placed = |unordered, words: [u32; 10]| {
+            let mut all = [0; 16];
+            all[..10].copy_from_slice(&words);
+            (all[10], all[11]) = (0x1000, 0x1);
+            View::Placed(unordered, buffer, all)
+        };
+        let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        let (r32_uint, r32_typeless) = (DXGI_FORMAT_R32_UINT.0 as u32, DXGI_FORMAT_R32_TYPELESS.0 as u32);
+        let raw = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        // SRV: format, dimension, mapping, padding, first (2 words), count,
+        // stride, flags. UAV: format, dimension, first (2 words), count,
+        // stride, counter offset (2 words), flags.
+        let cases = [
+            ("typed SRV", placed(false, [r32_uint, 1, mapping, 0x55, 2, 0, 37, 0, 0, 0]), 0x1008, 37, 20),
+            ("structured SRV", placed(false, [0, 1, mapping, 0, 1, 0, 5, 12, 0, 0]), 0x100C, 5, 20),
+            ("raw SRV", placed(false, [r32_typeless, 1, mapping, 0, 0, 0, 16, 0, raw, 0]), 0x1000, 64, 20),
+            ("typed UAV", placed(true, [r32_uint, 1, 3, 0, 9, 0, 0, 0, 0, 0]), 0x100C, 9, 20),
+        ];
+        for (label, view, low, records, format) in cases {
+            let mut entry = [u32::MAX; 4];
+            write_address(entry.as_mut_ptr() as usize, 0, Some(&view));
+            assert_eq!(entry, [low, 1, records, format << 12], "{label}");
+        }
+        // A 2D texture view's entry is its image size fields, as before.
+        let texture: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let mut entry = [u32::MAX; 4];
+        write_address(entry.as_mut_ptr() as usize, 0, Some(&View::Placed(false, texture, view)));
+        let desc: [u32; 10] = view[..10].try_into().unwrap();
+        assert_eq!(entry, image_words(&texture, Some(&desc), false), "texture view");
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
