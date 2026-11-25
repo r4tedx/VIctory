@@ -468,6 +468,10 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Upload memory for the tables of batched indirect clamps
+    /// (`crate::indirect`): one open at a time, its unused room given back
+    /// when it closes ([`HostList::give_back_table`]).
+    tables: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -604,12 +608,43 @@ fn node_is_list(
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
-/// the bytes used in it.
+/// the bytes used in it; the chunks each of the last recordings used.
 #[derive(Default)]
 struct Scratch {
     chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
+    recent: [usize; SCRATCH_RECORDINGS],
+    recording: usize,
+}
+
+/// Recordings whose use of a list's scratch the chunks it keeps cover: the
+/// chunks past what the busiest of them used are let go at a reset.
+const SCRATCH_RECORDINGS: usize = 8;
+
+impl Scratch {
+    /// After the list's last submission ran: the chunks the busiest of the
+    /// last recordings used are kept, the rest let go, and memory is handed
+    /// out from the first chunk again. Without the trim one busy recording
+    /// held its memory for the list's life.
+    fn rewind(&mut self) {
+        let used = if self.chunks.is_empty() {
+            0
+        } else {
+            self.current + usize::from(self.used > 0)
+        };
+        self.recent[self.recording % SCRATCH_RECORDINGS] = used;
+        self.recording += 1;
+        let keep = self.recent.iter().copied().max().unwrap_or(0);
+        self.chunks.truncate(keep.max(1));
+        (self.current, self.used) = (0, 0);
+    }
+
+    /// Bytes of upload memory the chunks hold.
+    #[cfg(test)]
+    fn held(&self) -> u64 {
+        self.chunks.iter().map(|c| c.capacity).sum()
+    }
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -792,6 +827,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                tables: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
@@ -1390,9 +1426,8 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
+        for pool in [&self.scratch, &self.tables] {
+            pool.lock().unwrap_or_else(|e| e.into_inner()).rewind();
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1718,17 +1753,62 @@ impl HostList {
         self.scratch_at(len).map(|(_, _, gpu, data)| (gpu, data))
     }
 
-    /// As [`HostList::scratch`]: the upload buffer holding the memory, the
-    /// offset in it and the CPU pointer (for commands that take a buffer,
-    /// such as indirect arguments).
-    pub(crate) fn scratch_in(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        self.scratch_at(len).map(|(buffer, at, _, data)| (buffer, at, data))
+    /// As [`HostList::scratch`], with the upload buffer and the offset in
+    /// it, for a batched clamp window's table
+    /// (`crate::indirect`), from memory of its own: the room the table does
+    /// not use is given back when the window closes.
+    pub(crate) fn table(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_from(&self.tables, len)
+            .map(|(buffer, at, _, data)| (buffer, at, data))
+    }
+
+    /// The table [`HostList::table`] gave last, `len` bytes at `at`, needs
+    /// only its first `used` bytes: the rest goes to the next table.
+    pub(crate) fn give_back_table(&self, at: u64, len: u64, used: u64) {
+        let mut s = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(len), Some(used)) = (
+            len.max(1).checked_next_multiple_of(256),
+            used.checked_next_multiple_of(256),
+        ) else {
+            return;
+        };
+        if s.used == at + len && used <= len {
+            s.used = at + used;
+        }
+    }
+
+    /// Upload memory the list holds until its next reset and keeps after
+    /// it: scratch, clamp tables and buffers of their own (tests check it
+    /// stays bounded).
+    #[cfg(test)]
+    pub(crate) fn upload_held(&self) -> u64 {
+        let own: u64 = self
+            .deferred()
+            .uploads
+            .iter()
+            // SAFETY: a live buffer.
+            .map(|b| unsafe { b.GetDesc() }.Width)
+            .sum();
+        own + [&self.scratch, &self.tables]
+            .iter()
+            .map(|p| p.lock().unwrap().held())
+            .sum::<u64>()
     }
 
     /// Scratch memory: its buffer, offset, host GPU address and CPU pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        self.scratch_from(&self.scratch, len)
+    }
+
+    /// Memory from `pool`: its buffer, offset, host GPU address and CPU
+    /// pointer.
+    fn scratch_from(
+        &self,
+        pool: &Mutex<Scratch>,
+        len: u64,
+    ) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = pool.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;

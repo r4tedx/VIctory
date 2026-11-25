@@ -638,6 +638,11 @@ pub(crate) struct Batch {
 /// as executions come), where its records go and how much room it has.
 struct Window {
     table: usize,
+    /// The table's offset in its buffer and the bytes it took
+    /// ([`HostList::table`]): what its executions leave is given back when
+    /// it closes.
+    table_at: u64,
+    table_len: u64,
     room: u32,
     entries: u32,
     total: u32,
@@ -823,7 +828,8 @@ fn open(
     records: u32,
 ) -> Option<Window> {
     let room = batch.room.max(FIRST_ENTRIES);
-    let (table, at, data) = list.scratch_in(EXECUTIONS_AT + u64::from(room) * EXECUTION)?;
+    let table_len = EXECUTIONS_AT + u64::from(room) * EXECUTION;
+    let (table, at, data) = list.table(table_len)?;
     let (records_buffer, records_at, space) = batch.records.rest(bytes, RECORDS)?;
     let (charges, charges_at, charge_bytes) =
         batch.charges.rest(u64::from(records) * 8, CHARGES)?;
@@ -867,6 +873,8 @@ fn open(
     }
     Some(Window {
         table: data as usize,
+        table_at: at,
+        table_len,
         room,
         entries: 0,
         total: 0,
@@ -908,6 +916,14 @@ fn close(list: &HostList, batch: &mut Batch) {
     }
     batch.records.take(w.written);
     batch.charges.take(u64::from(w.total) * 8);
+    // The window's room past its executions is the next window's: a list
+    // of many short windows held the most room of each, ~256 KiB of upload
+    // memory a window once the room had grown.
+    list.give_back_table(
+        w.table_at,
+        w.table_len,
+        EXECUTIONS_AT + u64::from(w.entries) * EXECUTION,
+    );
 }
 
 /// After the list's last submission ran: its memory is free again (the
@@ -1581,6 +1597,64 @@ mod tests {
             list.reset();
         }
         list.close();
+    }
+
+    /// A list's upload memory stays bounded over many recordings: 201
+    /// recordings of 50 short windows each, the first one busy after them
+    /// (the clamp tables' room grown to its most, a lot of scratch, buffers
+    /// of their own), every one submitted and reset. What the busy one took
+    /// is let go within a few resets, and a short window holds only the
+    /// room its executions use, not the most room.
+    #[test]
+    fn list_upload_memory_stays_bounded_over_recordings() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let calls: Vec<Call> = (0..50).map(|_| (0, 1, vec![1, 1, 0, 0])).collect();
+        let (buffer, _, offsets) = fill(&calls);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let list = host.new_list().unwrap();
+        let mut held = Vec::new();
+        for round in 0..201 {
+            // Short windows, each ended as a command that may write ends it.
+            for &o in &offsets {
+                super::member(&list, (gpu, o), None, (0, 16, 1)).unwrap();
+                super::end(&list);
+            }
+            list.scratch(4096).unwrap();
+            if round == 0 {
+                // Executions until a window fills at the most room.
+                let mut n = 0;
+                while list.clamps.lock().unwrap().room < super::MOST_ENTRIES {
+                    super::member(&list, (gpu, offsets[0]), None, (0, 16, 1)).unwrap();
+                    n += 1;
+                    assert!(n < 100_000, "the room did not grow");
+                }
+                super::end(&list);
+                for _ in 0..8 {
+                    list.scratch(3 << 20).unwrap();
+                }
+                list.scratch(5 << 20).unwrap();
+                list.upload(host, 1 << 20).unwrap();
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            held.push(list.upload_held());
+        }
+        list.close();
+        let (busy, settled, last) = (held[0], held[20], held[200]);
+        assert!(busy > 16 << 20, "the busy recording held {busy} bytes");
+        assert!(
+            held[20..].iter().all(|&h| h <= settled),
+            "upload memory grew after the busy recording was let go: {:?}",
+            &held[20..]
+        );
+        assert!(
+            last <= 2 << 20,
+            "short windows hold {last} bytes of upload memory (busy {busy})"
+        );
     }
 
     /// Before and after: 1,500 indirect dispatches of no groups, each with
