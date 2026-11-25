@@ -133,12 +133,24 @@ fn mimg(name: &str, dmask: u8) -> Mimg {
     }
 }
 
+/// How a case's program differs from the plain one (not in PR #160).
+#[derive(Clone, Copy, Default)]
+struct Setup {
+    /// The sampler is immediate, written to s[16:19] with moves instead of
+    /// loaded from the sampler table: the one `synthetic_tests` uses
+    /// (border, transparent black, levels 0-12, linear filters).
+    border_sampler: bool,
+    /// This VGPR's address is an unsigned integer in the buffer, converted
+    /// to a float before the instruction, so a level is known to be whole.
+    whole: Option<u8>,
+}
+
 /// User data: s0 the SRV table (the image at heap index 0, the address
 /// buffer at 1), s1 the sampler table, s2 the UAV table (index 2). Each
 /// lane loads 16 address dwords into v2..v17, `literals` then set some to
 /// constants, and the instruction's four result dwords are stored at
 /// 16 × the lane (stores write the image instead).
-fn program(inst: Mimg, literals: &[(u8, u32)]) -> Vec<u32> {
+fn program(inst: Mimg, literals: &[(u8, u32)], setup: Setup) -> Vec<u32> {
     let mut w = vec![
         s_mov(4, 0),
         s_mov(5, ZERO),
@@ -149,7 +161,13 @@ fn program(inst: Mimg, literals: &[(u8, u32)]) -> Vec<u32> {
     ];
     w.extend(s_load(3, 8, 4, 0));
     w.extend(s_load(2, 32, 4, 0x20));
-    w.extend(s_load(2, 16, 6, 0));
+    if setup.border_sampler {
+        for (k, word) in [0x1B6, 0x00C0_0000, 0x1850_0000, 0].into_iter().enumerate() {
+            w.extend([s_mov(16 + k as u8, LITERAL), word]);
+        }
+    } else {
+        w.extend(s_load(2, 16, 6, 0));
+    }
     w.extend(s_load(3, 24, 20, 0));
     w.push(S_WAITCNT_0);
     for r in 20..24 {
@@ -162,6 +180,10 @@ fn program(inst: Mimg, literals: &[(u8, u32)]) -> Vec<u32> {
     w.push(S_WAITCNT_0);
     for &(r, x) in literals {
         w.extend([v_mov(r, LITERAL), x]);
+    }
+    if let Some(r) = setup.whole {
+        // v_cvt_f32_u32 v<r>, v<r>
+        w.push(0x7E00_0000 | u32::from(r) << 17 | 6 << 9 | 0x100 | u32::from(r));
     }
     w.extend(inst.words());
     w.push(S_WAITCNT_0);
@@ -244,7 +266,11 @@ fn report(test: &str, case: &str, outcome: &str) {
 /// `inst`'s program translated, and validated when the validator is found
 /// (`CS_DERIVATIVES` let through for a sample with implicit derivatives).
 fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, Stop> {
-    let s = lower(&program(inst, literals)).map_err(|e| Stop::Refused(e.to_string()))?;
+    translate_with(inst, literals, Setup::default())
+}
+
+fn translate_with(inst: Mimg, literals: &[(u8, u32)], setup: Setup) -> Result<HostShader, Stop> {
+    let s = lower(&program(inst, literals, setup)).map_err(|e| Stop::Refused(e.to_string()))?;
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
@@ -324,13 +350,13 @@ fn point(compare: bool) -> D3D12_SAMPLER_DESC {
 /// `out` at 2: what `out` holds afterwards.
 fn run(
     host: &Host,
-    inst: Mimg,
+    (inst, setup): (Mimg, Setup),
     literals: &[(u8, u32)],
     (image, out): (View, View),
     sampler: D3D12_SAMPLER_DESC,
     addr: &[[u32; ADDR]],
 ) -> Result<Vec<u32>, Stop> {
-    let s = translate(inst, literals)?;
+    let s = translate_with(inst, literals, setup)?;
     let (root, pso) = host.compute_pipeline(&s).map_err(Stop::NoPipeline)?;
     let mut data = vec![0; s.user_data_dwords().max(1) as usize];
     for u in &s.user_data {
@@ -486,6 +512,7 @@ fn corner(l: usize) -> (f32, f32) {
 struct Case {
     what: &'static str,
     inst: Mimg,
+    setup: Setup,
     literals: Vec<(u8, u32)>,
     lanes: Vec<(Vec<u32>, [u32; 4])>,
 }
@@ -499,6 +526,7 @@ fn case(
     Case {
         what,
         inst,
+        setup: Setup::default(),
         literals: literals.to_vec(),
         lanes: (0..LANES).map(lane).collect(),
     }
@@ -525,7 +553,8 @@ fn check(
             })
             .collect();
         let out = View::RawUav(4 * LANES as u32);
-        let got = match run(host, c.inst, &c.literals, (image(), out), sampler, &addr) {
+        let inst = (c.inst, c.setup);
+        let got = match run(host, inst, &c.literals, (image(), out), sampler, &addr) {
             Ok(g) => g,
             Err(e) => {
                 let (outcome, fails) = e.outcome();
@@ -1020,7 +1049,7 @@ fn stores_of_some_channels_write_zero_to_the_others() {
         let what = format!("image_store dmask {dmask:#x}{}", if d16 { " d16" } else { "" });
         let got = match run(
             &host,
-            inst,
+            (inst, Setup::default()),
             &[],
             (View::Texture(1, 1, dummy), View::TextureUav(8, 4)),
             point(false),
@@ -1431,5 +1460,84 @@ fn plain_forms_sample_the_texels_they_name() {
         || View::Depth(W, W, d),
         point(true),
     ));
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Not one of PR #160's tests: its gather at a run-time level
+/// (`gathers_at_a_run_time_level_read_that_levels_footprint`) in the one
+/// form this lowering takes, an immediate sampler whose border is
+/// transparent black and a level converted from an integer. The same
+/// texels, levels, coordinates and per-lane offsets; a texel outside the
+/// level reads 0 (the border) where PR #160's samplers clamp or wrap.
+#[test]
+fn gathers_at_a_whole_level_through_a_border_sampler_read_that_levels_footprint() {
+    let Some(host) = host() else { return };
+    let ow = offset_word;
+    let lane = |l: usize, (dx, dy): (i32, i32)| {
+        let n = (l % 3) as u32;
+        let s = (W >> n) as i32;
+        let (x, y) = ((l / 3) as i32 % s, (l / 7) as i32 % s);
+        let (u, v) = ((x + 1) as f32 / s as f32, (y + 1) as f32 / s as f32);
+        let blue = |i: i32, j: i32| {
+            let (i, j) = (i + dx, j + dy);
+            if (0..s).contains(&i) && (0..s).contains(&j) {
+                f((i + 8 * j + 100 * n as i32) as f32)
+            } else {
+                0
+            }
+        };
+        let want = [blue(x, y + 1), blue(x + 1, y + 1), blue(x + 1, y), blue(x, y)];
+        (n, (u, v), want)
+    };
+    let setup = |whole| Setup {
+        border_sampler: true,
+        whole: Some(whole),
+    };
+    let cases = [
+        Case {
+            setup: setup(4),
+            ..case("gather4_l blue", mimg("image_gather4_l", 4), &[], |l| {
+                let (n, (u, v), want) = lane(l, (0, 0));
+                ([f(u), f(v), n].to_vec(), want)
+            })
+        },
+        Case {
+            setup: setup(5),
+            ..case(
+                "gather4_l_o blue per lane",
+                mimg("image_gather4_l_o", 4),
+                &[],
+                |l| {
+                    let o = lane_offset(l);
+                    let (n, (u, v), want) = lane(l, o);
+                    ([ow(o.0, o.1), f(u), f(v), n].to_vec(), want)
+                },
+            )
+        },
+        // Levels past the view's last read the last.
+        Case {
+            setup: setup(4),
+            ..case(
+                "gather4_l blue, levels past the last",
+                mimg("image_gather4_l", 4),
+                &[],
+                |l| {
+                    let (x, y) = ((l % 2) as i32 - 1, (l / 2 % 2) as i32 - 1);
+                    let (u, v) = ((x + 1) as f32, (y + 1) as f32);
+                    let blue = |i: i32, j: i32| if (i, j) == (0, 0) { f(300.0) } else { 0 };
+                    let want = [blue(x, y + 1), blue(x + 1, y + 1), blue(x + 1, y), blue(x, y)];
+                    ([f(u), f(v), 3 + (l % 5) as u32].to_vec(), want)
+                },
+            )
+        },
+    ];
+    let t = leak(level_texels());
+    let failures = check(
+        "gathers_at_a_whole_level (border sampler)",
+        &host,
+        &cases,
+        || View::Mipped(W, W, LEVELS, t),
+        point(false),
+    );
     assert!(failures.is_empty(), "{failures:#?}");
 }
