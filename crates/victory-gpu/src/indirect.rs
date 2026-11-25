@@ -24,12 +24,17 @@ use windows::core::{Interface, s};
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint has_count; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+// Distinct indirect count buffer (bound to `args` when unused). Reading it
+// promotes a fresh `COMMON` count buffer to `UNORDERED_ACCESS` before the
+// post-clamp `UNORDERED_ACCESS -> INDIRECT_ARGUMENT` transition, and bounds
+// clamping to the records `ExecuteIndirect` can actually run.
+RWByteAddressBuffer count_buf : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -62,6 +67,7 @@ uint clamped(uint at) {
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
+groupshared uint limit;
 // One group walks the records in tiles of 64: every lane clamps its own
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
@@ -72,12 +78,15 @@ void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
+        limit = has_count != 0 ? min(records, count_buf.Load(0)) : records;
     }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+    GroupMemoryBarrierWithGroupSync();
+    uint active = limit;
+    for (uint tile = 0; tile < active / 64 + min(active % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
         uint at = record * stride;
         uint cost = 0;
-        if (record < records) {
+        if (record < active) {
             cost = clamped(at);
         }
         costs[lane] = cost;
@@ -195,77 +204,80 @@ impl Clamped {
     }
 }
 
-/// Which host buffer a scoped indirect UAV barrier targets (never a wildcard).
+/// Which host buffer a scoped indirect barrier targets (never a wildcard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Args,
     Count,
-    Budget,
 }
 
-/// The barriers and transition planned for one [`bound`] call.
+/// The barriers and transitions planned for one [`bound`] / [`done`] pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Plan {
-    /// Scoped UAV barriers emitted before the clamp dispatch.
-    pre_uav: [Target; 3],
-    pre_uav_len: usize,
-    /// Whether the clamp dispatches and emits the single post-clamp
-    /// `UAV -> INDIRECT_ARGUMENT` transition (and therefore requires [`done`]).
+    /// Scoped UAV barriers emitted before the clamp dispatch (and the exact
+    /// same buffers transitioned `UAV <-> INDIRECT_ARGUMENT` around execution).
+    buffers: [Target; 2],
+    buffers_len: usize,
+    /// Whether the clamp dispatches, bundles a post-clamp `budget` UAV barrier
+    /// (covering both subsequent clamps in the list and repeated list
+    /// executions in `Host::execute`), and transitions `buffers`.
     transition: bool,
 }
 
 impl Plan {
-    /// Plans barriers for `records` indirect records. `count_ptr` is the raw
-    /// resource pointer of the count buffer, if any (deduplicated against
-    /// `args_ptr`). `budget_written` is true when an earlier clamp on this
-    /// list already wrote the budget buffer.
-    fn for_call(
-        records: u32,
-        args_ptr: usize,
-        count_ptr: Option<usize>,
-        budget_written: bool,
-    ) -> Self {
+    /// Plans barriers and transitions for `records` indirect records.
+    /// `count_ptr` is the raw resource pointer of the count buffer, if any
+    /// (deduplicated against `args_ptr`).
+    fn for_call(records: u32, args_ptr: usize, count_ptr: Option<usize>) -> Self {
         if records == 0 {
             return Self {
-                pre_uav: [Target::Args; 3],
-                pre_uav_len: 0,
+                buffers: [Target::Args; 2],
+                buffers_len: 0,
                 transition: false,
             };
         }
-        let mut pre_uav = [Target::Args; 3];
+        let mut buffers = [Target::Args; 2];
         let mut len = 1;
         if count_ptr.is_some_and(|c| c != args_ptr) {
-            pre_uav[len] = Target::Count;
-            len += 1;
-        }
-        if budget_written {
-            pre_uav[len] = Target::Budget;
+            buffers[len] = Target::Count;
             len += 1;
         }
         Self {
-            pre_uav,
-            pre_uav_len: len,
+            buffers,
+            buffers_len: len,
             transition: true,
         }
     }
 
     fn pre_uav(&self) -> &[Target] {
-        &self.pre_uav[..self.pre_uav_len]
+        &self.buffers[..self.buffers_len]
+    }
+
+    fn transitions(&self) -> &[Target] {
+        if self.transition {
+            &self.buffers[..self.buffers_len]
+        } else {
+            &[]
+        }
+    }
+
+    fn post_budget_uav(&self) -> bool {
+        self.transition
     }
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. `count`
-/// is the indirect count buffer, if the call gives one (synchronized before
-/// execution when it is a different host buffer than `buffer`, without
-/// changing its state). Replaces the list's compute root signature and
-/// pipeline when returning [`Clamped::Ready`] (callers bind theirs after).
-/// `None` if the clamp is not available or the arguments are unaligned.
+/// `buffer`, and leaves `buffer` (and any distinct `count` buffer) ready in
+/// `INDIRECT_ARGUMENT`. `count` is `(resource, gpu_address)` of the indirect
+/// count buffer, if the call gives one. Replaces the list's compute root
+/// signature and pipeline when returning [`Clamped::Ready`] (callers bind
+/// theirs after). `None` if the clamp is not available or an address/stride is
+/// not 4-byte aligned.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
-    count: Option<&ID3D12Resource>,
+    count: Option<(&ID3D12Resource, u64)>,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> Option<Clamped> {
@@ -275,33 +287,38 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let (c, (budget_res, budget, budget_written)) = (clamp()?, list.budget()?);
+    if let Some((_, count_gpu)) = count
+        && !count_gpu.is_multiple_of(4)
+    {
+        return None;
+    }
+    let (c, (budget_res, budget)) = (clamp()?, list.budget()?);
     let plan = Plan::for_call(
         records,
         buffer.as_raw() as usize,
-        count.map(|r| r.as_raw() as usize),
-        budget_written,
+        count.map(|(r, _)| r.as_raw() as usize),
     );
     if !plan.transition {
         return Some(Clamped::Empty);
     }
-    let barrier_for = |target: Target| match target {
-        Target::Args => uav_barrier_for(buffer),
-        Target::Count => uav_barrier_for(count.expect("count buffer planned")),
-        Target::Budget => uav_barrier_for(budget_res),
+    let distinct_count = count.filter(|(r, _)| r.as_raw() != buffer.as_raw());
+    let resource_for = |target: Target| match target {
+        Target::Args => buffer,
+        Target::Count => distinct_count.expect("count buffer planned").0,
     };
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(distinct_count.is_some())];
     // SAFETY: an open list; our root signature, pipeline and live buffers
     // the caller and list hold.
     unsafe {
-        // Earlier shader writes (the title's argument/count passes, and any
-        // prior clamp's budget write in this list) first, scoped to their
-        // buffers so unrelated UAV waves keep running.
+        // Earlier shader writes to the argument (and distinct count) buffers
+        // first, scoped to their resources so unrelated UAV waves keep running.
         match plan.pre_uav() {
-            [a] => l.ResourceBarrier(&[barrier_for(*a)]),
-            [a, b] => l.ResourceBarrier(&[barrier_for(*a), barrier_for(*b)]),
-            [a, b, d] => l.ResourceBarrier(&[barrier_for(*a), barrier_for(*b), barrier_for(*d)]),
+            [a] => l.ResourceBarrier(&[uav_barrier_for(resource_for(*a))]),
+            [a, b] => l.ResourceBarrier(&[
+                uav_barrier_for(resource_for(*a)),
+                uav_barrier_for(resource_for(*b)),
+            ]),
             _ => unreachable!(),
         }
         l.SetComputeRootSignature(&c.root);
@@ -309,35 +326,58 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, distinct_count.map_or(gpu, |(_, g)| g));
         // One group walks every record.
         l.Dispatch(1, 1, 1);
-        // Transitioning UAV -> INDIRECT_ARGUMENT already synchronizes the
-        // clamp's UAV writes to `buffer`; `budget` is synchronized before the
-        // next clamp on this list.
-        l.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        )]);
+        // Transitioning UAV -> INDIRECT_ARGUMENT synchronizes the clamp's UAV
+        // writes to `buffer` and puts any distinct `count` buffer (promoted to
+        // UAV by `u2` above if it started in `COMMON`) in `INDIRECT_ARGUMENT`.
+        // Bundling `budget`'s UAV barrier in the same batch also serializes
+        // repeated executions of this list in one `ExecuteCommandLists` call.
+        let to_arg = |t: Target| {
+            transition(
+                resource_for(t),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )
+        };
+        debug_assert!(plan.post_budget_uav());
+        match plan.transitions() {
+            [a] => l.ResourceBarrier(&[to_arg(*a), uav_barrier_for(budget_res)]),
+            [a, b] => l.ResourceBarrier(&[to_arg(*a), to_arg(*b), uav_barrier_for(budget_res)]),
+            _ => unreachable!(),
+        }
     }
     Some(Clamped::Ready)
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it. No-op when `clamped` is [`Clamped::Empty`]
-/// (the buffer was never transitioned).
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, clamped: Clamped) {
+/// After the execution: `buffer` (and any distinct `count` buffer) back to
+/// unordered access, where the title's passes keep using them. No-op when
+/// `clamped` is [`Clamped::Empty`] (nothing was transitioned).
+pub(crate) fn done(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
+    clamped: Clamped,
+) {
     if !clamped.transitioned() {
         return;
     }
-    // SAFETY: an open list and a live buffer in INDIRECT_ARGUMENT.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
+    let to_uav = |r: &ID3D12Resource| {
+        transition(
+            r,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
+        )
     };
+    let distinct_count = count.filter(|r| r.as_raw() != buffer.as_raw());
+    // SAFETY: an open list and live buffers in INDIRECT_ARGUMENT.
+    unsafe {
+        match distinct_count {
+            None => list.list.ResourceBarrier(&[to_uav(buffer)]),
+            Some(count_res) => list.list.ResourceBarrier(&[to_uav(buffer), to_uav(count_res)]),
+        }
+    }
 }
 
 /// A UAV barrier scoped to `resource` (non-null `pResource`).
@@ -360,50 +400,43 @@ mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
 
-    /// Zero records skips pre-clamp barriers, clamp dispatch, transition, and
-    /// restore even when a count buffer and dirty budget are present.
+    /// Zero records skips pre-clamp barriers, clamp dispatch, transitions,
+    /// budget barrier, and restore even when a count buffer is present.
     #[test]
     fn zero_records_skips_clamp_and_barriers() {
-        let empty = Plan::for_call(0, 0x1000, None, false);
+        let empty = Plan::for_call(0, 0x1000, None);
         assert!(empty.pre_uav().is_empty());
-        assert!(!empty.transition);
+        assert!(empty.transitions().is_empty());
+        assert!(!empty.post_budget_uav());
 
-        let with_count_and_budget = Plan::for_call(0, 0x1000, Some(0x2000), true);
-        assert!(with_count_and_budget.pre_uav().is_empty());
-        assert!(!with_count_and_budget.transition);
+        let with_count = Plan::for_call(0, 0x1000, Some(0x2000));
+        assert!(with_count.pre_uav().is_empty());
+        assert!(with_count.transitions().is_empty());
+        assert!(!with_count.post_budget_uav());
         assert!(!Clamped::Empty.transitioned());
         assert!(Clamped::Ready.transitioned());
     }
 
-    /// Non-zero records plan only scoped pre-clamp UAV barriers (deduplicating
-    /// aliased count buffers, adding the budget only after an earlier clamp)
-    /// and a single post-clamp transition with no redundant UAV barrier.
+    /// Non-zero records plan only scoped pre-clamp UAV barriers and matching
+    /// `UAV <-> INDIRECT_ARGUMENT` transitions (deduplicating aliased count
+    /// buffers), plus a post-clamp budget UAV barrier bundled into the same
+    /// batch so repeated list executions stay synchronized.
     #[test]
     fn barrier_plan_scopes_pre_uav_targets() {
-        let first = Plan::for_call(4, 0x1000, None, false);
-        assert_eq!(first.pre_uav(), &[Target::Args]);
-        assert!(first.transition);
+        let plain = Plan::for_call(4, 0x1000, None);
+        assert_eq!(plain.pre_uav(), &[Target::Args]);
+        assert_eq!(plain.transitions(), &[Target::Args]);
+        assert!(plain.post_budget_uav());
 
-        let second = Plan::for_call(4, 0x1000, None, true);
-        assert_eq!(second.pre_uav(), &[Target::Args, Target::Budget]);
-        assert!(second.transition);
-
-        let distinct_count = Plan::for_call(8, 0x1000, Some(0x2000), false);
+        let distinct_count = Plan::for_call(8, 0x1000, Some(0x2000));
         assert_eq!(distinct_count.pre_uav(), &[Target::Args, Target::Count]);
-        assert!(distinct_count.transition);
+        assert_eq!(distinct_count.transitions(), &[Target::Args, Target::Count]);
+        assert!(distinct_count.post_budget_uav());
 
-        let distinct_count_and_budget = Plan::for_call(8, 0x1000, Some(0x2000), true);
-        assert_eq!(
-            distinct_count_and_budget.pre_uav(),
-            &[Target::Args, Target::Count, Target::Budget]
-        );
-        assert!(distinct_count_and_budget.transition);
-
-        let same_count_first = Plan::for_call(8, 0x1000, Some(0x1000), false);
-        assert_eq!(same_count_first.pre_uav(), &[Target::Args]);
-
-        let same_count_second = Plan::for_call(8, 0x1000, Some(0x1000), true);
-        assert_eq!(same_count_second.pre_uav(), &[Target::Args, Target::Budget]);
+        let same_count = Plan::for_call(8, 0x1000, Some(0x1000));
+        assert_eq!(same_count.pre_uav(), &[Target::Args]);
+        assert_eq!(same_count.transitions(), &[Target::Args]);
+        assert!(same_count.post_budget_uav());
     }
 
     /// `uav_barrier_for` constructs a scoped UAV barrier with a non-null
@@ -461,7 +494,7 @@ mod tests {
             for _ in 0..calls {
                 let state = super::bound(&list, &buffer, None, gpu, spec).unwrap();
                 assert_eq!(state, if records == 0 { Clamped::Empty } else { Clamped::Ready });
-                super::done(&list, &buffer, state);
+                super::done(&list, &buffer, None, state);
             }
             list.close();
             host.execute(&[&list]);
@@ -532,5 +565,114 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// A distinct `count` buffer — whether starting fresh in `COMMON` or left
+    /// in `UNORDERED_ACCESS` by an earlier pass — transitions cleanly into
+    /// `INDIRECT_ARGUMENT` for `ExecuteIndirect` and restores back to
+    /// `UNORDERED_ACCESS` in `done`, while repeated execution of the same list
+    /// stays synchronized on `budget`.
+    #[test]
+    fn distinct_count_buffer_transitions_for_execute_indirect_and_restores() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid command signature description for Dispatch.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&sig_desc, None, &mut sig)
+                .unwrap();
+        }
+        let sig = sig.unwrap();
+
+        let (args, args_data) = host.shared_buffer(256).unwrap();
+        let (scratch, _) = host.shared_buffer(256).unwrap();
+        let (count_uav, count_uav_data) = host.shared_buffer(256).unwrap();
+        let (count_common, count_common_data) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: mapped host buffers written before submission and read after.
+        unsafe {
+            let a = args_data.cast::<u32>();
+            // Record 0: 0 groups (no-op Dispatch via ExecuteIndirect); record 1: garbage past count=1.
+            a.add(0).write_volatile(0);
+            a.add(1).write_volatile(0);
+            a.add(2).write_volatile(0);
+            a.add(3).write_volatile(u32::MAX);
+            a.add(4).write_volatile(1);
+            a.add(5).write_volatile(1);
+
+            let cu = count_uav_data.cast::<u32>();
+            cu.add(0).write_volatile(1);
+            cu.add(1).write_volatile(1);
+            cu.add(2).write_volatile(1);
+
+            let cc = count_common_data.cast::<u32>();
+            cc.add(0).write_volatile(1);
+
+            let args_gpu = args.GetGPUVirtualAddress();
+            let scratch_gpu = scratch.GetGPUVirtualAddress();
+            let count_uav_gpu = count_uav.GetGPUVirtualAddress();
+            let count_common_gpu = count_common.GetGPUVirtualAddress();
+
+            // Put `count_uav` into `UNORDERED_ACCESS` first (reproducing a
+            // count buffer written by a prior UAV pass or earlier indirect call).
+            let prep = super::bound(&list, &count_uav, None, count_uav_gpu, (2, 12, 1)).unwrap();
+            assert_eq!(prep, Clamped::Ready);
+            super::done(&list, &count_uav, None, prep);
+
+            // Case 1: distinct `count` already in `UNORDERED_ACCESS`.
+            let s1 = super::bound(
+                &list,
+                &args,
+                Some((&count_uav, count_uav_gpu)),
+                args_gpu,
+                (2, 12, 2),
+            )
+            .unwrap();
+            assert_eq!(s1, Clamped::Ready);
+            // Point the active compute PSO's UAV slots away from `args`/`count`
+            // (which are now in `INDIRECT_ARGUMENT`) before `ExecuteIndirect`.
+            list.list.SetComputeRootUnorderedAccessView(1, scratch_gpu);
+            list.list.SetComputeRootUnorderedAccessView(3, scratch_gpu);
+            list.list
+                .ExecuteIndirect(&sig, 2, &args, 0, Some(&count_uav), 0);
+            super::done(&list, &args, Some(&count_uav), s1);
+
+            // Case 2: distinct `count` starting fresh in `COMMON` (promoted by u2).
+            let s2 = super::bound(
+                &list,
+                &args,
+                Some((&count_common, count_common_gpu)),
+                args_gpu,
+                (2, 12, 2),
+            )
+            .unwrap();
+            assert_eq!(s2, Clamped::Ready);
+            list.list.SetComputeRootUnorderedAccessView(1, scratch_gpu);
+            list.list.SetComputeRootUnorderedAccessView(3, scratch_gpu);
+            list.list
+                .ExecuteIndirect(&sig, 2, &args, 0, Some(&count_common), 0);
+            super::done(&list, &args, Some(&count_common), s2);
+
+            list.close();
+            // Execute the same list twice in one batch to exercise post-clamp
+            // `budget` UAV synchronization across repeated executions.
+            host.execute(&[&list, &list]);
+
+            // Record 0 ran empty (0 groups); record 1 was past `count = 1`.
+            assert_eq!(a.add(0).read_volatile(), 0);
+            assert_eq!(a.add(3).read_volatile(), u32::MAX);
+        }
     }
 }

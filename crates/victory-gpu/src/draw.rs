@@ -1598,7 +1598,7 @@ impl State {
         let Some(clamped) = crate::indirect::bound(
             list,
             &args.buffer,
-            counter.as_ref().map(|(s, _)| &s.buffer),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at))),
             args.gpu(arguments),
             (kind, stride, max),
         ) else {
@@ -1625,7 +1625,12 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer, clamped);
+            crate::indirect::done(
+                list,
+                &args.buffer,
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                clamped,
+            );
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1664,7 +1669,12 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer, clamped);
+        crate::indirect::done(
+            list,
+            &args.buffer,
+            counter.as_ref().map(|(s, _)| &s.buffer),
+            clamped,
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
