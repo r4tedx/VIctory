@@ -21,11 +21,22 @@
 //! After every dispatch of the program, direct or indirect, the view is
 //! cleared to the value (`ClearUnorderedAccessView*`) between unordered
 //! access barriers. Nothing happens while the variable is unset.
+//!
+//! `VICTORY_STAND_IN`, with rules written the same way, is for a program
+//! that does not run: held back (a program walking acceleration structures
+//! the builder has not built), dropped, or without a host pipeline. Where
+//! a dispatch of it, direct or indirect, does not run, its views are
+//! cleared to the values instead. Nothing of the program runs, so it
+//! needs no translation and walks nothing: a "lit" shadow mask in place
+//! of a ray-traced shadow pass that cannot run, say. The program's views
+//! are not known then, so its rules are not checked against them.
 //! The idea and the use of R9G9B9E5 as 32-bit words come from the
 //! Belobug fork's `ambient.rs` (0603123, 4f45ab8, GPL-3.0-or-later),
 //! which matches its program by name; here the user names it. The masks
 //! and zeros for narrower integer outputs follow ScarlettPort's stand-in
-//! encodings (`emit/stand_in.rs`, GPL-3.0-or-later).
+//! encodings (`emit/stand_in.rs`, GPL-3.0-or-later), whose shadow-mask
+//! stand-in suggested the second variable; it rewrites the program's
+//! stores where this one runs nothing.
 //! shortcut: the same value everywhere, every frame.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -153,26 +164,47 @@ fn parse_value(value: &str) -> Result<Value, String> {
     Ok(Value::Colour(rgba, packing))
 }
 
-/// The rules `VICTORY_AMBIENT` sets, read once; none if unset or wrong.
+/// The rules `VICTORY_AMBIENT` sets (after a program), read once; none if
+/// unset or wrong.
 pub(crate) fn rules() -> &'static [Rule] {
     static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
-    RULES.get_or_init(|| {
-        let Ok(text) = std::env::var("VICTORY_AMBIENT") else {
-            return Vec::new();
-        };
-        match parse(&text) {
-            Ok(rules) => {
-                for r in &rules {
-                    tracing::info!(program = %r.program, view = %r.view(), value = ?r.value, "ambient stand-in set");
-                }
-                rules
+    RULES.get_or_init(|| read("VICTORY_AMBIENT"))
+}
+
+/// The rules `VICTORY_STAND_IN` sets (in place of a program that does not
+/// run), read once; none if unset or wrong.
+pub(crate) fn instead_rules() -> &'static [Rule] {
+    #[cfg(test)]
+    if let Some(rules) = TEST_INSTEAD.with(std::cell::Cell::get) {
+        return rules;
+    }
+    static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
+    RULES.get_or_init(|| read("VICTORY_STAND_IN"))
+}
+
+// Rules that tests set for their own thread in place of the variable's.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_INSTEAD: std::cell::Cell<Option<&'static [Rule]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn read(variable: &str) -> Vec<Rule> {
+    let Ok(text) = std::env::var(variable) else {
+        return Vec::new();
+    };
+    match parse(&text) {
+        Ok(rules) => {
+            for r in &rules {
+                tracing::info!(variable, program = %r.program, view = %r.view(), value = ?r.value, "stand-in set");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "VICTORY_AMBIENT not understood: no stand-in");
-                Vec::new()
-            }
+            rules
         }
-    })
+        Err(e) => {
+            tracing::warn!(variable, error = %e, "stand-in rules not understood: none");
+            Vec::new()
+        }
+    }
 }
 
 /// What the clear writes: floats for a float or normalized view, words for
@@ -352,7 +384,7 @@ pub(crate) fn note(filled: bool) {
             tracing::info!(
                 filled = FILLED.load(Ordering::Relaxed),
                 skipped = SKIPPED.load(Ordering::Relaxed),
-                "ambient stand-in: views filled so far"
+                "stand-ins: views filled so far"
             );
             *last = Some(now);
         }

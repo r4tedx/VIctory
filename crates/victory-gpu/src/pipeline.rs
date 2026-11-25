@@ -220,6 +220,19 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// The shader hash (as logged) of a compute pipeline's program; `None` for
+/// graphics pipelines. Asks for no translation.
+#[cfg(windows)]
+pub(crate) fn compute_hash<'a>(this: This) -> Option<&'a str> {
+    if this.is_null() {
+        return None;
+    }
+    match &pipeline(this).shaders[..] {
+        [shader] if shader.stage == "compute" => Some(&shader.hash),
+        _ => None,
+    }
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
