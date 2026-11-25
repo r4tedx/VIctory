@@ -401,36 +401,42 @@ RWByteAddressBuffer charged : register(u3);
 RWByteAddressBuffer budget : register(u4);
 // The window's runs and records.
 cbuffer Window : register(b1) { uint runs; uint total; };
-// Per execution of the window, 32 bytes: kind, record stride, records, its
-// first record among the window's; where its clamped records go in
-// `clamped_args`, where its count goes there (none: ~0), where its records
-// and its count are in the run's buffers.
+// Per execution of the window, 32 bytes: kind, record stride, whether a
+// distinct count bounds the clamp, its first record among the window's;
+// where its records and count go in `clamped_args` (no count: ~0), and
+// where they are in the run's buffers.
 ByteAddressBuffer executions : register(t0);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
-// Clamps the record of `kind` at `from` in `src` into `to` in
-// `clamped_args` as the in-place clamp does (the same bounds); its cost.
-uint clamped(uint kind, uint from, uint to) {
-    uint cost;
+// Copies the record from `src` to `clamped_args`. Only active records
+// are clamped and charged, using the in-place clamp's bounds.
+uint clamp_and_copy(uint kind, uint from, uint to, bool active) {
+    uint cost = 0;
     if (kind <= 1) {
-        uint count = min(src.Load(from), 1u << 24);
-        uint instances = min(src.Load(from + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        clamped_args.Store4(to, uint4(count, instances, src.Load2(from + 8)));
+        uint4 args = src.Load4(from);
+        if (active) {
+            args.x = min(args.x, 1u << 24);
+            args.y = min(args.y, (1u << 26) / max(args.x, 1u));
+            cost = args.x * args.y;
+        }
+        clamped_args.Store4(to, args);
         if (kind == 1) {
             clamped_args.Store(to + 16, src.Load(from + 16));
         }
-    } else if (kind == 2) {
-        uint3 g = min(src.Load3(from), uint3(65535, 65535, 65535));
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        clamped_args.Store3(to, g);
     } else {
         uint3 g = src.Load3(from);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
+        if (active) {
+            if (kind == 2) {
+                g = min(g, uint3(65535, 65535, 65535));
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64;
+            } else {
+                g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+                cost = g.x * g.y * g.z * 128;
+            }
+        }
         clamped_args.Store3(to, g);
     }
     return cost;
@@ -459,11 +465,21 @@ void gather(uint id : SV_DispatchThreadID) {
     uint4 e = executions.Load4(lo * 32);
     uint4 where = executions.Load4(lo * 32 + 16);
     uint record = at - e.w;
-    if (record == 0 && where.y != 0xffffffffu) {
-        clamped_args.Store(where.y, count_src.Load(where.w));
+    bool distinct_count = e.z != 0;
+    bool active = true;
+    if (where.y != 0xffffffffu && (distinct_count || record == 0)) {
+        // Use the same GPU-loaded count that record zero copies for
+        // ExecuteIndirect. The inline clamp only honors distinct counts.
+        uint count = count_src.Load(where.w);
+        if (record == 0) {
+            clamped_args.Store(where.y, count);
+        }
+        active = !distinct_count || record < count;
     }
-    uint to = where.x + record * e.y;
-    charged.Store2(at * 8, uint2(to, clamped(e.x, where.z + record * e.y, to)));
+    uint offset = record * e.y;
+    uint to = where.x + offset;
+    uint cost = clamp_and_copy(e.x, where.z + offset, to, active);
+    charged.Store2(at * 8, uint2(to, cost));
 }
 // Above any budget left: sums saturate here and still compare right.
 static const uint CAP = BUDGET + 1;
@@ -503,6 +519,7 @@ void charge(uint lane : SV_GroupIndex) {
         for (uint j = 0; j < EACH && first + j < total; j++) {
             uint2 r = charged.Load2((first + j) * 8);
             sum = min(sum + min(r.y, CAP), CAP);
+            // Zero-cost records, including those past the count, stay as gathered.
             if (r.y != 0 && sum > left) {
                 // Draws keep their layout with no vertices; groups become
                 // zero.
@@ -839,6 +856,8 @@ pub(crate) fn member(
     };
     // Its records, then its count.
     let bytes = u64::from(stride) * u64::from(records) + if count.is_some() { 4 } else { 0 };
+    // Match bound's resource comparison before adjusting either base address.
+    let distinct_count = count.is_some_and(|(base, _)| base != source.0);
     // Offsets the pass's 32 bits reach; past them the address starts a
     // buffer of its own.
     let near = |(base, at): (u64, u64), len: u64| {
@@ -908,7 +927,7 @@ pub(crate) fn member(
     let execution = [
         kind,
         stride,
-        records,
+        u32::from(distinct_count),
         w.total,
         at as u32,
         count_at.map_or(u32::MAX, |c| c as u32),
@@ -1496,27 +1515,57 @@ mod tests {
     }
 
     /// Batched clamps leave every record as the clamps one by one do, the
-    /// budget included (spent on the way, so records run empty from there):
-    /// 150 mixed executions (several windows: the room for executions
-    /// growing, then too many runs), with clamps one by one before and after
-    /// them in the same list. The title's records stay as written.
+    /// budget included (spent on the way, so active records run empty from
+    /// there). The 150 batched executions mix counted and uncounted calls
+    /// across several windows, with clamps one by one before and after them.
+    /// The batched source records stay as written.
     #[test]
     fn batched_clamps_leave_what_clamps_one_by_one_leave() {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
-        let calls = mixed_calls(160);
+        let mut calls = mixed_calls(160);
+        // The first batched call executes one record. Charging both of its
+        // remaining records would exhaust the budget in the first window.
+        calls[5] = (2, 3, vec![65_536, 1, 1, 1024, 1024, 1, 1024, 1024, 1]);
+        let counts: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, records, _))| match i % 12 {
+                1 => Some(records / 2),
+                2 => Some(0),
+                3 => Some(records + 1),
+                5 if i == 5 => Some(1),
+                _ => None,
+            })
+            .collect();
+        let (count_buffer, count_data) = host.shared_buffer(counts.len() as u64 * 4).unwrap();
+        for (i, &count) in counts.iter().enumerate() {
+            // SAFETY: a mapped buffer sized for all counts, before submission.
+            unsafe {
+                count_data
+                    .cast::<u32>()
+                    .add(i)
+                    .write_volatile(count.unwrap_or(0))
+            };
+        }
+        // SAFETY: a live buffer.
+        let count_gpu = unsafe { count_buffer.GetGPUVirtualAddress() };
+        let count_offset = |i: usize| counts[i].map(|_| i as u64 * 4);
+        let inline_count = |i| count_offset(i).map(|at| (&count_buffer, count_gpu + at));
         let inline = |i: usize| !(5..155).contains(&i);
         // One by one, in place.
         let (old, old_data, offsets) = fill(&calls);
         let list = host.new_list().unwrap();
         // SAFETY: a live buffer.
         let old_gpu = unsafe { old.GetGPUVirtualAddress() };
-        for ((kind, records, _), &offset) in calls.iter().zip(&offsets) {
+        for (i, ((kind, records, _), &offset)) in calls.iter().zip(&offsets).enumerate() {
             let spec = (*kind, words(*kind) as u32 * 4, *records);
-            let clamped = super::bound(&list, &old, None, old_gpu + offset, spec).unwrap();
-            super::done(&list, &old, None, clamped);
+            let count = inline_count(i);
+            let clamped = super::bound(&list, &old, count, old_gpu + offset, spec).unwrap();
+            super::done(&list, &old, count.map(|(buffer, _)| buffer), clamped);
         }
+        let (old_budget, old_budget_at) = read_back(&list, &[(list.budget().unwrap().0, 0, 4)]);
         list.close();
         host.execute(&[&list]);
         // Batched, but the first five and the last five.
@@ -1529,8 +1578,9 @@ mod tests {
             let spec = (*kind, words(*kind) as u32 * 4, *records);
             if inline(i) {
                 super::end(&batched);
-                let clamped = super::bound(&batched, &new, None, new_gpu + offset, spec).unwrap();
-                super::done(&batched, &new, None, clamped);
+                let count = inline_count(i);
+                let clamped = super::bound(&batched, &new, count, new_gpu + offset, spec).unwrap();
+                super::done(&batched, &new, count.map(|(buffer, _)| buffer), clamped);
                 members.push(None);
             } else {
                 // The first window fills (one run); then 30 executions name
@@ -1540,7 +1590,8 @@ mod tests {
                     100..130 => (new_gpu + offset, 0),
                     _ => (new_gpu, offset),
                 };
-                members.push(Some(super::member(&batched, source, None, spec).unwrap()));
+                let count = count_offset(i).map(|at| (count_gpu, at));
+                members.push(Some(super::member(&batched, source, count, spec).unwrap()));
             }
         }
         super::end(&batched);
@@ -1560,6 +1611,7 @@ mod tests {
                     )
                 })
             })
+            .chain([(batched.budget().unwrap().0, 0, 4)])
             .collect();
         let (back, starts) = read_back(&batched, &ranges);
         batched.close();
@@ -1568,7 +1620,7 @@ mod tests {
         let mut ran = 0;
         let mut empty = 0;
         let mut copied = starts.iter();
-        for (i, ((_, _, written), &offset)) in calls.iter().zip(&offsets).enumerate() {
+        for (i, ((kind, records, written), &offset)) in calls.iter().zip(&offsets).enumerate() {
             let at = offset as usize / 4;
             // SAFETY: inside the buffers, after the lists ran.
             let want: Vec<u32> = (0..written.len())
@@ -1588,9 +1640,14 @@ mod tests {
                 assert_eq!(&kept, written, "execution {i}: its source changed");
                 words_of(&back, *copied.next().unwrap(), written.len())
             };
-            assert_eq!(got, want, "execution {i} ({:?})", calls[i].0);
-            if calls[i].0 <= 1 {
-                for record in want.chunks(words(calls[i].0)) {
+            assert_eq!(
+                got, want,
+                "execution {i} (kind {kind}, count {:?})",
+                counts[i]
+            );
+            if *kind <= 1 {
+                let active = counts[i].unwrap_or(*records).min(*records) as usize;
+                for record in want.chunks(words(*kind)).take(active) {
                     if record[0] == 0 {
                         empty += 1;
                     } else {
@@ -1601,6 +1658,9 @@ mod tests {
         }
         // The budget ran out on the way.
         assert!(ran > 100 && empty > 100, "ran {ran}, empty {empty}");
+        let want_budget = words_of(&old_budget, old_budget_at[0], 1);
+        assert_eq!(want_budget, [1 << 27]);
+        assert_eq!(words_of(&back, *copied.next().unwrap(), 1), want_budget);
     }
 
     /// A window ends before a write to later executions' records (as a
@@ -1662,7 +1722,8 @@ mod tests {
     /// dispatch and dispatches in one window; the dispatches run with their
     /// count (3 of 4 records: 1 + 2 + 3 groups) and without (all 4: 10).
     /// The last dispatches' count lies in another buffer (a run of its own):
-    /// 1 of 2 records, 5 groups.
+    /// 1 of 2 records, 5 groups. A draw count in the argument buffer is
+    /// copied and leaves the clamp's record limit at the supplied maximum.
     #[test]
     fn executions_read_the_windows_records_and_counts() {
         let Some(host) = super::host() else {
@@ -1680,12 +1741,18 @@ mod tests {
             (2, 4, vec![1, 1, 1, 2, 1, 1, 3, 1, 1, 4, 1, 1]),
             (2, 2, vec![5, 1, 1, 6, 1, 1]),
         ];
-        let (buffer, _, offsets) = fill(&calls);
+        let (buffer, args_data, offsets) = fill(&calls);
+        let draw_count_at = offsets[0] + calls[0].2.len() as u64 * 4;
         let (counts, count) = host.shared_buffer(256).unwrap();
         let (others, other) = host.shared_buffer(256).unwrap();
         let (counter, counted) = host.shared_buffer(256).unwrap();
         // SAFETY: our mapped buffers, before the list runs; live buffers.
         let (gpu, count_gpu, counter_gpu) = unsafe {
+            // The draw count fits in the padding after its records.
+            args_data
+                .add(draw_count_at as usize)
+                .cast::<u32>()
+                .write_volatile(0);
             count.cast::<u32>().write_volatile(3);
             other.cast::<u32>().add(1).write_volatile(1);
             counted.cast::<u32>().write_volatile(0);
@@ -1704,6 +1771,7 @@ mod tests {
             .enumerate()
             .map(|(i, ((kind, records, _), &offset))| {
                 let count = match i {
+                    0 => Some((gpu, draw_count_at)),
                     3 => Some((count_gpu, 0)),
                     4 => Some((other_gpu, 4)),
                     _ => None,
@@ -1718,7 +1786,7 @@ mod tests {
             })
             .collect();
         assert!(members[0].opened && members[1..].iter().all(|m| !m.opened));
-        let (m, last) = (&members[3], &members[4]);
+        let (draw, m, last) = (&members[0], &members[3], &members[4]);
         // SAFETY: an open list, our pipeline, signature and buffers; the
         // window's records are indirect arguments while it is open.
         unsafe {
@@ -1749,7 +1817,11 @@ mod tests {
                     u64::from(*records) * words(*kind) as u64 * 4,
                 )
             })
-            .chain([(&m.buffer, m.count, 4), (&last.buffer, last.count, 4)])
+            .chain([
+                (&m.buffer, m.count, 4),
+                (&last.buffer, last.count, 4),
+                (&draw.buffer, draw.count, 4),
+            ])
             .collect();
         let (back, starts) = read_back(&list, &ranges);
         list.close();
@@ -1770,6 +1842,7 @@ mod tests {
             (got[5].as_slice(), got[6].as_slice()),
             ([3].as_slice(), [1].as_slice())
         );
+        assert_eq!(got[7], [0]);
     }
 
     /// A list runs its batched clamps again at each submission (the budget
