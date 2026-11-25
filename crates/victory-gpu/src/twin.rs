@@ -147,6 +147,9 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             return None;
         }
         let texture = texture?;
+        // SAFETY: a plain query of a description the host just took.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+        crate::procmem::count(&texture, crate::procmem::Kind::Twin, bytes);
         crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
         planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
     }

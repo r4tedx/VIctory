@@ -52,12 +52,15 @@ pub(crate) enum Kind {
     /// Host pipeline states of title pipelines (counted, no bytes: what
     /// the driver keeps for each is its own).
     Pipeline = 4,
+    /// Writable twins of depth textures (video memory, not counted with
+    /// host textures): `crate::twin`.
+    Twin = 5,
     /// Tests' own, which nothing else counts under.
     #[cfg(test)]
-    Test = 5,
+    Test = 6,
 }
 
-const KINDS: usize = if cfg!(test) { 6 } else { 5 };
+const KINDS: usize = if cfg!(test) { 7 } else { 6 };
 
 /// Per kind: buffers alive, and their bytes.
 static BUFFERS: [[AtomicU64; 2]; KINDS] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; KINDS];
@@ -297,6 +300,7 @@ pub(crate) struct Figures {
     pub(crate) title_heap: u64,
     pub(crate) buffers: [(u64, u64); 4],
     pub(crate) pipelines: u64,
+    pub(crate) twins: (u64, u64),
     /// Host copies alive, of title buffers alive, of loose windows:
     /// (count, title bytes).
     pub(crate) copies: [(u64, u64); 3],
@@ -362,6 +366,7 @@ pub(crate) fn figures() -> Figures {
         title_heap: HEAP.load(Relaxed),
         buffers: [Kind::Shared, Kind::Upload, Kind::Readback, Kind::GpuUpload].map(buffers),
         pipelines: buffers(Kind::Pipeline).0,
+        twins: buffers(Kind::Twin),
         copies: {
             let [registered, loose] = crate::shadow::held_copies();
             [
@@ -393,7 +398,7 @@ pub(crate) fn log() {
     let mb = |b: u64| b as f64 / 1e6;
     let [shared, upload, readback, gpu_upload] = f.buffers;
     tracing::info!(
-        "process memory, by class: [video, DXGI] used {:.0} of budget {:.0} MB, host textures {} ({:.0} MB), GPU upload heaps {} ({:.0} MB); \
+        "process memory, by class: [video, DXGI] used {:.0} of budget {:.0} MB, host textures {} ({:.0} MB), depth twins {} ({:.0} MB), GPU upload heaps {} ({:.0} MB); \
          [process] private commit {:.0} MB, working set {:.0} MB, system commit {:.0} of {:.0} MB ({:.0} MB free); \
          [title] reservations {:.0} MB committed of {:.0} MB in {} regions (private), default heap {:.0} MB (private), \
          physical pages {:.0} MB committed of {:.0} MB (system commit, not private); \
@@ -405,6 +410,8 @@ pub(crate) fn log() {
         mb(f.d3d_video.1),
         f.textures.0,
         mb(f.textures.1),
+        f.twins.0,
+        mb(f.twins.1),
         gpu_upload.0,
         mb(gpu_upload.1),
         mb(f.private),
