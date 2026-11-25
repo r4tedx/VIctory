@@ -209,7 +209,8 @@ impl GraphicsState {
         let mut next = [0u32; 32];
         self.inputs
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(i, e)| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
                 let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
@@ -230,6 +231,11 @@ impl GraphicsState {
                     offset,
                     format,
                     per_instance: e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    position: self.names.get(i).is_some_and(|n| {
+                        let n = n.to_bytes();
+                        n.eq_ignore_ascii_case(b"POSITION")
+                            || n.eq_ignore_ascii_case(b"SV_POSITION")
+                    }),
                 }
             })
             .collect()
@@ -243,6 +249,9 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+    /// Named as the position (`POSITION` or `SV_Position`, any case): the
+    /// CPU rectangle expansion finds each rectangle's corners there.
+    pub(crate) position: bool,
 }
 
 /// The console's own primitive topology types.

@@ -1433,6 +1433,23 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        // The position input's vertices, where every slot's expansion finds
+        // the corner between the other two (see `primitive`): (title
+        // address, stride, offset, format).
+        let position = p
+            .inputs
+            .iter()
+            .find(|e| e.position && !e.per_instance)
+            .and_then(|e| {
+                let v = self.vertex.get(e.slot as usize)?;
+                let stride = u64::from(v.stride);
+                let from = v.address + u64::from(first) * stride;
+                let inside = v.address != 0
+                    && stride != 0
+                    && (u64::from(first) + u64::from(count)) * stride <= u64::from(v.size)
+                    && crate::shadow::find(from, rects * 3 * stride).is_some();
+                inside.then_some((from as usize, stride as usize, e.offset, e.format))
+            });
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -1468,7 +1485,19 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                let position = position.map(|(at, stride, offset, format)| {
+                    // SAFETY: the position's vertices lie in a title buffer
+                    // too (checked when recorded).
+                    let src =
+                        unsafe { std::slice::from_raw_parts(at as *const u8, n * 3 * stride) };
+                    crate::primitive::Position {
+                        src,
+                        stride,
+                        offset,
+                        format,
+                    }
+                });
+                crate::primitive::expand_rects(src, dst, stride, &elements, position);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
