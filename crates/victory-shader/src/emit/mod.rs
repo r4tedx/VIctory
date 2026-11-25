@@ -197,6 +197,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
