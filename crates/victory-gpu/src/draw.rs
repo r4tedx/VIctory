@@ -5,8 +5,8 @@
 //! user data the translated shaders read, the host copies of the buffers
 //! and descriptors they read, and the states of the textures involved.
 //! State the host keeps across draws (viewports, scissors, blend factor,
-//! stencil reference, topology, targets) is set on the host list as the
-//! title sets it.
+//! stencil reference, depth bounds, topology, targets) is set on the host
+//! list as the title sets it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,6 +64,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// None leaves the host list's default bounds (0..1) in place.
+    depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -502,6 +504,21 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        if list.depth_bounds.is_none() {
+            crate::host::warn_depth_bounds();
+        }
+        self.apply_depth_bounds(list);
+    }
+
+    fn apply_depth_bounds(&self, list: &HostList) {
+        if let (Some(list), Some((min, max))) = (&list.depth_bounds, self.depth_bounds) {
+            // SAFETY: the host supports depth bounds and the list is open.
+            unsafe { list.OMSetDepthBounds(min, max) };
+        }
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -625,6 +642,10 @@ impl State {
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            // Also reached after the indirect clamp invalidates the pipeline.
+            if !compute {
+                self.apply_depth_bounds(list);
+            }
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
