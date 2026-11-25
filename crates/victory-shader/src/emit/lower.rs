@@ -752,9 +752,14 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if s
+                    .threads
+                    .map(|t| t.iter().product::<u32>())
+                    .is_some_and(|n| n != 64 && n > 32)
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
+                    // (A group of 32 threads or fewer is the lower half
+                    // alone: its sections are that one host wave's.)
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
                 } else {
                     None
@@ -1497,7 +1502,11 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        if self.console_cf && self.split {
+        // A group of 32 threads or fewer has no upper half: the console
+        // wave's other lanes are in no mask a section reduces over, so the
+        // one host wave's reduction is the console wave's.
+        let halves = self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 32);
+        if self.console_cf && self.split && halves {
             // The halves exchange dwords: a float goes as its bits. (The
             // console adds a wave's floats in its own order, the host's
             // wave operations in theirs, and the halves' sums are added

@@ -659,8 +659,9 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves only in a group of exactly one
-/// console wave: with a partial upper half, or none, it still stops.
+/// A whole-wave section crosses the halves in a group of exactly one
+/// console wave, and needs no crossing in a group of 32 threads or fewer
+/// (the lower half alone): with a partial upper half it still stops.
 #[test]
 fn whole_wave_sections_in_partial_groups_still_stop() {
     let nvidia = super::Target {
@@ -669,8 +670,13 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
     };
     let mut body = reduction_scan(37, 0x80);
     body.push(0x7E04_020A); // v_mov_b32 v2, s10
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    for threads in [48, 32] {
+    for threads in [64, 32, 16] {
+        assert!(
+            emit_for(&program(&body, threads), nvidia).is_ok(),
+            "{threads} threads"
+        );
+    }
+    for threads in [48, 33] {
         assert_eq!(
             emit_for(&program(&body, threads), nvidia),
             Err(crate::ShaderError::Unsupported {
@@ -679,6 +685,28 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
             }),
             "{threads} threads"
         );
+    }
+}
+
+/// A wave64 group of 32 threads or fewer is the console wave's lower half
+/// alone: its upper lanes are in no mask, so a whole-wave reduction is the
+/// one host wave's, with nothing exchanged. (With the halves combined as in
+/// a full wave, a minimum or an AND would take the absent half's 0.)
+#[test]
+fn whole_wave_reductions_in_a_group_of_one_half() {
+    // (operation, VOP2 opcode, identity operand, the console's result per
+    // thread count)
+    for (label, opcode, ident, want) in [
+        ("v_add_nc_u32", 37, 0x80, [496, 120]),
+        ("v_max_u32", 20, 0x80, [31, 15]),
+        ("v_min_u32", 19, 0xC1, [0, 0]),
+        ("v_or_b32", 28, 0x80, [31, 15]),
+    ] {
+        for (threads, want) in [32, 16].into_iter().zip(want) {
+            let mut body = reduction_scan(opcode, ident);
+            body.push(0x7E04_020A); // v_mov_b32 v2, s10
+            console_flow_case(&format!("whole-wave {label}"), &body, threads, |_| want);
+        }
     }
 }
 
