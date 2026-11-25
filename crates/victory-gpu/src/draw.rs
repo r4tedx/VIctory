@@ -2001,6 +2001,129 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    /// A depth texture the title denies shader reads, which the host keeps
+    /// in its typed format (16- or 32-bit depth), used through an
+    /// unordered view: its twin's plane holds the same bytes, copied over
+    /// without the conversion and back. A multisample one gets no twin,
+    /// and asking for one is no debug layer error.
+    #[test]
+    fn a_typed_depth_texture_shares_its_bytes_with_its_twin() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(1);
+        let (out, data) = host.shared_buffer(64 * 64 * 4).unwrap();
+        let cs = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0)), UAV(u1)"
+RWTexture2D<float> d : register(u0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store((id.y * 64 + id.x) * 4, asuint(d[id.xy]));
+    d[id.xy] = 0.75;
+}
+"#,
+        );
+        // Console format, its unordered view's, the host's; the clear of
+        // 0.25 as the shader reads it; 0.75 as the depth texture holds it.
+        let cases = [
+            (55, 56, DXGI_FORMAT_D16_UNORM, 16384.0 / 65535.0, 49151, 2),
+            (40, 41, DXGI_FORMAT_D32_FLOAT, 0.25, 0.75f32.to_bits(), 4),
+        ];
+        for (console, view, format, read, held, size) in cases {
+            let words = texture_words(64, 64, console, 0, 2 | 4 | 8);
+            let depth = texture_at_address(title_memory(1 << 20), &words);
+            let copy = crate::resource::host_copy(depth).expect("a host depth texture");
+            // SAFETY: a live resource.
+            let dd = unsafe { copy.texture.GetDesc() };
+            assert_eq!(dd.Format, format, "f{console}: the host keeps it typed");
+            let uav = View::Unordered(depth as usize, 0, Some([view, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+            slots.make(0, &uav);
+            let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            // SAFETY: outputs for one subresource.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &dd,
+                    0,
+                    1,
+                    0,
+                    Some(&mut f),
+                    None,
+                    None,
+                    Some(&mut total),
+                )
+            };
+            let (raw, raw_data) = host.shared_buffer(total).unwrap();
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, depth, 0x10);
+            let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let handle = host.dsv(&copy.texture, Some(&dsv));
+            // SAFETY: an open list, the texture in the depth write state.
+            unsafe {
+                list.list
+                    .ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None)
+            };
+            readable(&list, &used(ResourceType::Uav), &uav, false);
+            assert!(!list.take_rebind(), "f{console}: no conversion");
+            run(&list, &slots, &cs, 0, Some(&out), (8, 8));
+            crate::list::ensure_state(&list, depth, 0x800);
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the copy does not release.
+                pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&raw) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+            };
+            // SAFETY: an open list, the texture in the copy source state.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            list.close();
+            host.execute(&[&list]);
+            for (x, y) in [(0usize, 0usize), (31, 17), (63, 63)] {
+                let at = f.Offset as usize + y * f.Footprint.RowPitch as usize + x * size;
+                // SAFETY: inside the mapped buffers.
+                let (got, bytes) = unsafe {
+                    let got = (data.add((y * 64 + x) * 4) as *const f32).read();
+                    let bytes = (raw_data.add(at) as *const u32).read_unaligned();
+                    (got, if size == 2 { bytes & 0xffff } else { bytes })
+                };
+                assert!(
+                    (got - read).abs() < 1e-7,
+                    "f{console} cleared at {x},{y}: {got}"
+                );
+                assert_eq!(bytes, held, "f{console} written depth at {x},{y}");
+            }
+        }
+        let mut words = texture_words(64, 64, 40, 0, 2 | 4);
+        words[9] = 4;
+        let depth = texture_at_address(title_memory(1 << 20), &words);
+        let copy = crate::resource::host_copy(depth).expect("a host depth texture");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.SampleDesc.Count, 4);
+        let uav = View::Unordered(depth as usize, 0, Some([41, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(crate::descriptor::host::make_view(&uav, host.cpu_view()).is_none());
+        assert!(copy.twin.get().is_some_and(Option::is_none), "no twin");
+        if let Some(e) = host.log_messages() {
+            assert!(e.contains("CreatePipelineLibrary"), "debug layer: {e}");
+        }
+    }
+
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
         compile_cs(SOURCE)
     }
