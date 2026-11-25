@@ -1477,6 +1477,64 @@ mod tests {
         eprintln!("64 KiB page rewritten whole: a byte at a time {bytes:?}, differing {words:?}");
     }
 
+    /// Marked-page copy-backs of 1216 pages (76 MB, about a world frame's)
+    /// for patterns of GPU writes: the runs written per page, the time per
+    /// page and per MB compared (WARP or any host; prints the times).
+    #[test]
+    #[ignore = "timing; run in release with --ignored --nocapture"]
+    fn marked_copy_backs_time_write_patterns() {
+        const PAGES: usize = 1216;
+        let blocks = |at: usize| {
+            (1024..2048).contains(&at)
+                || (12 * 1024..16 * 1024).contains(&at)
+                || (40 * 1024..48 * 1024).contains(&at)
+        };
+        // Names, and whether the GPU writes the byte at an offset.
+        type Pattern = (&'static str, fn(usize) -> bool);
+        let patterns: [Pattern; 7] = [
+            ("the whole page", |_| true),
+            ("a word every 64 bytes", |at| at % 64 < 4),
+            ("a word every 512 bytes", |at| at % 512 < 4),
+            ("a word every 4 KiB", |at| at % 4096 < 4),
+            ("every other byte", |at| at % 2 == 0),
+            ("three runs of 1 to 8 KiB", blocks),
+            ("nothing (marked only)", |_| false),
+        ];
+        let (len, zeros) = (PAGES * PAGE, vec![0u8; PAGE]);
+        for (name, gpu) in patterns {
+            let page: Vec<u8> = (0..PAGE).map(|at| if gpu(at) { 0xa5 } else { 0 }).collect();
+            let runs = differing(&page, &zeros, None).len();
+            let p = crate::watch::tests::pool(PAGES);
+            register(p, p as u64, len as u64);
+            let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+                unregister(p, p as u64);
+                return; // no host GPU here
+            };
+            let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+            copy.update(p, len);
+            copy.writing(p, len, true);
+            for i in 0..PAGES {
+                copy.write_host((p + i * PAGE) as u64, &page);
+                // SAFETY: a dword of the mapped bitmap.
+                unsafe { *(b.data as *mut u32).add((base + i) / 32) |= 1 << ((base + i) % 32) };
+            }
+            let t = std::time::Instant::now();
+            copy_back_marks(&[]);
+            let time = t.elapsed();
+            // SAFETY: our pool, which nothing else writes.
+            let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+            assert!(title.as_chunks::<PAGE>().0.iter().all(|t| t[..] == page[..]), "{name}");
+            unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+            eprintln!(
+                "{name}: {runs} runs per page, {:.1} us per page, {:.3} ms per MB",
+                time.as_secs_f64() * 1e6 / PAGES as f64,
+                time.as_secs_f64() * 1e9 / len as f64,
+            );
+        }
+    }
+
     /// Mark bits are handed out in runs and come back joined.
     #[test]
     fn mark_runs_are_reused_and_joined() {
