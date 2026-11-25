@@ -990,16 +990,34 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
 /// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
-/// high), a texture view's size fields ([`texture_words`]), zeros for
-/// anything else.
+/// high), its record count (dword 2) and its format and type (dword 3), the
+/// last two as the title's own descriptor holds them; a texture view's size
+/// fields ([`texture_words`]); zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
     let words = match view.and_then(texture_words) {
         Some(words) => words,
-        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
+        None => {
+            let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+            let words = view
+                .filter(|v| buffer_range(v).is_some())
+                .and_then(buffer_words)
+                .unwrap_or([0; 10]);
+            [address as u32, (address >> 32) as u32 & 0xFFFF, words[2], words[3]]
+        }
     };
     // SAFETY: the mapped view addresses hold 16 bytes per title slot.
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// The title's own descriptor words of a buffer view (the console's buffer
+/// descriptor, 10 dwords), for the fields a shader reads as data.
+fn buffer_words(view: &View) -> Option<[u32; 10]> {
+    match view {
+        View::Shader(_, Some(desc)) => Some(*desc),
+        View::Unordered(_, _, Some(desc)) => Some(*desc),
+        View::Placed(_, resource, words) if resource[0] == 1 => words[..10].try_into().ok(),
+        _ => None,
+    }
 }
 
 /// A texture view's console image descriptor dwords 0-3 as far as its size
