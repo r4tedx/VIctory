@@ -620,6 +620,39 @@ pub(crate) mod tests {
         }
     }
 
+    /// A list renders to a depth texture, then a use of its twin (made in
+    /// between) follows: the render is copied to the twin in the list, not
+    /// before it.
+    #[test]
+    fn a_twin_made_after_a_depth_use_in_the_list_gets_the_copy() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        let made = unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+        };
+        let Ok(()) = made else { return };
+        let depth = std::sync::Arc::new(crate::resource::HostTexture::new(texture.unwrap(), 0, Vec::new()));
+        let list = host.new_list().unwrap();
+        // Draw 1 renders to it: the depth side is used, no twin yet.
+        assert!(list.move_texture(&depth, 0x10).is_none(), "the list's first use records nothing");
+        // Draw 2 uses its (new) twin: Draw 1's depth is copied over now.
+        assert_eq!(list.twin_use(&depth, crate::twin::TWIN, true), Some(false));
+        list.close();
+    }
+
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
@@ -2010,7 +2043,8 @@ impl HostList {
     /// A use of the depth texture `depth` (with a twin) needing `side`
     /// (`crate::twin::DEPTH` or `TWIN`): whether a copy must be recorded
     /// now (true: into the depth texture). The list's first use is the
-    /// prelude's to prepare.
+    /// prelude's to prepare; a depth texture the list used before it had a
+    /// twin (so none was noted) counts as used on its depth side, written.
     pub(crate) fn twin_use(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -2020,8 +2054,13 @@ impl HostList {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes));
-                None
+                let key = std::sync::Arc::as_ptr(depth) as usize;
+                if self.states.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key) {
+                    v.insert(crate::twin::Use::new(depth, crate::twin::DEPTH, true)).again(side, writes)
+                } else {
+                    v.insert(crate::twin::Use::new(depth, side, writes));
+                    None
+                }
             }
             std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
         }
