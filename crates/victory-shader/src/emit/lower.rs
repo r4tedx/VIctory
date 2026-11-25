@@ -307,6 +307,10 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
+    /// SCC values of mask operations (whether some lane has its bit) that
+    /// an instruction other than a branch reads as data: the console flow
+    /// takes them as the console wave's where the operation is.
+    scc_data: HashSet<Value>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -465,6 +469,27 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
+}
+
+/// SCC values of mask operations (an EXEC write or a lane mask result) that
+/// an instruction other than an `s_cbranch_scc*` reads: as data, where the
+/// console compiler tests whether some lane has its bit.
+fn mask_sccs_read_as_data(p: &Program, st: &Structured) -> HashSet<Value> {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let masks: HashSet<Value> = insts()
+        .filter(|i| {
+            matches!(i.fields, Fields::Sop { .. })
+                && i.writes.iter().any(|&(r, w)| {
+                    r == Reg::S(EXEC) || matches!(r, Reg::S(_)) && st.masks.contains_key(&w)
+                })
+        })
+        .filter_map(|i| i.write(Reg::Scc))
+        .collect();
+    insts()
+        .filter(|i| !i.name().starts_with("s_cbranch_scc"))
+        .filter_map(|i| i.read(Reg::Scc))
+        .filter(|v| masks.contains(v))
+        .collect()
 }
 
 /// The per-lane lowering can replace a proven restore with its original SGPR.
@@ -633,6 +658,7 @@ impl<'a> Lower<'a> {
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
+        let scc_data = mask_sccs_read_as_data(p, x.st);
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
@@ -661,7 +687,9 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || reads_mask_as_data(x.st, i)
             };
-            let reads_whole = insts().any(whole);
+            // (A mask operation's SCC read as data says whether some lane
+            // of the console wave has its bit: the whole wave's.)
+            let reads_whole = insts().any(whole) || !scc_data.is_empty();
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -788,6 +816,12 @@ impl<'a> Lower<'a> {
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            // A mask operation's SCC read as data (`s_cselect` of a mask on
+            // whether a waterfall left lanes, say): no lane knows it alone,
+            // the console flow's wave does (see [`Self::scc_bit`]).
+            wants_console_flow |= x.target.runs(wave)
+                && !scc_data.is_empty()
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
             if x.console_cf {
                 console_lanes = true;
@@ -918,6 +952,7 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            scc_data,
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -3758,6 +3793,17 @@ impl<'a> Lower<'a> {
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
+                }
+                // The console flow takes a mask operation's SCC read as
+                // data here, where its mask is: some lane of the console
+                // wave has its bit.
+                if why == LANE_MASK
+                    && self.console_cf
+                    && let Some(scc) = inst.write(Reg::Scc)
+                    && self.scc_data.contains(&scc)
+                    && let Ok(bit) = self.scc_bit(scc)
+                {
+                    self.vals.insert(scc, Val::Bit(bit));
                 }
                 Ok(())
             }

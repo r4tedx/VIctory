@@ -1337,3 +1337,107 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+/// Lanes above 15 take a branch; there each tests whether some lane of the
+/// wave is below `k` and active (`s_and` of EXEC and VCC: its SCC), takes
+/// EXEC or nothing by that SCC (`s_cselect`) and picks 2 or 1 by its bit
+/// of the result. Lanes below 16 keep 7. A lane alone sees only its own
+/// bit of the `s_and`: the SCC is the wave's (some lane below `k`).
+fn scc_of_a_mask_read_as_data(k: u32, wave64: bool) -> Vec<u32> {
+    if wave64 {
+        vec![
+            0x7E04_0287,             // v_mov_b32 v2, 7
+            0x7D82_008F,             // v_cmp_lt_u32 vcc, 15, v0
+            0xBE8C_246A,             // s_and_saveexec_b64 s[12:13], vcc
+            0x7D88_0000 | (128 + k), // v_cmp_gt_u32 vcc, k, v0
+            0x878E_6A7E,             // s_and_b64 s[14:15], exec, vcc
+            0x8590_807E,             // s_cselect_b64 s[16:17], exec, 0
+            0xD501_0002,
+            0x0041_0481, // v_cndmask_b32 v2, 1, 2, s[16:17]
+            0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        ]
+    } else {
+        vec![
+            0x7E04_0287,             // v_mov_b32 v2, 7
+            0x7D82_008F,             // v_cmp_lt_u32 vcc_lo, 15, v0
+            0xBE8C_3C6A,             // s_and_saveexec_b32 s12, vcc_lo
+            0x7D88_0000 | (128 + k), // v_cmp_gt_u32 vcc_lo, k, v0
+            0x870E_6A7E,             // s_and_b32 s14, exec_lo, vcc_lo
+            0x8510_807E,             // s_cselect_b32 s16, exec_lo, 0
+            0xD501_0002,
+            0x0041_0481, // v_cndmask_b32 v2, 1, 2, s16
+            0x887E_0C7E, // s_or_b32 exec_lo, exec_lo, s12
+        ]
+    }
+}
+
+/// What lane `t` of [`scc_of_a_mask_read_as_data`] stores.
+fn scc_of_a_mask_want(k: u32) -> impl Fn(u32) -> u32 {
+    move |t| match t {
+        t if t < 16 => 7,
+        _ if k > 16 => 2,
+        _ => 1,
+    }
+}
+
+/// A mask operation's SCC read as data takes the console flow, where it is
+/// whether some lane of the console wave has its bit (no lane knows that
+/// alone): for waves of 32 on a 32-lane host, and of 64 in halves. The
+/// modules validate.
+#[test]
+fn scc_of_a_mask_operation_read_as_data_lowers_in_the_console_flow() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref());
+    let mut validator = validator.ok();
+    for wave64 in [false, true] {
+        let threads = if wave64 { 64 } else { 32 };
+        let mut p = program(&scc_of_a_mask_read_as_data(20, wave64), threads);
+        p.wave64 = wave64;
+        let cs = emit_for(&p, nvidia).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "wave64 {wave64}");
+        if let Some(v) = &mut validator {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+        }
+    }
+}
+
+/// [`scc_of_a_mask_read_as_data`] on every hardware adapter (halves where
+/// the host has no 64-lane waves), and on WARP where it runs waves of 64:
+/// some lane below 20 is in the branch, none below 8.
+#[test]
+fn scc_of_a_mask_operation_read_as_data_is_the_waves() {
+    for k in [20, 8] {
+        console_flow_case(
+            &format!("SCC of a mask, k {k}"),
+            &scc_of_a_mask_read_as_data(k, true),
+            64,
+            scc_of_a_mask_want(k),
+        );
+    }
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    if !host.target().runs(64) {
+        eprintln!("WARP runs no waves of 64; skipped");
+        return;
+    }
+    for k in [20, 8] {
+        let p = program(&scc_of_a_mask_read_as_data(k, true), 64);
+        match run(&host, &p, 2) {
+            Ok(out) => {
+                let want: Vec<u32> = (0..2)
+                    .flat_map(|_| (0..64).map(scc_of_a_mask_want(k)))
+                    .collect();
+                assert_eq!(out, want, "WARP: k {k}");
+                eprintln!("WARP: k {k} exact");
+            }
+            Err(e) => eprintln!("WARP: k {k}: {e}; skipped"),
+        }
+    }
+}
