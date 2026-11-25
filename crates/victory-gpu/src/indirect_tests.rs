@@ -396,7 +396,7 @@ fn reads_arguments_written_earlier_in_the_list_at_k1_and_k2() {
             (source.clone(), 32)
         } else {
             (
-                dispatch(&list, source_gpu, Some(source_gpu + 32), (16, 2, waves)).unwrap(),
+                dispatch(&list, source_gpu, Some(source_gpu + 32), (16, 2, waves), 0).unwrap(),
                 24,
             )
         };
@@ -472,7 +472,7 @@ fn dispatch_limits_charge_only_scaled_host_groups() {
             assert_eq!(clamped, Some(Clamped::Ready));
             done(&list, &draws, None, Clamped::Ready);
         }
-        let packed = dispatch(&list, address + at, count, (16, records, 2)).unwrap();
+        let packed = dispatch(&list, address + at, count, (16, records, 2), 0).unwrap();
         let bytes = u64::from(records) * 12;
         // SAFETY: the scratch buffer is in INDIRECT_ARGUMENT after the
         // rewrite and the nonoverlapping readbacks fit in the mapped buffer.
@@ -562,7 +562,7 @@ fn rewrite_many_records_once() {
                 0
             };
         let count_at = count_index.map(|i| count_gpu + i as u64 * 4);
-        let packed = dispatch(&list, source_at, count_at, (STRIDE, records, WAVES)).unwrap();
+        let packed = dispatch(&list, source_at, count_at, (STRIDE, records, WAVES), 0).unwrap();
         // SAFETY: packed is in INDIRECT_ARGUMENT and readback ranges are disjoint.
         unsafe {
             let address = packed.GetGPUVirtualAddress();
