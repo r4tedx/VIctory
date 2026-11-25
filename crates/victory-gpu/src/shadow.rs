@@ -159,8 +159,9 @@ fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, us
 
 /// Runs of a copy-back closer than this go into title memory as one span,
 /// with title memory's bytes between them as the copy-back read them: a
-/// kernel copy per run cost over 1 ms per page in the world, where shaders
-/// change many scattered words of a page.
+/// copy per run cost over 1 ms per page in the world, where shaders change
+/// many scattered words of a page (a kernel copy each then; plain stores
+/// now, [`crate::watch::store`]).
 const SPAN_GAP: usize = 256;
 
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
@@ -180,9 +181,11 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
             _ => spans.push((start, end)),
         }
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackSpans, spans.len() as u64);
     let _writing = crate::watch::writing(at, merged.len());
     for (start, end) in spans {
-        crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
+        crate::watch::store((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
     }
     true
 }

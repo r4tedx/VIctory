@@ -540,6 +540,58 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+thread_local! {
+    /// The title memory `[start, end)` this thread is writing with
+    /// [`store`] now, if any.
+    static STORING: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The instruction [`store`] copies with (`rep movsb`): a store of it that
+/// faults inside the range being stored ends the copy there.
+#[cfg(target_arch = "x86_64")]
+const REP_MOVSB: [u8; 2] = [0xf3, 0xa4];
+
+/// Copies `len` bytes of host memory at `src` into title memory at `dst`
+/// under a [`writing`] of it, as [`crate::host::write_mapped`] does: pages
+/// that are not mapped or not writable are left alone. Plain stores, not
+/// the kernel's copy: a system call per piece cost ~1 us, and a copy-back
+/// writes tens of pieces into a page where shaders changed scattered words.
+/// Title memory may stop being mapped while we write it (the runtime maps
+/// and unmaps it on the title's threads) or be read-only to the title: a
+/// store that faults there ends the copy instead (the handler resumes after
+/// it), and the kernel copies the rest.
+pub(crate) fn store(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if len == 0 {
+            return;
+        }
+        install();
+        STORING.set((dst as usize, dst as usize + len));
+        let left: usize;
+        // SAFETY: `src` is `len` bytes of host memory the caller may read;
+        // a store into `dst` that faults resumes after the instruction (the
+        // handler), with `rcx` the bytes not copied. The direction flag is
+        // clear (the ABI).
+        unsafe {
+            std::arch::asm!(
+                "rep movsb",
+                inout("rcx") len => left,
+                inout("rsi") src => _,
+                inout("rdi") dst => _,
+                options(nostack, preserves_flags),
+            );
+        }
+        STORING.set((0, 0));
+        if left != 0 {
+            let done = len - left;
+            crate::host::write_mapped(dst.wrapping_add(done), src.wrapping_add(done), left);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    crate::host::write_mapped(dst, src, len);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -612,13 +664,27 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // A store of ours ([`store`]) into memory that is not mapped or not
+        // writable: the copy ends there.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (start, end) = STORING.get();
+            // SAFETY: the context of the faulting thread, which the system
+            // resumes with it.
+            let c = unsafe { &mut *(*info).ContextRecord };
+            // SAFETY: the faulting instruction's bytes, readable code.
+            if (start..end).contains(&at) && unsafe { *(c.Rip as *const [u8; 2]) } == REP_MOVSB {
+                c.Rip += REP_MOVSB.len() as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
+    // SAFETY: the handler only touches our guard state and protections,
+    // and the context of a store of ours that faulted.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
@@ -843,6 +909,44 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    /// A store into title memory with a block that is not mapped and one
+    /// the title made read-only: no fault, those blocks stay as they were,
+    /// and the others get the bytes, after the holes too.
+    #[test]
+    fn stores_leave_unmapped_and_read_only_pages_alone() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh reservation of four blocks, freed below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        let p = p as usize;
+        assert_ne!(p, 0);
+        for block in [0, 2, 3] {
+            let at = (p + block * PAGE) as *const _;
+            // SAFETY: inside the reservation.
+            let at = unsafe { VirtualAlloc(at, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(at as usize, p + block * PAGE);
+            // SAFETY: the block just committed.
+            unsafe { (at as *mut u8).write_bytes(0xee, PAGE) };
+        }
+        let mut old = 0;
+        // SAFETY: a committed block of ours.
+        let protected =
+            unsafe { VirtualProtect((p + 3 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        let from: Vec<u8> = (0..4 * PAGE).map(|i| (i % 251) as u8 + 1).collect();
+        let (at, n) = (p + 100, 4 * PAGE - 200);
+        let w = writing(at, n);
+        store(at as *mut u8, from.as_ptr(), n);
+        drop(w);
+        // SAFETY: (reads below) committed blocks of ours.
+        let block =
+            |k: usize| unsafe { std::slice::from_raw_parts((p + k * PAGE) as *const u8, PAGE) };
+        assert!(block(0)[..100].iter().all(|&b| b == 0xee));
+        assert_eq!(block(0)[100..], from[..PAGE - 100]);
+        assert_eq!(block(2), &from[2 * PAGE - 100..3 * PAGE - 100]);
+        assert!(block(3).iter().all(|&b| b == 0xee));
+        free(p);
     }
 
     /// A write or mapping that runs past the end of the address space (a
