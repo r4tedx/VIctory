@@ -284,8 +284,7 @@ fn rewrite(op: &mut Op, same: &HashMap<u32, V>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Attr, Bin, Cast, Module, Rmw, Term, V, pred};
-    use crate::emit::counts;
+    use super::super::{Attr, Bin, Cast, Module, Op, Rmw, Term, V, pred};
 
     /// A module with the functions the tests call: a handle from the heap,
     /// a load through it (which reads memory), a float operation, a sink.
@@ -327,19 +326,33 @@ mod tests {
         }
     }
 
-    fn kinds(m: &Module) -> Vec<(String, u64)> {
-        counts::count(&m.write())
-            .expect("counts")
-            .kinds
-            .into_iter()
+    /// The instructions of the module's blocks, by LLVM's name (a call by
+    /// the function called); the module must still be written whole.
+    fn names(m: &Module) -> Vec<String> {
+        let _ = m.write();
+        let name = |i: &u32| match &m.insts[*i as usize].op {
+            Op::Bin(op, ..) => format!("{op:?}").to_lowercase(),
+            Op::Cast(op, _) => format!("{op:?}").to_lowercase(),
+            Op::Cmp(p, ..) => if *p < 32 { "fcmp" } else { "icmp" }.to_owned(),
+            Op::Select(..) => "select".to_owned(),
+            Op::Extract(..) => "extractvalue".to_owned(),
+            Op::Call(f, _) => m.funcs[*f as usize].name.clone(),
+            Op::Phi(_) => "phi".to_owned(),
+            Op::Gep(..) => "getelementptr".to_owned(),
+            Op::Load(_) => "load".to_owned(),
+            Op::Store(..) => "store".to_owned(),
+            Op::AtomicRmw(..) => "atomicrmw".to_owned(),
+            Op::CmpXchg(..) => "cmpxchg".to_owned(),
+        };
+        m.blocks
+            .iter()
+            .flat_map(|b| b.phis.iter().chain(&b.body))
+            .map(name)
             .collect()
     }
 
-    fn kind(m: &Module, name: &str) -> u64 {
-        kinds(m)
-            .into_iter()
-            .find(|(k, _)| k == name)
-            .map_or(0, |(_, n)| n)
+    fn kind(m: &Module, name: &str) -> usize {
+        names(m).iter().filter(|n| *n == name).count()
     }
 
     /// What the lowering writes for two reads through one descriptor in one
@@ -365,10 +378,9 @@ mod tests {
         let sum = m.bin(b, Bin::Add, loads[0], loads[1]);
         let _ = m.call(b, f.sink, vec![zero, sum]);
         m.terminate(b, Term::Ret);
-        let before = counts::count(&m.write()).expect("counts").instructions;
+        let before = names(m).len();
         assert_eq!(m.reuse(&[]), 5);
-        let after = counts::count(&m.write()).expect("counts");
-        assert_eq!(after.instructions, before - 5);
+        assert_eq!(names(m).len(), before - 5);
         assert_eq!(kind(m, "dx.op.createHandleFromHeap"), 1);
         assert_eq!(kind(m, "dx.op.load.i32"), 3, "loads are asked again");
         assert_eq!(

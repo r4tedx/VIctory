@@ -161,6 +161,11 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **The host's tables** (the page table, the view addresses, the view
+//!   marks, the view strides) are read once per entry (added 2026-11-25):
+//!   where a shader reads an entry it has read on every path there, it
+//!   takes the first read's value (`bitcode::reuse`). So the host does not
+//!   change a table under a list that runs and reads it.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
