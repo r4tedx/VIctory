@@ -432,7 +432,7 @@ fn work() {
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// the cache saved when due (`library::SavePolicy`).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {

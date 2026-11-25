@@ -472,15 +472,89 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// When a save during the run is due. Each save serialises and writes the
+/// whole library (hundreds of MB to GB), however few pipelines it gained:
+/// saved every 20 s, it was rewritten whole three times a minute for a few
+/// new pipelines each time. So a run's saves wait for `min` new pipelines
+/// (`VICTORY_LIBRARY_SAVE_MIN`, 256), or for `every` to pass since the
+/// last save (`VICTORY_LIBRARY_SAVE_SECS`, 60 s) with anything new; the
+/// end of a run saves whatever is new ([`save`] `now`). Saves stay
+/// [`SavePolicy::FLOOR`] apart, so a load that makes thousands does not
+/// save every few hundred.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SavePolicy {
+    min: u64,
+    every: std::time::Duration,
+}
+
+impl SavePolicy {
+    /// The least time between two saves of a run, when `every` is longer.
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+    const DEFAULT: SavePolicy = SavePolicy {
+        min: 256,
+        every: std::time::Duration::from_secs(60),
+    };
+
+    /// The policy `VICTORY_LIBRARY_SAVE_MIN` and `VICTORY_LIBRARY_SAVE_SECS`
+    /// set (each a whole number; others are ignored).
+    fn of(min: Option<&str>, secs: Option<&str>) -> SavePolicy {
+        let mut policy = SavePolicy::DEFAULT;
+        if let Some(min) = min.and_then(|v| v.trim().parse().ok()) {
+            policy.min = min;
+        }
+        if let Some(secs) = secs.and_then(|v| v.trim().parse().ok()) {
+            policy.every = std::time::Duration::from_secs(secs);
+        }
+        policy
+    }
+
+    fn get() -> SavePolicy {
+        static POLICY: OnceLock<SavePolicy> = OnceLock::new();
+        *POLICY.get_or_init(|| {
+            let var = |name| std::env::var(name).ok();
+            let policy = SavePolicy::of(
+                var("VICTORY_LIBRARY_SAVE_MIN").as_deref(),
+                var("VICTORY_LIBRARY_SAVE_SECS").as_deref(),
+            );
+            if policy != SavePolicy::DEFAULT {
+                tracing::info!(
+                    min = policy.min,
+                    secs = policy.every.as_secs(),
+                    "host pipeline library saves"
+                );
+            }
+            policy
+        })
+    }
+
+    /// Whether a save is due `since` the last (or the first check), with
+    /// `added` pipelines stored since and the lists `changed` or not.
+    fn due(self, since: std::time::Duration, added: u64, changed: bool) -> bool {
+        if added == 0 && !changed {
+            return false;
+        }
+        since >= self.every || (added >= self.min && since >= Self::FLOOR.min(self.every))
+    }
+}
+
+/// Writes the library and the early list if anything changed since the
+/// last save and a save is due ([`SavePolicy`]), or at once (`now`, the
+/// end of a run).
 pub(crate) fn save(now: bool) {
+    /// When the last save started (or the first check, which starts the
+    /// time to the first save).
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let since = last.get_or_insert_with(std::time::Instant::now).elapsed();
+        let changed = l.prebuilt_changed || USED_CHANGED.load(Ordering::Relaxed);
+        let due = match now {
+            true => l.added > 0 || changed,
+            false => SavePolicy::get().due(since, l.added, changed),
+        };
+        if !due {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -489,8 +563,8 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
+    let stored = l.added;
     let (bytes, prebuilt) = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
         if l.added == 0 && !l.prebuilt_changed {
             if !used_changed {
@@ -520,6 +594,7 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
+    drop(l);
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
     let written =
         write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()).and_then(|()| {
@@ -533,6 +608,7 @@ pub(crate) fn save(now: bool) {
     match written {
         Ok(()) => tracing::info!(
             bytes,
+            stored,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -752,6 +828,81 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run's saves wait for enough new pipelines or for time to pass, and
+    /// a save with nothing new is never due.
+    #[test]
+    fn a_save_waits_for_enough_new_pipelines_or_a_minute() {
+        let secs = std::time::Duration::from_secs;
+        let policy = SavePolicy::DEFAULT;
+        assert_eq!((policy.min, policy.every), (256, secs(60)));
+        // A few to a few hundred new pipelines 20 s or 59 s after a save:
+        // not due.
+        for added in [3, 10, 40, 255] {
+            assert!(
+                !policy.due(secs(20), added, false),
+                "{added} new pipelines after 20 s"
+            );
+            assert!(
+                !policy.due(secs(59), added, true),
+                "{added} new pipelines after 59 s"
+            );
+        }
+        // A minute with anything new, also only an early list.
+        assert!(policy.due(secs(60), 1, false));
+        assert!(policy.due(secs(60), 0, true));
+        // Enough new pipelines, but not sooner than the floor.
+        assert!(!policy.due(secs(5), 1000, false));
+        assert!(policy.due(SavePolicy::FLOOR, 256, false));
+        // Nothing new, however long it has been.
+        assert!(!policy.due(secs(3600), 0, false));
+
+        // The saves of a run checked every 20 s (the workers' checks), with
+        // `new[i]` pipelines made before check `i`; and what is left for the
+        // end of the run (`save(true)`).
+        let saves = |new: &[u64]| {
+            let (mut added, mut at, mut saves) = (0, 0, 0);
+            for (i, &n) in new.iter().enumerate() {
+                let now = 20 * (i as u64 + 1);
+                added += n;
+                if policy.due(secs(now - at), added, false) {
+                    (added, at, saves) = (0, now, saves + 1);
+                }
+            }
+            (saves, added)
+        };
+        // Thirty new every 20 s for five minutes: fifteen whole rewrites
+        // before, five now (each of 90).
+        assert_eq!(saves(&[30; 15]), (5, 0));
+        // A load that makes 600 every 20 s for a minute, then a few: saved
+        // at each check of the load, then once a minute.
+        assert_eq!(saves(&[600, 600, 600, 2, 2, 2, 2]), (4, 2));
+        // Nothing new after the last save: no more saves.
+        assert_eq!(saves(&[300, 0, 0, 0, 0]), (1, 0));
+    }
+
+    /// The variables set the count and the time; others leave the defaults.
+    #[test]
+    fn the_save_policy_comes_from_the_variables() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(SavePolicy::of(None, None), SavePolicy::DEFAULT);
+        let set = SavePolicy {
+            min: 64,
+            every: secs(30),
+        };
+        assert_eq!(SavePolicy::of(Some("64"), Some(" 30 ")), set);
+        let wrong = SavePolicy::of(Some("lots"), Some("-1"));
+        assert_eq!(wrong, SavePolicy::DEFAULT);
+        // 0 and 0: a save at every check with anything new, for comparison
+        // runs.
+        let always = SavePolicy::of(Some("0"), Some("0"));
+        assert!(always.due(secs(0), 1, false));
+        assert!(!always.due(secs(0), 0, false));
+        // An `every` shorter than the floor also shortens the floor.
+        let quick = SavePolicy::of(Some("1"), Some("5"));
+        assert!(quick.due(secs(5), 1, false));
+        assert!(!quick.due(secs(4), 300, false));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
