@@ -290,10 +290,12 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 
 /// Whether memory at `at` is the runtime's GPU memory: a write-watched
 /// pool, or (with `views`) a view or a placeholder (anything but plain
-/// committed memory).
+/// committed memory, and not free memory: a null address's window is free,
+/// and guarding it would guard whatever is allocated there later; under
+/// Wine the process heap lies in the first 4 MiB).
 fn runtime_memory(at: usize, views: bool) -> bool {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let page = at & !(4096 - 1);
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -308,7 +310,7 @@ fn runtime_memory(at: usize, views: bool) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
+    n != 0 && info.State != MEM_FREE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
 }
 
 impl Drop for Tracked {
@@ -883,6 +885,19 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Free memory is not tracked: the window a null address falls in (a
+    /// loose copy of title memory starting at 0). Tracked, its blocks would
+    /// be guarded once something is allocated there: under Wine the process
+    /// heap, whose writes then fault into the handler while a thread holds
+    /// the guard lock.
+    #[test]
+    fn free_memory_is_not_tracked() {
+        assert!(
+            track(0, 4 << 20, true).is_none(),
+            "the window of a null address"
+        );
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
