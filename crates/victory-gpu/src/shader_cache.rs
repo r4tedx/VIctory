@@ -87,8 +87,34 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, cap)
+        let rays_miss = rays_miss();
+        if rays_miss {
+            tracing::warn!("VICTORY_RT_MISS: every BVH intersection is a miss (diagnostics; not a correct image)");
+        }
+        with_rays_miss(key(victory_shader::SOURCE_HASH, ENCODING, limit, cap), rays_miss)
     })
+}
+
+/// Whether translations make every BVH intersection a miss
+/// (`victory_shader::emit::Options::rays_miss`): `VICTORY_RT_MISS=1` in a
+/// diagnostics build.
+pub(crate) fn rays_miss() -> bool {
+    static MISS: OnceLock<bool> = OnceLock::new();
+    *MISS.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var("VICTORY_RT_MISS").is_ok_and(|v| v == "1")
+    })
+}
+
+/// `key` for translations made with `rays_miss`: the same key without it,
+/// so caches made before the switch existed stay valid.
+fn with_rays_miss(key: [u8; 32], rays_miss: bool) -> [u8; 32] {
+    if !rays_miss {
+        return key;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(&key);
+    h.update(b"VICTORY_RT_MISS");
+    *h.finalize().as_bytes()
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -118,6 +144,7 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     let options = victory_shader::emit::Options {
         view_marks: true,
         target,
+        rays_miss: rays_miss(),
     };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -486,13 +513,20 @@ mod tests {
         assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1_000_000));
         assert_eq!(
             *build(),
-            key(
-                victory_shader::SOURCE_HASH,
-                ENCODING,
-                victory_shader::emit::loop_limit(),
-                victory_shader::emit::view_heap_limit().unwrap_or(0)
+            with_rays_miss(
+                key(
+                    victory_shader::SOURCE_HASH,
+                    ENCODING,
+                    victory_shader::emit::loop_limit(),
+                    victory_shader::emit::view_heap_limit().unwrap_or(0)
+                ),
+                rays_miss()
             )
         );
+        // `VICTORY_RT_MISS` makes another key, and leaves the key alone
+        // when it is off.
+        assert_eq!(with_rays_miss(k, false), k);
+        assert_ne!(with_rays_miss(k, true), k);
         // The encoding part is this file as built.
         assert!(
             std::str::from_utf8(ENCODING)

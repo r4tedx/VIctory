@@ -170,6 +170,15 @@ impl Lower<'_> {
                 Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off))
             }
         };
+        if self.x.rays_miss {
+            // `Options::rays_miss`: the node is not read, and the result is
+            // a miss of its type.
+            let r = self.bvh_miss(node);
+            for (k, &x) in r.iter().enumerate() {
+                self.write(inst, Reg::V(out + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         // Inactive lanes may hold any pointer: they read nothing.
         let at = self.begin_guarded(guard);
         let r = self.bvh_lanes(&nodes, node, &ray);
@@ -186,6 +195,19 @@ impl Lower<'_> {
             self.write(inst, Reg::V(out + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// The four result dwords of a miss of the node `node` points to: a
+    /// triangle's `(+inf, 1, 0, 0)`, four invalid children otherwise.
+    fn bvh_miss(&mut self, node: V) -> [V; 4] {
+        let c = self.cur;
+        let seven = self.s.m.i32(7);
+        let ty = self.s.m.bin(c, Bin::And, node, seven);
+        let four = self.s.m.i32(4);
+        let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
+        let none = self.s.m.i32(INVALID);
+        let tri = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0].map(|x| self.s.m.i32(x));
+        tri.map(|t| self.s.m.select(c, is_tri, t, none))
     }
 
     /// The four result dwords of `ray` against the node `node` points to.

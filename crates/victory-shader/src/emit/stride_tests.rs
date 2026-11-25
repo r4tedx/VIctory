@@ -220,6 +220,7 @@ fn build(
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
+        rays_miss: false,
     })
     .expect("lower");
     let shader = HostShader {

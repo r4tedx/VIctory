@@ -863,6 +863,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
+        rays_miss: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
