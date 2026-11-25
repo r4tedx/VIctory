@@ -2701,7 +2701,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::procmem::count_buffer(&buffer, crate::procmem::Kind::Upload, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -2732,7 +2736,10 @@ impl Host {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, mapped whole.
         match unsafe { buffer.Map(0, None, Some(&mut data)) } {
-            Ok(()) => Some((buffer, data.cast_const().cast())),
+            Ok(()) => {
+                crate::procmem::count_buffer(&buffer, crate::procmem::Kind::Readback, size);
+                Some((buffer, data.cast_const().cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -2962,6 +2969,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                crate::procmem::log();
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
@@ -3362,7 +3370,16 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                let kind = if upload {
+                    crate::procmem::Kind::GpuUpload
+                } else {
+                    crate::procmem::Kind::Shared
+                };
+                crate::procmem::count_buffer(&buffer, kind, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, upload, "no shared buffer");
                 None

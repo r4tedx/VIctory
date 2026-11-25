@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -67,9 +68,14 @@ fn pooled(n: usize) -> Vec<u8> {
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
     let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
+        Some(i) => {
+            let v = pool.swap_remove(i);
+            crate::procmem::SNAPSHOTS_KEPT.fetch_sub(v.capacity() as u64, Relaxed);
+            v
+        }
         None => Vec::with_capacity(n),
     };
+    crate::procmem::SNAPSHOTS_IN_USE.fetch_add(v.capacity() as u64, Relaxed);
     v.clear();
     v
 }
@@ -78,6 +84,7 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
+    crate::procmem::SNAPSHOTS_IN_USE.fetch_sub(v.capacity() as u64, Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -86,10 +93,12 @@ fn give_back(v: Vec<u8>) {
         total += v.capacity();
         total <= POOL_BYTES
     });
+    let kept = pool.iter().map(|v| v.capacity() as u64).sum();
+    crate::procmem::SNAPSHOTS_KEPT.store(kept, Relaxed);
 }
 
 /// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+pub(crate) const POOL_BYTES: usize = 2 << 30;
 
 /// The runs `[start, end)` of bytes where the copy differs from title
 /// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
@@ -342,6 +351,8 @@ impl Shadow {
             marks,
             upload: std::sync::atomic::AtomicBool::new(false),
         });
+        crate::procmem::COPIES[0].fetch_add(1, Relaxed);
+        crate::procmem::COPIES[1].fetch_add(len, Relaxed);
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
@@ -750,6 +761,12 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Snapshots a copy still holds go with it, not back to the pool.
+        let before = self.before.get_mut().unwrap_or_else(|e| e.into_inner());
+        let held: usize = before.0.iter().map(|(_, bytes)| bytes.capacity()).sum();
+        crate::procmem::SNAPSHOTS_IN_USE.fetch_sub(held as u64, Relaxed);
+        crate::procmem::COPIES[0].fetch_sub(1, Relaxed);
+        crate::procmem::COPIES[1].fetch_sub(self.len, Relaxed);
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -953,6 +970,24 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 /// Counts copies made and title buffers released: [`all`] may differ when
 /// it changed.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host copies the registries hold, (count, title bytes) each: of title
+/// buffers alive, and of loose windows (never freed). Copies alive beyond
+/// them are views' own ([`exact`]) or of buffers the title released that
+/// lists or heap slots still hold (diagnostics).
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn held_copies() -> [(u64, u64); 2] {
+    let registered = buffers()
+        .iter()
+        .filter(|(_, e)| e.shadow.is_some())
+        .fold((0, 0), |(n, b), ((start, _), e)| (n + 1, b + (e.end - start)));
+    let loose = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .fold((0, 0), |(n, b), (_, len)| (n + 1, b + len));
+    [registered, loose]
+}
 
 /// The generation of [`all`]: read it before calling that.
 pub(crate) fn generation() -> u64 {
@@ -1249,6 +1284,40 @@ mod tests {
     /// reference to its buffer is gone (a clone, as descriptor tables hold,
     /// keeps them charged). Counted for the whole run, copies went to
     /// system memory for good after the budget's worth (#2120).
+    /// The memory line's count of host copies (`crate::procmem`): a copy
+    /// counts its title bytes while it lives, and the registry holds it as
+    /// a live title buffer's until the title releases the buffer. Other
+    /// tests make copies meanwhile, so a round counts only when nothing
+    /// else moved the count; one such round is enough.
+    #[test]
+    fn a_host_copy_counts_while_it_lives() {
+        use crate::procmem::COPIES;
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        const LEN: usize = 8 << 20;
+        let p = crate::watch::tests::pool(LEN / PAGE);
+        let bytes = || COPIES[1].load(Relaxed);
+        let mut exact = 0;
+        for _ in 0..20 {
+            let before = bytes();
+            register(p, p as u64, LEN as u64);
+            let copy = find(p as u64, LEN as u64).expect("a copy");
+            let alive = bytes();
+            assert!(alive >= LEN as u64, "counted while alive");
+            let [registered, _] = held_copies();
+            assert!(registered.1 >= LEN as u64, "held as a live title buffer's");
+            unregister(p, p as u64);
+            drop(copy);
+            let after = bytes();
+            if alive == before + LEN as u64 && after == before {
+                exact += 1;
+            }
+        }
+        crate::watch::tests::free(p);
+        assert!(exact > 0, "no round undisturbed by other tests");
+    }
+
     #[test]
     fn upload_budget_is_given_back_when_copies_go() {
         use windows::core::Interface;

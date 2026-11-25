@@ -47,6 +47,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod procmem;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -70,6 +72,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use procmem::{title_heap, title_reserved, title_sections};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
