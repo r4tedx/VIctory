@@ -752,16 +752,15 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s
-                    .threads
-                    .map(|t| t.iter().product::<u32>())
-                    .is_some_and(|n| n != 64 && n > 32)
-                    && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
-                {
-                    // (A group of 32 threads or fewer is the lower half
-                    // alone: its sections are that one host wave's.)
-                    Some("a whole-wave section of a wave64 on a host without 64-lane waves")
                 } else {
+                    // (Whole-wave sections lower in a group of any size up
+                    // to one console wave: a group of 32 threads or fewer is
+                    // the lower half alone, whose sections are that one host
+                    // wave's; in one of 33 to 63 the upper half's host wave
+                    // holds only the threads there are, and the console
+                    // wave's other lanes are in no mask a section reduces
+                    // over, so each half's reduction is over its own lanes
+                    // and the two combine as in a full wave.)
                     None
                 };
                 wants_console_flow = no_console_flow.is_none() && x.target.runs(32);

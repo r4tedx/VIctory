@@ -659,32 +659,50 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves in a group of exactly one
-/// console wave, and needs no crossing in a group of 32 threads or fewer
-/// (the lower half alone): with a partial upper half it still stops.
+/// A whole-wave section lowers in a group of any size up to one console
+/// wave: crossing the halves in one of 33 to 63 threads too, whose upper
+/// half's host wave holds the threads there are. The modules validate.
 #[test]
-fn whole_wave_sections_in_partial_groups_still_stop() {
+fn whole_wave_sections_lower_in_groups_up_to_one_console_wave() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
     };
     let mut body = reduction_scan(37, 0x80);
     body.push(0x7E04_020A); // v_mov_b32 v2, s10
-    for threads in [64, 32, 16] {
-        assert!(
-            emit_for(&program(&body, threads), nvidia).is_ok(),
-            "{threads} threads"
-        );
+    let validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref());
+    let mut validator = validator.ok();
+    for threads in [64, 63, 48, 36, 33, 32, 16] {
+        let cs = emit_for(&program(&body, threads), nvidia)
+            .unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{threads} threads");
+        if let Some(v) = &mut validator {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        }
     }
-    for threads in [48, 33] {
-        assert_eq!(
-            emit_for(&program(&body, threads), nvidia),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "a whole-wave section of a wave64 on a host without 64-lane waves",
-            }),
-            "{threads} threads"
-        );
+}
+
+/// In a group of 33 to 63 threads the console wave's upper lanes past the
+/// group are in no mask: each half reduces its own lanes (the upper half's
+/// host wave holds only the threads there are) and the two combine. A
+/// minimum or an AND over the halves must not take an absent lane's 0.
+#[test]
+fn whole_wave_reductions_in_a_partial_upper_half() {
+    // (operation, VOP2 opcode, identity operand, the console's result for
+    // 36 and 48 threads: lane ids summed, their maximum, minimum, or)
+    for (label, opcode, ident, want) in [
+        ("v_add_nc_u32", 37, 0x80, [630, 1128]),
+        ("v_max_u32", 20, 0x80, [35, 47]),
+        ("v_min_u32", 19, 0xC1, [0, 0]),
+        ("v_or_b32", 28, 0x80, [63, 63]),
+    ] {
+        for (threads, want) in [36, 48].into_iter().zip(want) {
+            let mut body = reduction_scan(opcode, ident);
+            body.push(0x7E04_020A); // v_mov_b32 v2, s10
+            console_flow_case(&format!("whole-wave {label}"), &body, threads, |_| want);
+        }
     }
 }
 
