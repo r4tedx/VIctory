@@ -1895,6 +1895,11 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// A copy none of whose pages changed since it took them is not asked for
+/// at all ([`crate::shadow::Shadow::unchanged`]): lists using title memory
+/// ask for every copy there is, a few thousand in the world, of which a
+/// submission's writes touch a few.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -1909,6 +1914,16 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Nothing to copy anywhere in it, now or (but for a write that
+        // comes meanwhile, which is the next submission's) at the flush.
+        if shadow.unchanged() {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
@@ -2971,6 +2986,47 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         batch.title_written();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A copy whose memory nothing wrote since it was taken is left out of
+    /// the batch (no refresh queued, none remembered); a write the guard
+    /// takes or one that is reported brings it back, for the pages written.
+    #[test]
+    fn a_copy_nothing_wrote_is_not_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!((batch.refreshes.len(), batch.flush()), (1, len), "all of it at first");
+        // Later lists and submissions: nothing queued, nothing kept.
+        batch.add(&copy, p, len);
+        batch.title_written();
+        batch.add(&copy, p + PAGE, 100);
+        let mut next = Batch::default();
+        next.add(&copy, p, len);
+        assert!(batch.refreshes.is_empty() && next.refreshes.is_empty());
+        assert_eq!(next.flush(), 0);
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(7) };
+        next.add(&copy, p, len);
+        assert_eq!((next.refreshes.len(), next.flush()), (1, PAGE), "the page written");
+        assert_eq!(copy.read_host((p + 2 * PAGE + 8) as u64, 1)[0], 7);
+        // A write of our own or the kernel's, reported.
+        drop(crate::watch::writing(p + 3 * PAGE, 16));
+        next.title_written();
+        next.add(&copy, p, len);
+        assert_eq!(next.flush(), PAGE, "the page reported");
+        next.add(&copy, p, len);
+        assert!(next.refreshes.is_empty());
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
