@@ -12,8 +12,10 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 - Base: upstream `main` at `940d32f`.
 - Every PR comes in as its own merge commit (`git log --first-parent`), so
   you can find, revert or leave out each one. No edits were made beyond the
-  PRs themselves; the only conflict was the README's "missing" row, which
-  #158 and #159 both edit, resolved to carry both clauses.
+  PRs themselves. Two conflicts, both text: the README's "missing" row,
+  which #158 and #159 both edit, carries both clauses; and the DXIL line of
+  `translate`'s summary keeps #1315's "vertex, geometry and pixel programs"
+  with #2115's wording for checks that were not asked for.
 - Only heads their authors or owners name as green on `main` are taken, and
   a head goes in only when no program that validates on `main` is lost.
 
@@ -28,6 +30,14 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 | #1883 | powplusplus | `a31d8cc` | lane masks a traversal keeps as numbers |
 | #2027 | fiestorra | `34d0b4e` | a compute shader samples at level 0, not with derivatives |
 | #1315 | r4tedx | `0d45a59` | single-stream triangle geometry programs |
+| #2136 | r4tedx | `937f329` | a host copy nothing wrote is not asked for at submission (less CPU time preparing a frame) |
+| #2147 | r4tedx | `f869790` | ranges shaders may write are armed as runs of pages, not page by page |
+| #2134 | r4tedx | `efb35b5` | a benchmark of a world frame's preparing at the published volumes (tests only) |
+| #2115 | r4tedx | `4d34d76` | `translate --count`: the instructions of the emitted shaders, to compare builds |
+
+Left out for now: #2150 (one instruction per value on the finished
+module). It rewrites every emitted shader and has not run on a hardware
+GPU; it goes in after such a run or a review.
 
 Not in it yet, because their owners have not named a head based on `main`:
 the wave64 stack (#223, #233, #320, #439: compute programs written for
@@ -41,8 +51,8 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 - `cargo build --release -p victory`, the test builds and
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `victory-gpu` tests on WARP (diagnostics build, `VICTORY_D3D12_WARP=1`,
-  one thread): 161 passed, 0 failed, 2 ignored.
-- `victory-shader` tests with `VICTORY_WARP=1`, one thread: 259 passed,
+  one thread): 164 passed, 0 failed, 3 ignored.
+- `victory-shader` tests with `VICTORY_WARP=1`, one thread: 263 passed,
   2 failed, 3 ignored. The two failures are hardware-only checks that
   `VICTORY_WARP=1` sends to WARP (`gathers_at_a_level_match_the_hardware`,
   and `permutes_read_the_lane_named_and_zero_from_lanes_left_out`, which
@@ -51,11 +61,16 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 - **Local title-data diagnostic:** `victory translate shaders.rpf --validate
   --list --jobs 6` on this PC's copy of the title (offline, CPU only, counts
   and refusal reasons only), program by program against the same count of
-  `main`: **975 programs gained, 0 lost**. They are all 195 geometry
+  `main`: **975 programs gained, 0 lost**. (Counted on the head before #2147
+  and #2115's last commit; those two change no translation code, and the
+  summary lines of a count on this head were the same before an unrelated
+  power loss cut its file.) They are all 195 geometry
   programs (#1315) and 780 compute programs (#1883 and #2027 together: 735
   that `main` emits but the validator refuses, 40 ray-intersection programs
   and 5 more). Every program of that archive that does not validate on this
   branch does not validate on `main` either.
+- The speed numbers of #2136 and #2111 in their PRs come from synthetic
+  benchmarks, not from the game; times from the title are what they need.
 - Nothing from this branch was run on the RTX 5070, and **the title was not
   run** with it. It makes no claim about results in the game.
 
