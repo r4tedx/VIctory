@@ -30,7 +30,7 @@
 //! must still be right when the bytes are written.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -54,6 +54,8 @@ struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Vec<u8>,
+    /// A rejected blob still occupies the save path.
+    save_blocked: bool,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -112,6 +114,7 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
@@ -122,10 +125,11 @@ fn library() -> Option<&'static Mutex<Library>> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let dir = DIR.get().map(PathBuf::as_path);
+            let read = |file| dir.and_then(|d| std::fs::read(d.join(file)).ok());
             let blob = read(LIBRARY_FILE).unwrap_or_default();
             let tag = tag(&blob);
-            let mut library = open(&device, blob);
+            let mut library = open(&device, blob, dir);
             // The pre-build's list, if it was saved with these bytes.
             if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
                 && !l._blob.is_empty()
@@ -140,15 +144,15 @@ fn library() -> Option<&'static Mutex<Library>> {
         .as_ref()
 }
 
-/// The library in `blob`, or an empty one if the host rejects the blob (an
-/// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+/// The library in `blob`, or an empty one after keeping a rejected blob aside.
+fn open(device: &ID3D12Device1, blob: Vec<u8>, dir: Option<&Path>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut save_blocked = false;
     if !blob.is_empty() {
         let started = std::time::Instant::now();
         match make(&blob) {
@@ -158,20 +162,39 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                 return Some(Library {
                     library,
                     _blob: blob,
+                    save_blocked: false,
                     added: 0,
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                if let Some(dir) = dir {
+                    let kept = dir.join(REJECTED_FILE);
+                    // Rename over the previous rejection without copying the blob.
+                    match std::fs::rename(dir.join(LIBRARY_FILE), &kept) {
+                        Ok(()) => tracing::info!(error = %e, path = %kept.display(),
+                            "host pipeline library rejected and kept; starting an empty one"),
+                        Err(rename) => {
+                            save_blocked = true;
+                            tracing::warn!(error = %e, %rename, path = %kept.display(),
+                                "host pipeline library rejected and could not be moved; leaving the cache on disk and disabling library saves");
+                        }
+                    }
+                } else {
+                    tracing::info!(error = %e, "host pipeline library rejected; starting an empty one");
+                }
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
+    drop(blob);
     let library = make(&[]).ok()?;
     Some(Library {
         library,
         _blob: Vec::new(),
+        save_blocked,
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -302,8 +325,15 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    save_library(dir, library);
+}
+
+fn save_library(dir: &Path, library: &Mutex<Library>) {
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        if l.save_blocked {
+            return;
+        }
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -611,10 +641,10 @@ mod tests {
                 }
             }
         }
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, Vec::new(), None).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
         (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
+        let again = open(&device, made.serialized(), None).expect("the library again");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
@@ -645,10 +675,72 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
-        // SAFETY: a plain query on a live library.
-        assert!(unsafe { library.library.GetSerializedSize() } > 0);
+        let library =
+            open(&device, b"not a pipeline library".repeat(16), None).expect("an empty library");
+        let empty = open(&device, Vec::new(), None).expect("a fresh library");
+        // SAFETY: plain queries on live libraries.
+        let (size, empty_size) =
+            unsafe { (library.library.GetSerializedSize(), empty.library.GetSerializedSize()) };
+        assert_eq!(size, empty_size);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn a_rejected_file_replaces_the_previous_rejection() {
+        let Some(device) = warp_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join(LIBRARY_FILE);
+        let rejected = dir.path().join(REJECTED_FILE);
+        let blob = b"not a pipeline library".repeat(16);
+        std::fs::write(&rejected, b"previous rejection").unwrap();
+        std::fs::write(&active, &blob).unwrap();
+
+        let library = open(&device, blob.clone(), Some(dir.path())).expect("an empty library");
+        assert!(library._blob.is_empty());
+        assert!(!active.exists());
+        assert_eq!(std::fs::read(rejected).unwrap(), blob);
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn saving_after_a_rejection_leaves_the_kept_file_untouched() {
+        let Some(device) = warp_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join(LIBRARY_FILE);
+        let rejected = dir.path().join(REJECTED_FILE);
+        let blob = b"not a pipeline library".repeat(16);
+        std::fs::write(&active, &blob).unwrap();
+
+        let mut library = open(&device, blob.clone(), Some(dir.path())).expect("an empty library");
+        let kept = std::fs::OpenOptions::new().write(true).open(&rejected).unwrap();
+        kept.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+        drop(kept);
+        let modified = std::fs::metadata(&rejected).unwrap().modified().unwrap();
+        library.prebuilt_changed = true;
+        save_library(dir.path(), &Mutex::new(library));
+
+        let saved = std::fs::read(active).unwrap();
+        assert!(!saved.is_empty());
+        let reloaded = open(&device, saved, Some(dir.path())).expect("the saved library");
+        assert!(!reloaded._blob.is_empty());
+        assert_eq!(std::fs::read(&rejected).unwrap(), blob);
+        assert_eq!(std::fs::metadata(rejected).unwrap().modified().unwrap(), modified);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn warp_device() -> Option<ID3D12Device1> {
+        if !crate::switch::on("VICTORY_D3D12_WARP") {
+            return None;
+        }
+        Some(
+            crate::host::host()
+                .expect("the WARP host")
+                .device
+                .cast()
+                .expect("the WARP pipeline library device"),
+        )
     }
 
     #[test]
