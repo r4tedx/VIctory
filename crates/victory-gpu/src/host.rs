@@ -407,7 +407,7 @@ mod tests {
         let list = host.new_list().unwrap();
         list.scratch(1).unwrap();
         let s = list.scratch.lock().unwrap();
-        assert_eq!(kept(&s.chunks[0]._buffer), Some(Residency::Frame));
+        assert_eq!(kept(&s.chunks[0].buffer), Some(Residency::Frame));
         drop(s);
         list.close();
     }
