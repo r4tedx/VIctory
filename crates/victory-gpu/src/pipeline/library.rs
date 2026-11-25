@@ -384,6 +384,7 @@ fn tag(blob: &[u8]) -> String {
     if crate::shader_cache::rays_miss() {
         h.update(b"VICTORY_RT_MISS");
     }
+    crate::shader_cache::hash_heap_usage(&mut h, victory_shader::emit::heap_usage_marks());
     h.finalize().to_hex().to_string()
 }
 
