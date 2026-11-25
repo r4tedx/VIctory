@@ -868,6 +868,14 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // One instruction for one value (`bitcode::reuse`); the host's
+        // tables are read once per entry.
+        let tables: Vec<V> = [self.memory, self.view_addresses, self.view_marks]
+            .into_iter()
+            .flatten()
+            .chain(self.root_srvs.iter().filter(|r| r.0 == VIEW_STRIDES).map(|r| r.1))
+            .collect();
+        self.m.reuse(&tables);
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
