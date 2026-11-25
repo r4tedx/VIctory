@@ -164,7 +164,9 @@ impl Changed {
     /// snapshot and record it so pending declared copy-backs skip it.
     fn remapped(&self, page: usize) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
-        saved.armed.remove(&page);
+        if saved.armed(page) {
+            saved.unarmed.insert(page);
+        }
         saved.bytes.remove(&page);
         saved.remapped.insert(page);
     }
@@ -557,9 +559,14 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
+        let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = pages.iter().copied().filter(|&p| !self.was_remapped(p)).collect();
+        if pages.is_empty() {
+            return;
+        }
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
+        let others = aliases(&g, &pages);
         let unguarded = guard_aliases(&mut g, &others);
         let pages: Vec<usize> = pages
             .iter()
@@ -834,9 +841,69 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Serializes title virtual memory map/unmap operations and remap
+/// notifications against copy-back writes so a mapping cannot change between a
+/// remap check and `write_mapped`.
+static MAPPING: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static REMAPPING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard keeping title memory mappings stable against copy-back writes for its
+/// lifetime (reentrant on the same thread).
+pub struct Remapping {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    _local: std::marker::PhantomData<*const ()>,
+}
+
+/// Acquires the mapping lock for the duration of a title memory map/unmap
+/// operation and its [`title_memory_remapped`] notification.
+pub fn title_memory_remapping() -> Remapping {
+    let depth = REMAPPING.with(|d| {
+        let n = d.get();
+        d.set(n + 1);
+        n
+    });
+    let _guard = (depth == 0).then(|| MAPPING.lock().unwrap_or_else(|e| e.into_inner()));
+    Remapping {
+        _guard,
+        _local: std::marker::PhantomData,
+    }
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        REMAPPING.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Runs `write` to copy bytes back into `[at, at + len)` while holding
+/// [`MAPPING`] so a concurrent remap cannot race between the remap check and
+/// the copy-back write. Returns `false` if any page in `[at, at + len)` was
+/// already remapped.
+pub(crate) fn write_back(
+    tracked: Option<&Tracked>,
+    at: usize,
+    len: usize,
+    write: impl FnOnce(),
+) -> bool {
+    let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    if let Some(t) = tracked
+        && (first..last).any(|p| t.was_remapped(p))
+    {
+        return false;
+    }
+    let _writing = writing(at, len);
+    write();
+    true
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _remap = title_memory_remapping();
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
