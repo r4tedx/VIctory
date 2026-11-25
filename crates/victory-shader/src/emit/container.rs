@@ -150,7 +150,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,

@@ -190,6 +190,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(test)]
+mod geometry_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -372,23 +374,35 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let geometry = crate::dxbc::u32_at(dxil.data, 0).is_ok_and(|v| v >> 16 == 2);
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
+            if geometry {
+                p.stage == HwStage::Gs
+            } else {
+                matches!(
+                    p.stage,
+                    HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                )
+            }
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, geometry, pixel, compute or mesh program",
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let code = native.translation_code()?;
+    let (p, st) = crate::range::build(&code, native.wave64, native.vgprs)?;
+    let io = io::raise(&p, &native);
+    let res = match &io {
+        Ok(raised) => {
+            resource::track_io(&p, &native.layout, native.stage, st.as_ref().ok(), raised)
+        }
+        Err(_) => resource::track(&p, &native.layout, native.stage, st.as_ref().ok()),
+    }?;
+    let io = io?;
     let st = st?;
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
@@ -421,9 +435,65 @@ pub fn emit_with(
             None => Ok(Vec::new()),
         }
     };
+    if native.stage == HwStage::Gs
+        && (io.geometry.is_none() || !matches!(native.io, crate::native::StageIo::Gs(_)))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "unraised geometry stream I/O",
+        });
+    }
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if let crate::native::StageIo::Gs(gs) = &native.io {
+        use crate::dxbc::u32_at;
+        let info = c.part(FourCC::PSV0).and_then(|p| {
+            let size = u32_at(p.data, 0).ok()? as usize;
+            p.data.get(4..)?.get(..size)
+        });
+        let supported = info.is_some_and(|i| {
+            i.len() >= 36
+                && i[24] == 2
+                && i[25] == 0
+                && u32_at(i, 0) == Ok(3)
+                && u32_at(i, 4) == Ok(5)
+                && u32_at(i, 8) == Ok(1)
+                && u32::from(u16::from_le_bytes([i[26], i[27]])) == gs.max_vertices
+                && (1..=1024).contains(&gs.max_vertices)
+        });
+        if !supported {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "the geometry primitive or stream configuration",
+            });
+        }
+        for e in &mut inputs {
+            e.interp = match (e.kind, e.comp) {
+                (3, _) => 4,
+                (0, 9) => 2,
+                (0, _) => 1,
+                _ => {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "a geometry system input",
+                    });
+                }
+            };
+        }
+        // DXIL wants one interpolation mode per packed row: a row holding
+        // an integer element is constant throughout.
+        let constant: Vec<u32> = inputs
+            .iter()
+            .filter(|e| e.interp == 1)
+            .filter_map(|e| e.row)
+            .collect();
+        for e in &mut inputs {
+            if e.row.is_some_and(|r| constant.contains(&r)) {
+                e.interp = 1;
+            }
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };

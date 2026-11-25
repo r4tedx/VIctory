@@ -163,7 +163,24 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    trace(Tracer::new(p, layout, stage, lanes)?, &[])
+}
+
+/// Geometry uses an internal table for its output ring. Only instructions
+/// proved to construct that address are exempt from root resource tracking.
+pub fn track_io(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    io: &crate::io::Io,
+) -> Result<Resources, ShaderError> {
+    let skipped = io.geometry.as_ref().map_or(&[][..], |g| &g.address_steps);
+    trace(Tracer::new(p, layout, stage, lanes)?, skipped)
+}
+
+fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
+    let p = t.p;
     let mut out = Resources {
         params: p
             .inputs
@@ -185,6 +202,9 @@ pub fn track(
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
+            if skipped.contains(&inst.machine.offset) {
+                continue;
+            }
             let site = (b, i);
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,

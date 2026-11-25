@@ -312,6 +312,22 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A triangle pipeline with a geometry stage between VS and PS.
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+        ])?;
+        let pso = self.pipeline_gs(&root, &vs.dxil, &gs.dxil, &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// A graphics pipeline with the given root signature; vertex inputs
     /// packed in register order.
     pub fn pipeline_with(
