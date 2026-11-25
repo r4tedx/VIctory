@@ -211,7 +211,7 @@ pub(crate) fn save_read_back(
         }
     };
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
+    // SAFETY: the copy finished (the present drained it); the
     // mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
@@ -545,6 +545,7 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
+    host.drain();
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
@@ -805,7 +806,7 @@ pub(crate) fn probe(
 /// Whether every pixel [`probe`] read is (near) black.
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+    // SAFETY: the copies finished (the present drained them).
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return false;

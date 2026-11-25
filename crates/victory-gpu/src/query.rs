@@ -591,6 +591,7 @@ mod tests {
         shadow.refresh(&reader, address + 32, 8);
         reader.close();
         host.execute(&[&reader]);
+        host.drain();
         let refreshed = shadow.read_host(address + 32, 2);
         assert_eq!(refreshed, [measured as u32, 0]);
         eprintln!("resolve after UAV dispatch: measured={measured}, next submission={refreshed:?}");

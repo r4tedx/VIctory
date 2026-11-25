@@ -221,11 +221,23 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     let Some(staging) = staging(resource, texture) else {
         return false;
     };
-    if !staging.refresh() {
+    // Earlier submissions in flight may still write the texture's memory
+    // (it is read now) or copy from the staging buffer (rewritten now).
+    let host = crate::host::made();
+    if let Some(host) = host {
+        let (from, to) = staging.range();
+        host.settle_range(from, to - from, false);
+    }
+    if !staging.refresh(|| {
+        if let Some(host) = host {
+            host.settle_staging(std::sync::Arc::as_ptr(&staging) as usize);
+        }
+    }) {
         return false;
     }
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
+    list.read_staging(&staging);
     true
 }
 
@@ -284,12 +296,20 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
 }
 
 impl Staging {
+    /// The title memory the texture is read from: start and end.
+    pub(crate) fn range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start + self.layout.size as usize)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all): whether it did.
-    pub(crate) fn refresh(&self) -> bool {
+    /// since the last time (and is mapped at all): whether it did. Calls
+    /// `before_write` right before overwriting the shared staging buffer so
+    /// any earlier in-flight GPU copy from it finishes first.
+    pub(crate) fn refresh(&self, before_write: impl FnOnce()) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, changed) = self.refresh_now();
+        let (read, changed) = self.refresh_now(before_write);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -297,7 +317,7 @@ impl Staging {
     }
 
     /// Returns the bytes of title memory read, and whether it detiled.
-    fn refresh_now(&self) -> (usize, bool) {
+    fn refresh_now(&self, before_write: impl FnOnce()) -> (usize, bool) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +330,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            before_write();
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -333,8 +354,13 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        // Snapshot changed bytes before a possible fence wait. Cache the
+        // hash of the bytes that actually become the next upload.
+        last.read.resize(size, 0);
+        crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+        last.hash = Some(blake3::hash(&last.read));
+        before_write();
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)

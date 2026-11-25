@@ -63,6 +63,8 @@ pub(crate) struct Heap {
     /// copies descriptors into it itself, as bytes (`sync_heaps`).
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    #[cfg(windows)]
+    id: u64,
 }
 
 pub(crate) use host::fallback_samplers;
@@ -77,6 +79,13 @@ impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
+    }
+
+    /// Unique heap identifier (guards delayed dynamic-slot releases against
+    /// pointer reuse if a heap is freed and another allocated at the same address).
+    #[cfg(windows)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The host heap, made on first use from what the title wrote so far.
@@ -119,10 +128,14 @@ const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
-/// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Shader-visible heaps by address range, for mirroring descriptor writes:
+/// start, end, heap pointer, monotonic heap id.
+#[cfg(windows)]
+static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
@@ -130,9 +143,9 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 #[cfg(windows)]
 fn mirror(handle: u64) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, at)) = heaps
+    let Some(&(_, _, at, _)) = heaps
         .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
+        .find(|&&(start, end, _, _)| (start..end).contains(&handle))
     else {
         return;
     };
@@ -165,7 +178,7 @@ fn mirror(handle: u64) {
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
+    for &(start, _, at, _) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
         let (Some(Some(host)), Some(written), Some(step)) =
@@ -254,7 +267,7 @@ pub(crate) static USAGE: (std::sync::atomic::AtomicU64, std::sync::atomic::Atomi
 fn make_used(heap: usize, used: &[u32]) -> u64 {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+    if !heaps.iter().any(|&(_, _, h, _)| h == heap) {
         USAGE.2.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
         return 0;
     }
@@ -275,12 +288,12 @@ fn make_used(heap: usize, used: &[u32]) -> u64 {
     made
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// Gives back dynamic slots of the host heap behind the title heap with
+/// monotonic `id`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
+    if let Some(&(_, _, heap, _)) = heaps.iter().find(|&&(_, _, _, hid)| hid == id)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
@@ -293,7 +306,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+    if !heaps.iter().any(|&(_, _, h, _)| h == heap) {
         return None;
     }
     // SAFETY: registered heaps are live (removed when dropped, which waits
@@ -305,9 +318,14 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
-        let at = std::ptr::from_ref::<Heap>(self) as usize;
+        if self.host.get().is_some_and(Option::is_some)
+            && let Some(host) = crate::host::host()
+        {
+            host.drain();
+        }
+        let id = self.id;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        heaps.retain(|&(_, _, _, hid)| hid != id);
     }
 }
 
@@ -758,12 +776,15 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
+        let id = heap.id;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at));
+        heaps.push((start, start + size, at, id));
     }
     #[cfg(not(windows))]
     let _ = visible;

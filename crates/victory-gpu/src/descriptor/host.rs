@@ -555,12 +555,14 @@ impl HostHeap {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
-        // SAFETY: two dwords of the mapped table, which has two per slot
-        // below the larger of the title's count and `HEAP_VIEWS`.
+        let packed = u64::from(entry.0) | (u64::from(entry.1) << 32);
+        // SAFETY: two dwords (8-byte aligned) of the mapped table, which has
+        // two per slot below the larger of the title's count and `HEAP_VIEWS`;
+        // written as one 64-bit store so an in-flight shader never observes a
+        // torn bit/phase pair.
         unsafe {
-            let at = (*data as *mut u32).add(2 * index as usize);
-            at.write_volatile(entry.0);
-            at.add(1).write_volatile(entry.1);
+            let at = (*data as *mut std::sync::atomic::AtomicU64).add(index as usize);
+            (&*at).store(packed, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -589,8 +591,11 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
+            if let Some((old, shadow)) = old {
                 crate::host::retire(old);
+                if let Some(shadow) = shadow {
+                    crate::host::retire_shadow(shadow);
+                }
             }
         }
     }
@@ -628,6 +633,15 @@ impl HostHeap {
     /// dynamic ones.
     fn address_slots(&self) -> u32 {
         self.count + self.dynamic
+    }
+
+    /// The host buffer backing [`HostHeap::view_addresses`], for `HostList::keep`.
+    pub(crate) fn view_addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        let _ = self.view_addresses()?;
+        self.addresses
+            .get()
+            .and_then(Option::as_ref)
+            .map(|m| &m.0)
     }
 
     /// Slot `index` now holds `view` (or no view): its view address.

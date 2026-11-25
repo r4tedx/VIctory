@@ -120,6 +120,17 @@ struct List {
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
+#[cfg(windows)]
+impl Drop for List {
+    /// The GPU may still read its upload memory, which goes before the host
+    /// list (which waits for its submission too).
+    fn drop(&mut self) {
+        if let Some(host) = &self.host {
+            host.settle();
+        }
+    }
+}
+
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
@@ -276,10 +287,21 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    // Memory the list's running submission may still use goes once it has
+    // finished.
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && list.running()
+        && let Some(host) = crate::host::made()
+    {
+        let old = std::mem::take(&mut *uploads);
+        host.after(move || drop(old));
+    }
+    uploads.clear();
+    drop(uploads);
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
@@ -786,7 +808,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        list.defer((dst as usize, len), (src as usize, len), move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -968,8 +990,8 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
+/// their own work and submissions run in order on one host queue, so there
+/// is nothing to do.
 extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
@@ -2351,6 +2373,7 @@ mod tests {
         let depth_rb = read_tex(&depth_tex, DXGI_FORMAT_D32_FLOAT);
         assert_eq!(close(list.0), S_OK);
         host.execute(&[recorded]);
+        host.drain();
 
         let expected_colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         for (rb, want) in rbs.iter().zip(expected_colors) {

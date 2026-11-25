@@ -343,8 +343,8 @@ pub(crate) fn bound(
         };
         debug_assert!(plan.post_budget_uav());
         match plan.transitions() {
-            [a] => l.ResourceBarrier(&[to_arg(*a), uav_barrier_for(budget_res)]),
-            [a, b] => l.ResourceBarrier(&[to_arg(*a), to_arg(*b), uav_barrier_for(budget_res)]),
+            [a] => l.ResourceBarrier(&[to_arg(*a), uav_barrier_for(&budget_res)]),
+            [a, b] => l.ResourceBarrier(&[to_arg(*a), to_arg(*b), uav_barrier_for(&budget_res)]),
             _ => unreachable!(),
         }
     }
@@ -498,6 +498,7 @@ mod tests {
             }
             list.close();
             host.execute(&[&list]);
+            host.drain();
             for at in all - per..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
             }
@@ -669,6 +670,7 @@ mod tests {
             // Execute the same list twice in one batch to exercise post-clamp
             // `budget` UAV synchronization across repeated executions.
             host.execute(&[&list, &list]);
+            host.drain();
 
             // Record 0 ran empty (0 groups); record 1 was past `count = 1`.
             assert_eq!(a.add(0).read_volatile(), 0);

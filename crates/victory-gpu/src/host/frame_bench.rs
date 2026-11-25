@@ -298,9 +298,13 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
                     })
                     .collect();
                 let value = *stamp;
-                list.defer_host(move || {
+                // The list's own bitmap, which its marking shaders write.
+                list.view_writes().expect("a mark bitmap");
+                let bitmap = list.marks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let bitmap = bitmap.expect("a mark bitmap");
+                list.defer_host((0, 0), (0, 0), move || {
                     for (copy, at, changed) in &writes {
-                        copy.mark_written(*at);
+                        copy.mark_written(&bitmap, *at);
                         if *changed {
                             copy.write_host(*at, &value.to_le_bytes());
                         }
@@ -489,7 +493,7 @@ fn unit_costs(all: &[Buffer]) {
         }
         let each = ms(started) * 1e3 / (ROUNDS * 10) as f64;
         for &(at, len) in &ranges {
-            heap.copy.copy_back(at, len);
+            heap.copy.copy_back(at, len, 1, |_, _| true);
         }
         println!("  a check of the unchanged heap with {declared} declared ranges on it: {each:.2} us");
     }
@@ -504,7 +508,7 @@ fn unit_costs(all: &[Buffer]) {
         }
         let arm = ms(started) * 1e3 / N as f64;
         let started = Instant::now();
-        heap.copy.copy_back(at, len);
+        heap.copy.copy_back(at, len, 1, |_, _| true);
         println!(
             "  declaring {what} to its end as written (marked): {arm:.1} us each; ending it {:.1} us",
             ms(started) * 1e3
