@@ -2795,6 +2795,8 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frames since the last log line.
+    logged_frames: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -2809,6 +2811,7 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            logged_frames: 0,
             caption: None,
         }
     }
@@ -2818,6 +2821,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.logged_frames += 1;
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
@@ -2862,6 +2866,19 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            // Over every frame since the last line.
+            let logged_frames = std::mem::take(&mut self.logged_frames);
+            let (no_root_views, no_tables, short_runs) = crate::draw::take_dynamic_drops();
+            if no_root_views + no_tables + short_runs > 0 {
+                let (free, total) = crate::descriptor::fullest_dynamic().unwrap_or_default();
+                tracing::info!(
+                    "dynamic descriptor slots: dropped {no_root_views} draws for root views and \
+                     {no_tables} for tables in {logged_frames} frames ({:.1}/frame); \
+                     {short_runs} root-view runs shorter than 256 slots; fullest view heap \
+                     {free} of {total} free",
+                    (no_root_views + no_tables) as f64 / logged_frames.max(1) as f64,
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
