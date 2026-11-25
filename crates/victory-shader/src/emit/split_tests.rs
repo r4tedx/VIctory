@@ -1337,3 +1337,74 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+/// `v_permlanex16_b32 v2, v0, sel, sel` with v0 = t: lane t reads lane
+/// `sel`'s nibble of the other 16-lane row of its 32. Every nibble 0 or
+/// every nibble 15: the read stays in the lane's half of a wave64.
+fn permlanex16(every_nibble_15: bool) -> Vec<u32> {
+    vec![
+        0xD778_0002,
+        if every_nibble_15 {
+            0x0305_8300 // v_permlanex16_b32 v2, v0, -1, -1
+        } else {
+            0x0201_0100 // v_permlanex16_b32 v2, v0, 0, 0
+        },
+    ]
+}
+
+/// What lane `t` of [`permlanex16`] stores: the lane it read.
+fn permlanex16_want(every_nibble_15: bool) -> impl Fn(u32) -> u32 {
+    move |t| ((t & !15) ^ 16) | if every_nibble_15 { 15 } else { 0 }
+}
+
+/// A row permutation reads within its 32 lanes, so a wave64 program whose
+/// only lane reads are `v_permlanex16` runs in halves on a 32-lane host
+/// (no console flow), and its module validates; on every hardware adapter
+/// and on WARP (waves of 64 there) each lane reads the console's lane.
+#[test]
+fn row_permutations_read_within_their_half() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref());
+    let mut validator = validator.ok();
+    for fifteen in [false, true] {
+        let p = program(&permlanex16(fifteen), 64);
+        let cs = emit_for(&p, nvidia).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "split in halves");
+        if let Some(v) = &mut validator {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        flow_case(
+            &format!("v_permlanex16, nibbles 15 {fifteen}"),
+            &permlanex16(fifteen),
+            64,
+            permlanex16_want(fifteen),
+            true,
+        );
+    }
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    if !host.target().runs(64) {
+        eprintln!("WARP runs no waves of 64; skipped");
+        return;
+    }
+    for fifteen in [false, true] {
+        let p = program(&permlanex16(fifteen), 64);
+        match run(&host, &p, 2) {
+            Ok(out) => {
+                let want: Vec<u32> = (0..2)
+                    .flat_map(|_| (0..64).map(permlanex16_want(fifteen)))
+                    .collect();
+                assert_eq!(out, want, "WARP: nibbles 15 {fifteen}");
+                eprintln!("WARP: nibbles 15 {fifteen} exact");
+            }
+            Err(e) => eprintln!("WARP: nibbles 15 {fifteen}: {e}; skipped"),
+        }
+    }
+}

@@ -754,11 +754,16 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            // Swizzles and DPP read lanes of the same 32 (rows of 16, groups
-            // of 8, 32 or 4): the rest may read the other half of a wave64.
+            // Swizzles, DPP and row permutations read lanes of the same 32
+            // (rows of 16, groups of 8, 32 or 4; `v_permlane16` its own
+            // row, `v_permlanex16` the other row of its 32): the rest may
+            // read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
-                    || i.name() == "ds_bpermute_b32"
+                    || matches!(
+                        i.name(),
+                        "ds_bpermute_b32" | "v_permlane16_b32" | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let spills = spill_writes(p, x.st, &phi_at);
@@ -770,7 +775,6 @@ impl<'a> Lower<'a> {
                 }
                 (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_permlane16_b32" | "v_permlanex16_b32")
                     || reads_mask_as_data(x.st, i)
             };
             let reads_whole = insts().any(whole);
