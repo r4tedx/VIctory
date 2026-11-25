@@ -158,13 +158,19 @@ impl Shadow {
     /// copy took it (then title memory is the copy as it was before the
     /// submission, and what differs is what the GPU wrote). Returns the
     /// bytes written; a page the title wrote meanwhile keeps the title's
-    /// bytes (logged once).
+    /// bytes (logged once), and so does one the runtime remapped since the
+    /// submission began at remap epoch `since`.
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
-    pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_page(&self, page: usize, since: u64) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        if let Some(t) = &self.tracked
+            && t.remapped_since(page / PAGE, page / PAGE + 1, since)
+        {
             return 0;
         }
         if let Some(t) = &self.tracked
@@ -336,27 +342,31 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_or_not(address, len, true)
+    /// records (a fence list read as -1, title+0x4e9b54a). Pages the
+    /// runtime remapped since the submission began at remap epoch `since`
+    /// are left alone: title memory there is no longer what the shaders
+    /// read. Returns the bytes written.
+    pub(crate) fn copy_back(&self, address: usize, len: usize, since: u64) -> usize {
+        self.copy_back_or_not(address, len, Some(since))
     }
 
     /// After the submission ran: what its shaders wrote in the range stays
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
-        self.copy_back_or_not(address, len, false);
+        self.copy_back_or_not(address, len, None);
     }
 
-    fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+    /// With `back` (the remap epoch the submission began at), what the
+    /// shaders wrote goes back ([`Shadow::copy_back`]); without, it stays.
+    fn copy_back_or_not(&self, address: usize, len: usize, back: Option<u64>) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
+            && let Some(since) = back
             && from < to
         {
             let before = &before[from - taken..to - taken];
@@ -384,7 +394,14 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                // A piece lies in one page. Remapped: left changed, the copy
+                // takes the new memory at its next refresh.
+                let page = (start + at) / PAGE;
+                let remapped = |t: &crate::watch::Tracked| t.remapped_since(page, page + 1, since);
+                if host != old
+                    && !self.tracked.as_ref().is_some_and(remapped)
+                    && crate::host::read_into((start + at) as *const u8, title)
+                {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -436,11 +453,12 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// A page the runtime remapped since the submission began at remap
+    /// epoch `since` keeps the new memory's bytes. Returns the bytes written.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, since: u64) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -452,6 +470,9 @@ impl Shadow {
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
         let saved = t.saved(page / PAGE);
+        if t.remapped_since(page / PAGE, page / PAGE + 1, since) {
+            return 0;
+        }
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
@@ -848,11 +869,16 @@ pub(crate) fn forget_read(slot: u32) {
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// declared ranges, which disarm the copies. `since`: the remap epoch the
+/// submission began at.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+pub(crate) fn copy_back_marks(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+    since: u64,
+) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -908,7 +934,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let written = copy.copy_back_marked(page, since);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1286,6 +1312,8 @@ pub(crate) mod tests {
         };
         let title = |at: usize| (p + at) as *mut u8;
         let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        // The submission begins.
+        let since = crate::watch::remap_epoch();
         copy.update(p, len);
         // An earlier list declares all of it as written by shaders.
         copy.writing(p, len, false);
@@ -1297,7 +1325,7 @@ pub(crate) mod tests {
         copy.write_host((p + 10) as u64, &[0xaa]);
         // SAFETY: a byte of our pool.
         unsafe { title(PAGE + 20).write_volatile(0x66) };
-        copy.copy_back(p, len);
+        copy.copy_back(p, len, since);
         // SAFETY: bytes of our pool.
         unsafe {
             assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
@@ -1407,6 +1435,7 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
+        let since = crate::watch::remap_epoch();
         copy.update(p, len);
         let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
         copy.writing(p + 16, 64, false);
@@ -1419,11 +1448,19 @@ pub(crate) mod tests {
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
-        assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
-        assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
-        assert_eq!(copy.copy_back(p + 80, 8), 0);
+        assert_eq!(
+            copy.copy_back(p + 16, 64, since),
+            64,
+            "the range's part of the piece"
+        );
+        assert_eq!(
+            copy.copy_back(p + PAGE, 2 * PAGE, since),
+            PAGE,
+            "the piece written"
+        );
+        assert_eq!(copy.copy_back(p + PAGE, PAGE, since), 0, "compared once");
+        assert_eq!(copy.copy_back(p + 3 * PAGE, 100, since), 0);
+        assert_eq!(copy.copy_back(p + 80, 8, since), 0);
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
@@ -1439,6 +1476,8 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        // Nothing else takes the marks set below.
+        let _one = crate::host::tests::no_submission();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1448,6 +1487,7 @@ pub(crate) mod tests {
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        let since = crate::watch::remap_epoch();
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
@@ -1468,7 +1508,7 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], false);
+        copy_back_marks(&[], false, since);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
@@ -1477,7 +1517,7 @@ pub(crate) mod tests {
         // SAFETY: dwords of the mapped bitmap.
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
-        assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        assert_eq!(copy.copy_back(p, len, since), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
 
@@ -1486,6 +1526,8 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        // Nothing else takes the marks set below.
+        let _one = crate::host::tests::no_submission();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1494,6 +1536,7 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let since = crate::watch::remap_epoch();
         copy.update(p, len);
         copy.writing(p, len, true);
         copy.write_host((p + 10) as u64, &[0xaa]);
@@ -1503,12 +1546,114 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], true);
+        copy_back_marks(&[], true, since);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        unregister(p, p as u64);
+    }
+
+    /// A page the runtime remaps while shaders write its copy (another
+    /// thread, during the GPU's run) keeps the new memory's bytes, whichever
+    /// copy-back would have put the shaders' there: a declared range's
+    /// snapshot, a marked page whose bytes the title's first write saved, a
+    /// page at a computed address. Each is counted. Pages the title only
+    /// wrote, or nobody, get the shaders' byte as before.
+    #[test]
+    fn pages_remapped_while_shaders_write_keep_the_new_memory() {
+        use crate::watch::{remap_epoch, remap_skips, title_memory_remapped};
+        // Nothing else takes the marks set below.
+        let _one = crate::host::tests::no_submission();
+        let p = crate::watch::tests::pool(6);
+        let len = 6 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        // SAFETY: a byte of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        // The title writes a byte; with `remap`, the runtime then reports its
+        // page as mapped anew. From another thread, as the title's.
+        let title = |at: usize, value: u8, remap: bool| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    // SAFETY: a byte of our pool (a guard fault marks it).
+                    unsafe { ((p + at) as *mut u8).write_volatile(value) };
+                    if remap {
+                        title_memory_remapped((p + at) & !(PAGE - 1), PAGE);
+                    }
+                });
+            });
+        };
+        let skips = remap_skips();
+        // The submission begins.
+        let since = remap_epoch();
+        copy.update(p, len);
+        // Pages 0-1 declared (a snapshot), 2-3 marked (armed), 4-5 neither
+        // (written at computed addresses).
+        copy.writing(p, 2 * PAGE, false);
+        copy.writing(p + 2 * PAGE, 2 * PAGE, true);
+        // The shaders write a byte in each page.
+        for k in 0..6 {
+            copy.write_host((p + k * PAGE + 10) as u64, &[0xa0 + k as u8]);
+        }
+        // Meanwhile the title writes the same byte of each page but page 4,
+        // and pages 1, 3 and 5 are remapped after (page 3 is armed: its
+        // bytes from before the title's write are saved).
+        for k in [0, 1, 2, 3, 5] {
+            title(k * PAGE + 10, 0x50 + k as u8, k % 2 == 1);
+        }
+        let bits = b.data as *mut u32;
+        for n in [base + 2, base + 3] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], false, since);
+        copy.copy_back(p, 2 * PAGE, since);
+        copy.copy_back(p + 2 * PAGE, 2 * PAGE, since);
+        assert_eq!(copy.copy_back_page(p + 4 * PAGE, since), PAGE);
+        assert_eq!(copy.copy_back_page(p + 5 * PAGE, since), 0);
+        assert_eq!(
+            read(10),
+            0xa0,
+            "the shaders' byte, a declared page the title wrote"
+        );
+        assert_eq!(
+            read(2 * PAGE + 10),
+            0xa2,
+            "the shaders' byte, a marked page the title wrote"
+        );
+        assert_eq!(
+            read(4 * PAGE + 10),
+            0xa4,
+            "the shaders' byte, a page at a computed address"
+        );
+        assert_eq!(
+            [read(PAGE + 10), read(3 * PAGE + 10), read(5 * PAGE + 10)],
+            [0x51, 0x53, 0x55],
+            "remapped pages keep the new memory's bytes"
+        );
+        assert!(remap_skips() >= skips + 3, "each counted");
+        // The copy takes the new memory at its next refresh.
+        assert!(copy.update(p, len) >= 3 * PAGE);
+        assert_eq!(
+            copy.read_host((p + PAGE + 8) as u64, 1)[0].to_le_bytes()[2],
+            0x51
+        );
+        // A submission beginning after the remap writes back as usual.
+        let since = remap_epoch();
+        copy.writing(p, 2 * PAGE, false);
+        copy.write_host((p + PAGE + 10) as u64, &[0xee]);
+        copy.copy_back(p, 2 * PAGE, since);
+        assert_eq!(
+            read(PAGE + 10),
+            0xee,
+            "the shaders' byte, a later submission"
+        );
         unregister(p, p as u64);
     }
 

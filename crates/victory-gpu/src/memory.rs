@@ -478,7 +478,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             })
         })
     });
-    list.defer_after(move || {
+    list.defer_after_since(move |since| {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
@@ -520,7 +520,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let n = copies[k].copy_back_page(at as usize, since);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),

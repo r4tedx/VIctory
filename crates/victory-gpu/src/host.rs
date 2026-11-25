@@ -376,6 +376,12 @@ pub(crate) mod tests {
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// Holds submissions off while it lives (they take every write mark at
+    /// their copy-back), for tests that set marks themselves.
+    pub(crate) fn no_submission() -> Option<std::sync::MutexGuard<'static, u64>> {
+        super::host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
@@ -996,8 +1002,9 @@ struct Deferred {
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
-    /// (title memory shaders wrote at addresses they computed goes back).
-    after: Vec<Box<dyn Fn() + Send>>,
+    /// (title memory shaders wrote at addresses they computed goes back),
+    /// given the remap epoch its submission began at.
+    after: Vec<Box<dyn Fn(u64) + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1129,6 +1136,9 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        // Before anything is refreshed: copy-backs leave alone the pages the
+        // runtime remaps from here on (`crate::watch::Tracked::remapped_since`).
+        let since = crate::watch::remap_epoch();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -1364,7 +1374,7 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        crate::shadow::copy_back_marks(&withheld, withholding, since);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -1373,7 +1383,7 @@ impl Host {
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let written = shadow.copy_back(address, len, since);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
                 shadow.keep_writes(address, len);
@@ -1383,7 +1393,7 @@ impl Host {
         }
         for list in runs {
             for work in &list.deferred().after {
-                work();
+                work(since);
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2097,6 +2107,13 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(move |_| work()));
+    }
+
+    /// [`HostList::defer_after`] of work that writes title memory: it is
+    /// given the remap epoch the submission began at, to leave alone pages
+    /// the runtime remapped since (`crate::shadow::Shadow::copy_back_page`).
+    pub(crate) fn defer_after_since(&self, work: impl Fn(u64) + Send + 'static) {
         self.deferred().after.push(Box::new(work));
     }
 

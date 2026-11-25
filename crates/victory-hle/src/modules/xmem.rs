@@ -166,6 +166,12 @@ pub extern "system" fn XMemVirtualAlloc(
                 "XMemVirtualAlloc refused"
             );
         }
+    } else {
+        // New memory where the title may have freed memory the GPU side's
+        // copies still hold (with the host's `VirtualFree`, which they do not
+        // see): what they took of it is gone, and so are their guards.
+        let end = base.max(at) as usize + size;
+        victory_gpu::title_memory_remapped(at as usize, end - at as usize);
     }
     if base.is_null() {
         tracing::debug!(
