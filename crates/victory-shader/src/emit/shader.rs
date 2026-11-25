@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -121,6 +121,9 @@ pub(crate) struct Shader {
     pub root_uavs: Vec<(u8, V)>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
+    /// The null raw SRV heap index (entry 0 of block 0 in the page table),
+    /// loaded once in the entry block.
+    pub memory_null: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
@@ -196,6 +199,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             memory: None,
+            memory_null: None,
             memory_dirty: None,
             view_addresses: None,
             view_marks: None,
@@ -387,6 +391,22 @@ impl Shader {
         self.flags |= flags::RAW_BUFFERS;
         self.memory = Some(h);
         h
+    }
+
+    /// The null raw SRV heap index (block 0's first entry in the page table,
+    /// at byte offset `4096 * 4`), loaded once in the entry block.
+    pub fn memory_null(&mut self) -> V {
+        if let Some(v) = self.memory_null {
+            return v;
+        }
+        let map = self.memory_handle();
+        let b = self.entry;
+        let (at, u, mask, al) = (self.m.i32(4096 * 4), self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+        let r = self.op(b, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139, &[map, at, u, mask, al]);
+        let x = self.m.extract(b, r, 0);
+        let v = self.m.cast(b, Cast::Bitcast, x, self.t.i32);
+        self.memory_null = Some(v);
+        v
     }
 
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw

@@ -752,3 +752,176 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+enum BcConst { Int(i64), Agg(Vec<u32>) }
+enum BcInst { Bin(u64, u32, u32), Cast(u64, u32), Cmp(u64, u32, u32), Extract(u32, u64), Call(String, Vec<u32>), Other }
+
+/// Decoded instructions and conditional branches of `main` from a DXIL container.
+struct Bc {
+    consts: std::collections::HashMap<u32, BcConst>,
+    insts: std::collections::HashMap<u32, (usize, BcInst)>,
+    cond_brs: Vec<(usize, usize, u32)>,
+}
+
+impl Bc {
+    fn parse(dxil: &[u8]) -> Self {
+        use std::collections::HashMap;
+        let c = crate::dxbc::Container::parse(dxil).expect("dxbc");
+        let bc = &c.part(crate::dxbc::FourCC::DXIL).expect("DXIL").data[24..];
+        assert_eq!(&bc[..4], b"BC\xC0\xDE");
+        let mut pos = 32usize;
+        let read = |p: &mut usize, n: u32| -> u64 {
+            (0..n).fold(0u64, |v, i| { let b = (bc[*p / 8] >> (*p % 8)) & 1; *p += 1; v | u64::from(b) << i })
+        };
+        let vbr = |p: &mut usize, w: u32| -> u64 {
+            let (mut v, mut sh) = (0u64, 0u32);
+            loop {
+                let x = read(p, w);
+                v |= (x & ((1 << (w - 1)) - 1)) << sh;
+                if x >> (w - 1) == 0 { return v; }
+                sh += w - 1;
+            }
+        };
+        let (mut stack, mut void_ty, mut ty_void) = (Vec::<(u64, u32)>::new(), None, HashMap::<u32, bool>::new());
+        let (mut ty_n, mut globals, mut funcs, mut const_n, mut next_id, mut blk) = (0u32, 0u32, 0u32, 0u32, 0u32, 0usize);
+        let (mut consts, mut names, mut insts, mut cond_brs) = (HashMap::new(), HashMap::<u32, String>::new(), HashMap::new(), Vec::new());
+        while pos < bc.len() * 8 {
+            match read(&mut pos, stack.last().map_or(2, |s| s.1)) {
+                0 => { pos = pos.next_multiple_of(32); stack.pop(); if stack.is_empty() { break; } }
+                1 => {
+                    let (id, nw) = (vbr(&mut pos, 8), vbr(&mut pos, 4) as u32);
+                    pos = pos.next_multiple_of(32) + 32;
+                    if id == 12 { (next_id, blk) = (globals + funcs + const_n, 0); }
+                    stack.push((id, nw));
+                }
+                3 => {
+                    let (code, n) = (vbr(&mut pos, 6), vbr(&mut pos, 6) as usize);
+                    let ops: Vec<u64> = (0..n).map(|_| vbr(&mut pos, 6)).collect();
+                    match stack.last().map(|s| s.0) {
+                        Some(17) if code != 1 && code != 19 => {
+                            if code == 2 { void_ty = Some(ty_n); }
+                            else if code == 21 { ty_void.insert(ty_n, Some(ops[1] as u32) == void_ty); }
+                            ty_n += 1;
+                        }
+                        Some(8) if code == 7 || code == 8 => if code == 7 { globals += 1 } else { funcs += 1 },
+                        Some(11) if code != 1 => {
+                            let id = globals + funcs + const_n;
+                            if code == 4 { let m = (ops[0] >> 1) as i64; consts.insert(id, BcConst::Int(if ops[0] & 1 == 0 { m } else { m.wrapping_neg() })); }
+                            else if code == 7 { consts.insert(id, BcConst::Agg(ops.iter().map(|&o| o as u32).collect())); }
+                            const_n += 1;
+                        }
+                        Some(14) if code == 1 => { names.insert(ops[0] as u32, ops[1..].iter().map(|&c| c as u8 as char).collect()); }
+                        Some(12) if code != 1 => {
+                            let rel = |r: u64| next_id - r as u32;
+                            match code {
+                                10 | 11 => { if code == 11 && ops.len() == 3 { cond_brs.push((blk, ops[0] as usize, rel(ops[2]))); } blk += 1; }
+                                44 => {}
+                                34 if ty_void.get(&(ops[2] as u32)).copied().unwrap_or(false) => {}
+                                _ => {
+                                    let inst = match code {
+                                        2 => BcInst::Bin(ops[2], rel(ops[0]), rel(ops[1])),
+                                        3 => BcInst::Cast(ops[2], rel(ops[0])),
+                                        26 => BcInst::Extract(rel(ops[0]), ops[1]),
+                                        28 => BcInst::Cmp(ops[2], rel(ops[0]), rel(ops[1])),
+                                        34 => BcInst::Call(names.get(&rel(ops[3])).cloned().unwrap_or_default(), ops[4..].iter().map(|&r| rel(r)).collect()),
+                                        _ => BcInst::Other,
+                                    };
+                                    insts.insert(next_id, (blk, inst));
+                                    next_id += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                other => panic!("unexpected bitcode abbrev {other}"),
+            }
+        }
+        Self { consts, insts, cond_brs }
+    }
+
+    fn int(&self, id: u32) -> Option<i64> { match self.consts.get(&id) { Some(BcConst::Int(v)) => Some(*v), _ => None } }
+
+    fn binding(&self, h: u32) -> Option<(i64, i64, i64)> {
+        let (_, BcInst::Call(name, args)) = self.insts.get(&h)? else { return None };
+        let inner = if name == "dx.op.annotateHandle" { args[1] } else { h };
+        let (_, BcInst::Call(name, args)) = self.insts.get(&inner)? else { return None };
+        let BcConst::Agg(f) = (name == "dx.op.createHandleFromBinding").then(|| self.consts.get(&args[1]))?? else { return None };
+        Some((self.int(f[0])?, self.int(f[2])?, self.int(f[3])?))
+    }
+
+    fn calls_on(&self, op: &str, bind: (i64, i64, i64)) -> Vec<(usize, &[u32])> {
+        self.insts.values().filter_map(|(b, i)| match i {
+            BcInst::Call(n, a) if n == op && self.binding(a[1]) == Some(bind) => Some((*b, a.as_slice())),
+            _ => None,
+        }).collect()
+    }
+
+    fn assert_guarded_dirty_or(&self, blk: usize, args: &[u32], bitmap: (i64, i64, i64)) -> usize {
+        assert_eq!((self.binding(args[1]), self.int(args[2])), (Some(bitmap), Some(2)));
+        let (word, bit) = (args[3], args[6]);
+        let &(test_blk, _, cond) = self.cond_brs.iter().find(|&&(_, then, _)| then == blk).expect("dirty atomic must be branched");
+        let (_, BcInst::Cmp(32, a, b)) = self.insts[&cond] else { panic!("guard must be icmp eq 0") };
+        let set = if self.int(b) == Some(0) { a } else { assert_eq!(self.int(a), Some(0)); b };
+        let (_, BcInst::Bin(10, x, y)) = self.insts[&set] else { panic!("test must mask word with bit") };
+        let old = if y == bit { x } else { assert_eq!(x, bit); y };
+        let (_, BcInst::Cast(11, ext)) = self.insts[&old] else { panic!("expected bitcast") };
+        let (_, BcInst::Extract(load, 0)) = self.insts[&ext] else { panic!("expected extract 0") };
+        let (load_blk, BcInst::Call(ref name, ref la)) = self.insts[&load] else { panic!("expected rawBufferLoad") };
+        assert_eq!((load_blk, name.as_str(), self.binding(la[1]), la[2]), (test_blk, "dx.op.rawBufferLoad.f32", Some(bitmap), word));
+        assert_eq!((self.int(la[4]), self.int(la[5]), self.insts[&word].0, self.insts[&bit].0), (Some(1), Some(4), test_blk, test_blk));
+        test_blk
+    }
+
+    fn gated_by_ne(&self, blk: usize, word: u32) -> bool {
+        let Some((_, BcInst::Bin(7, sh, _))) = self.insts.get(&word) else { return false };
+        let Some((_, BcInst::Bin(8, n, _))) = self.insts.get(sh) else { return false };
+        self.cond_brs.iter().any(|&(_, t, c)| t == blk && matches!(self.insts.get(&c), Some((_, BcInst::Cmp(33, a, b))) if a == n || b == n))
+    }
+
+    fn verify_dirty_marks(&self, bitmap: (i64, i64, i64), want_atomics: usize, want_ne: usize) {
+        let atomics = self.calls_on("dx.op.atomicBinOp.i32", bitmap);
+        assert_eq!(atomics.len(), want_atomics);
+        let ne = atomics.iter().filter(|&&(b, a)| self.gated_by_ne(self.assert_guarded_dirty_or(b, a, bitmap), a[3])).count();
+        assert_eq!(ne, want_ne, "2nd marks must check n != bits[0] before loading bitmap");
+    }
+}
+
+/// Across 13 title-memory accesses (`program`), `memory_null` is loaded once in
+/// block 0, `(view, start)` loads coalesce via `raw_dword2`, every dirty-mark
+/// atomic is guarded by load + bit-test, 2nd marks check `n != bits[0]` before
+/// loading the bitmap, and `WAVE_OPS` is not set.
+#[test]
+fn memory_entry_caches_null_coalesces_loads_and_guards_dirty_atomics() {
+    let shader = program();
+    let sfi0 = crate::dxbc::Container::parse(&shader.dxil).expect("dxbc").part(crate::dxbc::FourCC::SFI0).expect("SFI0").data;
+    assert_eq!(u64::from_le_bytes(sfi0.try_into().unwrap()) & 0x4000, 0, "no WAVE_OPS");
+    let bc = Bc::parse(&shader.dxil);
+    let pt_loads = bc.calls_on("dx.op.rawBufferLoad.f32", (0, 2, 0));
+    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]);
+    assert_eq!(pt_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 13);
+    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[4]) == Some(1)).count(), 14);
+    bc.verify_dirty_marks((0, 2, 1), 17, 4);
+}
+
+/// Single-byte writes omit the 2nd mark statically in both `Lower::memory` and
+/// `Lower::mark_view_write`; multi-byte writes check `n != bits[0]` before
+/// loading the bitmap; `mark_view_write` coalesces `(base, phase)`; and
+/// `memory_null` hoists to entry block 0 even from a non-entry branch.
+#[test]
+fn dirty_mark_width_and_branch_hoisting() {
+    let mut val = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for (view_mark, bytes, in_branch) in [(false, 1, false), (false, 4, true), (true, 1, false), (true, 4, false)] {
+        let dxil = lower::synthetic_mark_dxil(view_mark, bytes, in_branch);
+        if let Some(v) = val.as_mut() { v.validate(&mut dxil.clone()).expect("DXIL validation failed"); }
+        let bc = Bc::parse(&dxil);
+        let (table, bitmap) = if view_mark { ((2, 2, 0), (1, 2, 1)) } else { ((0, 2, 0), (0, 2, 1)) };
+        let t_loads = bc.calls_on("dx.op.rawBufferLoad.f32", table);
+        assert_eq!(t_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 1);
+        if view_mark { assert_eq!(t_loads.len(), 1); }
+        else { assert_eq!(t_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]); }
+        let want = if bytes <= 1 { 1 } else { 2 };
+        assert_eq!(bc.calls_on("dx.op.rawBufferLoad.f32", bitmap).len(), want);
+        bc.verify_dirty_marks(bitmap, want, usize::from(bytes > 1));
+    }
+}
