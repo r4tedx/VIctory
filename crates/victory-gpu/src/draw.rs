@@ -1625,8 +1625,10 @@ impl State {
         // (`crate::indirect::batching`), or on its own here.
         let batched = (crate::indirect::batching() && max != 0)
             .then(|| {
-                let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
-                crate::indirect::member(list, args.gpu(arguments), count, (kind, stride, max))
+                // Host addresses as a copy's start and the offset in it.
+                let at = |s: &crate::shadow::Shadow, a: u64| (s.gpu(a) - s.offset(a), s.offset(a));
+                let count = counter.as_ref().map(|(s, a)| at(s, *a));
+                crate::indirect::member(list, at(&args, arguments), count, (kind, stride, max))
             })
             .flatten();
         // Bounded first: the clamp binds a compute pipeline of its own.
