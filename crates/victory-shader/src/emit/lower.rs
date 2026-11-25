@@ -342,6 +342,8 @@ struct Lower<'a> {
     root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: a lane's last packed primitive export, or zero for no export.
+    mesh_primitive: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -905,6 +907,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             flat: None,
+            mesh_primitive: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
@@ -3257,11 +3260,8 @@ impl<'a> Lower<'a> {
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
+    // Use the declared maxima. Lanes without a primitive export emit zero
+    // indices at exit, so their unused triangles have zero area.
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -3278,19 +3278,10 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
-        let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        let slot = self.s.m.local_i32(e);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(e, slot, zero);
+        self.mesh_primitive = Some(slot);
         Ok(())
     }
 
@@ -9936,7 +9927,7 @@ impl<'a> Lower<'a> {
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
         if mesh && e.target == Target::Primitive {
-            return self.emit_indices(e, guard);
+            return self.save_mesh_primitive(e, guard);
         }
         let param_row = |usage: Usage, row: u8| match usage {
             // The 2020 compiler leaves a mesh program's first entry zeroed
@@ -10122,19 +10113,34 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
-    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
-    /// and 29), which only the console's edge-flag rasterisation reads and
-    /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area).
-    fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+    fn save_mesh_primitive(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let slot = self.mesh_primitive.expect("mesh primitive local");
+        let at = self.begin_guarded(guard);
+        self.s.m.store(self.cur, slot, x);
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Writes each lane's primitive once. WARP can retain the first indices
+    /// when the same primitive is emitted again.
+    fn finish_mesh_primitive(&mut self) {
+        let Some(slot) = self.mesh_primitive else { return };
+        let mesh = self.s.mesh.expect("mesh");
+        let threads = self.s.threads.expect("mesh")[0];
+        let flat = self.mesh_thread();
+        let max = self.s.m.i32(mesh.max_primitives);
+        let guard = (threads > mesh.max_primitives)
+            .then(|| self.s.m.cmp(self.cur, pred::IULT, flat, max));
         let at = self.begin_guarded(guard);
         let c = self.cur;
+        let x = self.s.m.load(c, slot);
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut args = vec![flat];
+        // Each corner is a 9-bit index with an edge flag above it. Bit 31
+        // culls the primitive by giving it zero area.
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
@@ -10145,7 +10151,6 @@ impl<'a> Lower<'a> {
         self.s
             .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
-        Ok(())
     }
 
     /// The per-vertex arbitrary row no mesh output entry names but one
@@ -10223,6 +10228,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
+                self.finish_mesh_primitive();
                 Term::Ret
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
@@ -10499,7 +10505,11 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let current = self.cur;
+        self.cur = a;
+        self.finish_mesh_primitive();
+        self.s.m.terminate(self.cur, Term::Ret);
+        self.cur = current;
         self.abort = Some(a);
         a
     }

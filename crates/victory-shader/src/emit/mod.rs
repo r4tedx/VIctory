@@ -1577,12 +1577,12 @@ mod tests {
     /// The culling bit.
     const CULL: u32 = 1 << 31;
 
-    /// A one-wave (32-lane) triangle mesh program whose lanes all export
-    /// primitive `prim` and, as vertex `lane`, the position
+    /// A one-wave (32-lane) triangle mesh program. Each lane exports every
+    /// word in `primitives` and, as vertex `lane`, the position
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
-    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
-        let words = [
+    fn triangle_mesh(primitives: &[u32]) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
             0x3604_0281, // v_and_b32 v2, 1, v1
@@ -1595,14 +1595,21 @@ mod tests {
             0x060A_0AF3, // v_add_f32 v5, -1.0, v5
             0x7E0C_02F0, // v_mov_b32 v6, 0.5
             0x7E0E_02F2, // v_mov_b32 v7, 1.0
-            0x7E12_02FF, // v_mov_b32 v9, prim
-            prim,
-            0xF800_0941, // exp prim v9, off, off, off done
-            0x0000_0009,
+        ];
+        for (i, &prim) in primitives.iter().enumerate() {
+            let done = u32::from(i + 1 == primitives.len()) << 11;
+            words.extend([
+                0x7E12_02FF, // v_mov_b32 v9, prim
+                prim,
+                0xF800_0141 | done, // exp prim v9, off, off, off
+                0x0000_0009,
+            ]);
+        }
+        words.extend([
             0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
             0x0706_0504,
             0xBF81_0000, // s_endpgm
-        ];
+        ]);
         let native = NativeProgram {
             stage: HwStage::Ms,
             wave64: false,
@@ -1660,7 +1667,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let ms = triangle_mesh(&[prim]).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())
@@ -1703,12 +1710,16 @@ mod tests {
                 eprintln!("no mesh shaders on the {label} device; skipped");
                 continue;
             }
-            for (prim, culled) in [
-                (TRIANGLE, false),
-                (TRIANGLE | EDGE_FLAGS, false),
-                (TRIANGLE | EDGE_FLAGS | CULL, true),
-            ] {
-                let ms = triangle_mesh(prim).unwrap();
+            let cases: [(&[u32], bool); 6] = [
+                (&[TRIANGLE], false),
+                (&[TRIANGLE | EDGE_FLAGS], false),
+                (&[TRIANGLE | EDGE_FLAGS | CULL], true),
+                (&[], true),
+                (&[TRIANGLE, TRIANGLE | CULL], true),
+                (&[TRIANGLE | CULL, TRIANGLE | EDGE_FLAGS], false),
+            ];
+            for (primitives, culled) in cases {
+                let ms = triangle_mesh(primitives).unwrap();
                 let root = host
                     .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();
@@ -1732,12 +1743,12 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
                 let lit = texels.iter().filter(|t| t[3] != 0.0).count();
                 if culled {
-                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                    assert_eq!(lit, 0, "{label}, {primitives:#x?}: unexpected lit texels");
                     continue;
                 }
                 assert!(
                     texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
-                    "{label}, {prim:#x}: {lit} of 256 texels lit"
+                    "{label}, {primitives:#x?}: {lit} of 256 texels lit"
                 );
             }
             eprintln!("{label}: edge-flagged triangles drew");
