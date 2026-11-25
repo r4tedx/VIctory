@@ -697,3 +697,220 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     };
     assert_eq!(what, "a hardware SGPR input");
 }
+
+/// A program whose lanes read their row neighbours, in a console group of
+/// `[x, y, z]` threads: each thread takes its flat id `x + X * (y + Y * z)`
+/// from its thread id, reads lane `^ 15`'s (`v_mov_b32_dpp row_xmask:15`)
+/// and stores it at its own flat id. On the console thread `f` stores
+/// `f ^ 15` (its wave holds flat ids in order).
+fn reads_its_row_neighbour(shape: [u32; 3], wave64: bool) -> NativeProgram {
+    let [x, y, z] = shape;
+    assert!(x <= 64, "an inline multiplier");
+    let ids = if z > 1 { 2 } else { 1 };
+    let mut code: Vec<u32> = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0000,                               // s_load_dwordx4 s[40:43], s[4:5], 0x0
+        0x0B << 25 | 3 << 17 | 1 << 9 | (128 + x), // v_mul_u32_u24 v3, x, v1
+        0x4A06_0700,                               // v_add_nc_u32 v3, v0, v3
+    ];
+    if z > 1 {
+        code.extend([
+            0x160A_04FF,
+            x * y,       // v_mul_u32_u24 v5, x * y, v2
+            0x4A06_0705, // v_add_nc_u32 v3, v5, v3
+        ]);
+    }
+    code.extend([
+        0x7E0E_02FA,
+        0xFF01_6F03, // v_mov_b32_dpp v7, v3 row_xmask:15 row_mask:0xf bank_mask:0xf
+        0x3408_0682, // v_lshlrev_b32 v4, 2, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x800A_0704, // buffer_store_dword v7, v4, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        // One user SGPR; thread ids x and y, and z for 3-D groups.
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1 | ids << 11,
+            threads: shape,
+        }),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// The host group a lowered compute program declares (`PSV0`) and its
+/// wave size, if any.
+fn host_group(dxil: &[u8]) -> ([u32; 3], Option<u32>) {
+    let c = crate::dxbc::Container::parse(dxil).expect("container");
+    let d = c.part(crate::dxbc::FourCC::PSV0).expect("PSV0").data;
+    let at = |o: usize| crate::dxbc::u32_at(d, 4 + o).expect("PSV0 runtime info");
+    let wave = (at(16) == at(20) && at(16) != 0).then(|| at(16));
+    ([at(36), at(40), at(44)], wave)
+}
+
+/// Shapes whose host waves an RTX 5070 Ti fills in 16 by 2 tiles (#2126's
+/// measurements: 2-D groups 24, 32 or 64 wide, or not a power of two
+/// wide), rows, and 3-D blocks.
+const GROUPS: [[u32; 3]; 9] = [
+    [8, 8, 1],
+    [32, 2, 1],
+    [32, 4, 1],
+    [64, 2, 1],
+    [24, 8, 1],
+    [12, 16, 1],
+    [16, 16, 1],
+    [4, 4, 4],
+    [8, 8, 2],
+];
+
+/// Threads relabelled so that their host lane is their console lane run in
+/// a 1-D host group, whose waves every host fills with runs of flat ids in
+/// order; the console's x, y and z come from the flat id. So each thread
+/// gets its own id and reads its console neighbour's, whatever a host does
+/// with 2-D groups.
+#[test]
+fn relabelled_threads_run_in_a_one_dimensional_host_group() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // WARP only: it refuses `WaveSize(32)`, so the waves of 32 only lower.
+    let host = Host::new(true).ok();
+    if host.is_none() {
+        eprintln!("no SM 6.6 WARP device; lowering checked only");
+    }
+    let mut wrong = Vec::new();
+    for wave64 in [false, true] {
+        for shape in GROUPS {
+            let n: u32 = shape.iter().product();
+            let wave = if wave64 { 64 } else { 32 };
+            if !n.is_multiple_of(wave) {
+                continue;
+            }
+            let l = lowered(&reads_its_row_neighbour(shape, wave64)).expect("lower");
+            assert_eq!(
+                host_group(&l.dxil),
+                ([n, 1, 1], Some(wave)),
+                "{shape:?} wave{wave}: the host group"
+            );
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut l.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{shape:?} wave{wave}: {e}"));
+            }
+            let Some(host) = &host else { continue };
+            let cs = HostShader {
+                stage: HwStage::Cs,
+                dxil: l.dxil,
+                user_data: l.user_data,
+                samplers: l.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                memory: l.memory,
+                memory_writes: l.memory_writes,
+                view_addresses: l.view_addresses,
+                heap: l.heap,
+                heap_writes: l.heap_writes,
+                view_marks: l.view_marks,
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&cs) else {
+                eprintln!(
+                    "{shape:?} wave{wave}: WARP refuses WaveSize({wave}); lowering checked only"
+                );
+                continue;
+            };
+            let ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(n)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{shape:?} wave{wave}: {e}"));
+            let want: Vec<u32> = (0..n).map(|f| f ^ 15).collect();
+            eprintln!("{shape:?} wave{wave}: ran on WARP");
+            if out[0] != want {
+                wrong.push(format!(
+                    "{shape:?} wave{wave}: {:?}",
+                    &out[0][..n.min(64) as usize]
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// The relabelling (`Lower::thread_id`) over host layouts: the flat ids each
+/// host wave holds, in lane order, give each thread `first & !31` plus its
+/// lane. In order (a 1-D group on every host measured) every id is taken
+/// once; in 16 by 2 tiles (2-D groups 32 wide on an RTX 5070 Ti, #2126) two
+/// waves take the same ids. Models the host for waves of 32, which WARP does
+/// not run.
+#[test]
+fn the_relabelling_needs_waves_of_flat_ids_in_order() {
+    let relabel = |waves: &[Vec<u32>]| {
+        let mut ids: Vec<u32> = waves
+            .iter()
+            .flat_map(|w| {
+                let base = w[0] & !31;
+                (0..w.len() as u32).map(move |lane| base + lane)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    for [x, y] in [[32, 2], [32, 8], [64, 4], [16, 16]] {
+        let n = x * y;
+        let in_order: Vec<Vec<u32>> = (0..n).step_by(32).map(|b| (b..b + 32).collect()).collect();
+        assert_eq!(relabel(&in_order), n as usize, "{x}x{y} in order");
+        let mut tiles = Vec::new();
+        for by in (0..y).step_by(2) {
+            for bx in (0..x).step_by(16) {
+                tiles.push(
+                    (0..2)
+                        .flat_map(|dy| (0..16).map(move |dx| (by + dy) * x + bx + dx))
+                        .collect::<Vec<u32>>(),
+                );
+            }
+        }
+        // Tiles are rows only when a row is 16 wide.
+        let taken = relabel(&tiles);
+        if x == 16 {
+            assert_eq!(taken, n as usize, "{x}x{y} in tiles");
+        } else {
+            assert_eq!(taken, n as usize / 2, "{x}x{y} in tiles");
+        }
+    }
+}

@@ -580,6 +580,16 @@ impl<'a> Lower<'a> {
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            // Relabelled threads (`Lower::thread_id`) run in a 1-D host
+            // group of the same size: hosts fill a 1-D group's waves with
+            // runs of flat ids in order, as the relabelling needs, but not
+            // always a 2-D or 3-D group's (an RTX 5070 Ti fills groups 24,
+            // 32 or 64 wide, or not a power of two wide, in 16 by 2 tiles,
+            // so two waves would take the same ids). The console's x, y and
+            // z come from the flat id.
+            if console_lanes {
+                s.threads = s.threads.map(|t| [t.iter().product(), 1, 1]);
+            }
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -2790,12 +2800,17 @@ impl<'a> Lower<'a> {
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
+    /// wave-aligned run of flat ids, as the console's waves do and the
+    /// host's do in the 1-D group such a program runs in.) The console's
+    /// group shape gives x, y and z.
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let StageIo::Cs(cs) = self.x.native.io else {
+            unreachable!("console lanes are compute's")
+        };
+        let [x, y, _] = cs.threads;
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
