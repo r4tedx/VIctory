@@ -192,6 +192,10 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        if let Some(cap) = crate::descriptor::host::view_heap_cap(&device) {
+            victory_shader::emit::set_view_heap_limit(cap);
+            tracing::info!(cap, "host view heaps capped: translated shaders keep their view indices below the cap");
+        }
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(

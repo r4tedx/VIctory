@@ -28,8 +28,8 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// are at least this large (or the smaller host view cap), the slots past
+/// their own null (`emit`, "Heap indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
@@ -149,6 +149,8 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// View heap indices stay below this ([`super::view_heap_limit`]).
+    view_limit: Option<u32>,
 }
 
 impl Shader {
@@ -211,6 +213,7 @@ impl Shader {
             lds: None,
             main,
             entry,
+            view_limit: super::view_heap_limit(),
         }
     }
 
@@ -542,7 +545,12 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let limit = if sampler {
+            HEAP_SAMPLERS
+        } else {
+            self.view_limit.unwrap_or(HEAP_VIEWS).min(HEAP_VIEWS)
+        };
+        let last = self.m.i32(limit - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -1038,15 +1046,16 @@ impl Shader {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
-    use super::super::bitcode::Term;
     use super::*;
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no
     /// thread-group size), pixel or compute program.
+    #[cfg(windows)]
     fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        use super::super::bitcode::Term;
         let mut s = Shader::new(pixel);
         s.threads = threads;
         let b = s.entry;
@@ -1070,6 +1079,7 @@ mod tests {
     /// not, nor a vertex program whose UAVs all come from the heap (the
     /// validator counts declared ranges only: 26 mesh and vertex programs).
     #[test]
+    #[cfg(windows)]
     fn uavs_outside_pixel_and_compute_programs_are_declared() {
         let mut validator = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
@@ -1085,6 +1095,31 @@ mod tests {
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
+    fn handle_index(limit: Option<u32>, sampler: bool, index: u32) -> u32 {
+        let mut s = Shader::new(false);
+        s.view_limit = limit;
+        let index = s.m.i32(index);
+        s.heap_handle(s.entry, index, sampler, false, (0, 0));
+        s.m.heap_handle_index()
+    }
+
+    /// The actual index passed to DXIL respects the host cap, the upstream
+    /// view bound and the independent sampler bound, including wraparound.
+    #[test]
+    fn heap_handles_stay_inside_the_host_limits() {
+        for (cap, sampler, limit) in [
+            (None, false, HEAP_VIEWS),
+            (Some(1_000_000), false, 1_000_000),
+            (Some(HEAP_VIEWS + 1), false, HEAP_VIEWS),
+            (None, true, HEAP_SAMPLERS),
+            (Some(1_000_000), true, HEAP_SAMPLERS),
+        ] {
+            for index in [0, limit - 2, limit - 1, limit, 1_200_000, u32::MAX] {
+                assert_eq!(handle_index(cap, sampler, index), index.min(limit - 1));
             }
         }
     }

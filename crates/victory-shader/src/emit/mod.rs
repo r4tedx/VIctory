@@ -263,6 +263,25 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Size of the host's view heap when the host caps it below the title's
+/// (0: not capped).
+static VIEW_HEAP_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Translations from now on keep view heap indices below `slots`, the size
+/// of a host view heap whose last slot is null. Set before the first
+/// translation: the value is part of it, so the shader cache keys on it.
+pub fn set_view_heap_limit(slots: u32) {
+    VIEW_HEAP_LIMIT.store(slots, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The limit [`set_view_heap_limit`] set, if any.
+pub fn view_heap_limit() -> Option<u32> {
+    match VIEW_HEAP_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
