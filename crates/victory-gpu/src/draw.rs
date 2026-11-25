@@ -998,6 +998,14 @@ impl State {
         [views, sampler]
     }
 
+    /// Tests that bind descriptor heaps of their own: the state takes them
+    /// for the ones it would bind for a title that binds none, so it does
+    /// not replace them with its fallback sampler heap.
+    #[cfg(test)]
+    pub(crate) fn heaps_bound_by_caller(&mut self) {
+        self.host_heaps = Self::wanted(self.heaps, false);
+    }
+
     /// Gives the host list the title's heaps if it has others.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = Self::wanted(self.heaps, memory_heap);
@@ -1401,6 +1409,19 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A shader emitted as one console wave per host group runs that
+        // many host groups per console group, along x.
+        let waves = group_waves(p);
+        let Some(x) = x.checked_mul(waves).filter(|&x| x <= 65535 || waves == 1) else {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a dispatch of more host groups than D3D12 runs in a dimension dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -2097,8 +2118,16 @@ impl State {
             },
             None => None,
         };
+        // A ready multi-wave pipeline needs packed, scaled arguments.
+        // Otherwise keep the original clamp-before-prepare order.
+        let pipeline = self.pipeline as This;
+        let compute = || crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        let dispatch = (kind == DISPATCH).then(compute).flatten();
+        let waves = dispatch.map_or(1, group_waves);
+        let rewrite = waves > 1;
+        let host_stride = if rewrite { 12 } else { stride };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| host_signature(kind, host_stride))
             .flatten()
         else {
             why("no host signature");
@@ -2122,9 +2151,28 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Clamped in the open window of the list's indirect executions
-        // (`crate::indirect::batching`), or on its own here.
-        let batched = (crate::indirect::batching() && max != 0)
+        // A multi-wave dispatch's records are rewritten into a list-owned
+        // buffer, bounded and scaled (the title's buffers left as they are),
+        // after any open window of clamps: like a command that writes GPU
+        // memory, it ends the window. The others are clamped in the open
+        // window of the list's indirect executions
+        // (`crate::indirect::batching`), or on their own here.
+        let rewritten = if rewrite {
+            crate::indirect::end(list);
+            let Some(buffer) = crate::indirect::dispatch(
+                list,
+                args.gpu(arguments),
+                counter.as_ref().map(|(s, at)| s.gpu(*at)),
+                (stride, max, waves),
+            ) else {
+                why("dispatch arguments could not be rewritten");
+                return false;
+            };
+            Some(buffer)
+        } else {
+            None
+        };
+        let batched = (rewritten.is_none() && crate::indirect::batching() && max != 0)
             .then(|| {
                 // Host addresses as a copy's start and the offset in it.
                 let at = |s: &crate::shadow::Shadow, a: u64| (s.gpu(a) - s.offset(a), s.offset(a));
@@ -2133,9 +2181,9 @@ impl State {
             })
             .flatten();
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let clamped = match batched {
-            Some(_) => None,
-            None => {
+        let clamped = match (&rewritten, &batched) {
+            (Some(_), _) | (None, Some(_)) => None,
+            (None, None) => {
                 let Some(clamped) = crate::indirect::bound(
                     list,
                     (&args.buffer, args.gpu(arguments)),
@@ -2148,10 +2196,12 @@ impl State {
                 Some(clamped)
             }
         };
-        let done = |list: &HostList| {
-            if let Some(clamped) = &clamped {
-                crate::indirect::done(list, clamped);
-            }
+        // What runs, put back after: the rewritten records (their count in
+        // the same buffer), or the list's clamped records.
+        let done = |list: &HostList| match (&rewritten, &clamped) {
+            (Some(buffer), _) => crate::indirect::done(list, buffer),
+            (None, Some(clamped)) => crate::indirect::done(list, clamped),
+            (None, None) => {}
         };
         if batched.as_ref().is_none_or(|b| b.opened) {
             self.host_pipeline = 0;
@@ -2165,10 +2215,11 @@ impl State {
                 }) && self.prepare(list, kind == INDEXED)
             }
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            // A pipeline may become ready during the clamp. It can use
+            // these arguments only if their wave count matches.
+            DISPATCH => dispatch
+                .or_else(compute)
+                .is_some_and(|p| group_waves(p) == waves && self.bind(list, p, true)),
             _ => false,
         };
         if !ran {
@@ -2192,13 +2243,15 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // Rewritten: packed records of 12 bytes, the count after them.
         // Batched: the clamped records and count, in the list's memory.
         // Else the list's own clamped records (`crate::indirect::bound`) and
         // the title's count.
-        let (records, count) = match (&batched, &clamped) {
-            (Some(b), _) => ((&b.buffer, b.offset), counter.as_ref().map(|_| (&b.buffer, b.count))),
-            (None, Some(clamped)) => ((clamped, 0), counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)))),
-            (None, None) => unreachable!("bounded above"),
+        let (records, count) = match (&rewritten, &batched, &clamped) {
+            (Some(b), _, _) => ((b, 0), Some((b, u64::from(max) * 12))),
+            (None, Some(b), _) => ((&b.buffer, b.offset), counter.as_ref().map(|_| (&b.buffer, b.count))),
+            (None, None, Some(clamped)) => ((clamped, 0), counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)))),
+            (None, None, None) => unreachable!("bounded above"),
         };
         // The count where the execution reads it, for the stand-ins after
         // it: the same value, whatever the records then write.
@@ -2229,7 +2282,8 @@ impl State {
                 && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
             if always || crate::capture::dump_on() {
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, records, count, (kind, stride, max), name, always);
+                let record_stride = if rewritten.is_some() { 12 } else { stride };
+                crate::capture::read_indirect(list, records, count, (kind, record_stride, max), name, always);
             }
         }
         done(list);
@@ -2283,6 +2337,14 @@ fn count_predicate<'a>(list: &'a HostList, buffer: &ID3D12Resource, offset: u64)
         list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
     }
     Some(predicate)
+}
+
+/// Host thread groups per console thread group of a compute pipeline
+/// (`HostShader::group_waves`).
+fn group_waves(p: &HostPipeline) -> u32 {
+    p.stages
+        .first()
+        .map_or(1, |s| s.translated().host.group_waves.max(1))
 }
 
 /// The host command signature for one argument of `kind` with records

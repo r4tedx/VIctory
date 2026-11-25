@@ -143,10 +143,16 @@ fn create() -> windows::core::Result<Host> {
     unsafe {
         // The debug layer only in builds with diagnostics.
         let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        let mut debug_enabled = false;
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
+                Ok(()) => {
+                    if let Some(l) = &layer {
+                        l.EnableDebugLayer();
+                        debug_enabled = true;
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
@@ -187,9 +193,21 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            // Whether a GPU hang ends the run or freezes the PC (#1054).
-            crate::tdr::log();
+            #[cfg(test)]
+            if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1")
+                || std::env::var("VICTORY_ADAPTER").is_ok_and(|v| !v.is_empty())
+            {
+                device = Some(
+                    victory_shader::emit::host::Host::new(false)
+                        .map_err(|e| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e))?
+                        .device,
+                );
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                // Whether a GPU hang ends the run or freezes the PC (#1054).
+                crate::tdr::log();
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         if let Some(cap) = crate::descriptor::host::view_heap_cap(&device) {
@@ -205,7 +223,7 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
-        let messages = debug
+        let messages = debug_enabled
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
@@ -865,6 +883,8 @@ pub(crate) struct HostList {
     /// A predicate for stand-ins after an indirect dispatch with a count
     /// ([`HostList::predicate`]), made on first use.
     predicate: OnceLock<Option<ID3D12Resource>>,
+    /// Indirect compute records rewritten on the GPU, reused after execution.
+    dispatch_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1251,6 +1271,7 @@ impl Host {
                 clamps: Mutex::default(),
                 clamps_open: false.into(),
                 predicate: OnceLock::new(),
+                dispatch_args: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1263,6 +1284,25 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.submit(runs);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_checked(&self, list: &HostList) {
+        let error = self.submit(&[list]);
+        if self.messages.is_some() {
+            assert_eq!(error, None, "D3D12 debug layer reported an error");
+            eprintln!("D3D12 debug layer checked: no errors");
+        } else if !cfg!(feature = "diagnostics") {
+            eprintln!("D3D12 debug layer check skipped: diagnostics feature disabled");
+        } else if !crate::switch::on("VICTORY_D3D12_DEBUG") {
+            eprintln!("D3D12 debug layer check skipped: VICTORY_D3D12_DEBUG unset");
+        } else {
+            eprintln!("D3D12 debug layer check skipped: debug layer or info queue unavailable");
+        }
+    }
+
+    fn submit(&self, runs: &[&HostList]) -> Option<String> {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1556,7 +1596,7 @@ impl Host {
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
-        self.log_messages();
+        let error = self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
@@ -1573,6 +1613,7 @@ impl Host {
             }
             crate::capture::dump_submission(sub, &targets);
         }
+        error
     }
 
     /// How host GPU timestamps map onto the title's GPU clock
@@ -2602,11 +2643,66 @@ impl HostList {
         Some(made)
     }
 
+    /// The caller must have waited for the list to finish.
+    #[cfg(test)]
+    pub(crate) unsafe fn indirect_budget_words(&self) -> [u32; 2] {
+        let (_, data) = self.budget.get().unwrap().as_ref().unwrap();
+        // SAFETY: the live mapped buffer contains both words; the GPU is done.
+        unsafe { (*data as *const [u32; 2]).read() }
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn dispatch_args(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let mut slot = self.dispatch_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, size)) = &*slot
+            && *size >= bytes
+        {
+            return Some(buffer.clone());
+        }
+        let size = bytes.max(64 << 10).next_multiple_of(256);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer = None;
+        // SAFETY: a valid default-heap buffer description and out pointer.
+        unsafe {
+            host()?
+                .device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        let buffer: ID3D12Resource = buffer?;
+        if let Some((old, _)) = slot.replace((buffer.clone(), size)) {
+            self.keep(&old);
+        }
+        Some(buffer)
     }
 
     /// Whether this is the first time since the reset that the list asks

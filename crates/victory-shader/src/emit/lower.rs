@@ -15,7 +15,7 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -81,6 +81,8 @@ pub(crate) struct Lowered {
     /// Whether depth and stencil are tested before it runs.
     #[cfg(test)]
     pub early_depth: bool,
+    /// See [`super::HostShader::group_waves`].
+    pub group_waves: u32,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -340,6 +342,11 @@ struct Lower<'a> {
     /// Why a wave64 program that needs its whole wave cannot take the
     /// console flow on a host without 64-lane waves.
     no_console_flow: Option<Why>,
+    /// Console waves per console thread group, where each is emitted as a
+    /// host group of its own (else 1): see [`super::HostShader::group_waves`].
+    group_waves: u32,
+    /// The console's thread-group size (compute).
+    console_threads: [u32; 3],
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -515,7 +522,20 @@ pub(crate) const IMPLICIT_SAMPLE_IN_HALVES: Why =
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    reads_as_data(i, |v| {
+        st.masks.contains_key(&v) || st.highs.contains_key(&v)
+    })
+}
+
+/// Whether `v` is a lane mask in any form the structure knows: a mask, the
+/// high dword of one, or one held as a number ([`Structured::other`], as
+/// an exit mask grown from 0 is).
+fn any_mask(st: &Structured, v: Value) -> bool {
+    st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.other.contains_key(&v)
+}
+
+/// Instructions that read a value `is_mask` says is a lane mask as a number.
+fn reads_as_data(i: &Inst, is_mask: impl Fn(Value) -> bool) -> bool {
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
@@ -534,7 +554,7 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(&is_mask),
         _ => false,
     })
 }
@@ -694,8 +714,11 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut group_waves = 1;
+        let mut console_threads = [0; 3];
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
+            console_threads = cs.threads;
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
@@ -787,10 +810,30 @@ impl<'a> Lower<'a> {
             // the console's instruction order: the console flow, for a group
             // of one console wave. What keeps a program out of it is the
             // reason it stops with.
-            let needs_wave64 =
-                (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
+            // (The console flow is lowered again for such a program: what
+            // made it one may not show in that pass, as a select on a mask
+            // held as a number does not until its result is needed, and the
+            // group's form must come out the same.)
+            let needs_wave64 = x.native.wave64
+                && (x.console_cf || (console_lanes || one_wave && s.lds_dwords > 0) && !split);
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                // A group of several console waves that share no LDS and
+                // never meet at a barrier: its waves share nothing but what
+                // every group shares, so each becomes a host group of its
+                // own (64 threads), which is one console wave in the
+                // console flow. The dispatch runs that many times the
+                // groups (`HostShader::group_waves`).
+                let n: u32 = cs.threads.iter().product();
+                if n > 64
+                    && n.is_multiple_of(64)
+                    && s.lds_dwords == 0
+                    && !insts().any(|i| i.name() == "s_barrier")
+                    && x.target.runs(32)
+                {
+                    group_waves = n / 64;
+                    s.threads = Some([64, 1, 1]);
+                }
+                no_console_flow = if group_waves == 1 && n > 64 {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -798,9 +841,14 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if s
+                    .threads
+                    .map(|t| t.iter().product::<u32>())
+                    .is_some_and(|n| n != 64 && n > 32)
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
+                    // (A group of 32 threads or fewer is the lower half
+                    // alone: its sections are that one host wave's.)
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
                 } else {
                     None
@@ -834,6 +882,25 @@ impl<'a> Lower<'a> {
                     .exits
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
+                && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            // A lane mask joined where lanes arrive by different paths (a
+            // loop its lanes leave at different iterations, a branch only
+            // some take) is, per lane, what that lane's path saw of it. Read
+            // as a number after the join (a count, a first bit, a compare)
+            // it gave each lane its own answer, or stopped the program; on
+            // the console the mask is the wave's. Such a program takes the
+            // console flow too, and keeps the per-lane form if that cannot
+            // lower it. (On a host without the console's wave size it
+            // already needs the console's lanes for the read.)
+            let joined_mask = p.blocks.iter().zip(&x.st.divergent_joins).any(|(b, &d)| {
+                d && b.phis.iter().any(|phi| {
+                    matches!(phi.reg, Reg::S(r) if ![EXEC, EXEC + 1, VCC, VCC + 1].contains(&r))
+                        && any_mask(x.st, phi.value)
+                })
+            });
+            wants_console_flow |= x.target.runs(wave)
+                && joined_mask
+                && insts().any(|i| reads_as_data(i, |v| any_mask(x.st, v)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
             if x.console_cf {
                 console_lanes = true;
@@ -949,6 +1016,8 @@ impl<'a> Lower<'a> {
             console_cf: x.console_cf,
             wants_console_flow,
             no_console_flow,
+            group_waves,
+            console_threads,
             console_flat: None,
             xchg: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -1558,7 +1627,11 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        if self.console_cf && self.split {
+        // A group of 32 threads or fewer has no upper half: the console
+        // wave's other lanes are in no mask a section reduces over, so the
+        // one host wave's reduction is the console wave's.
+        let halves = self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 32);
+        if self.console_cf && self.split && halves {
             // The halves exchange dwords: a float goes as its bits. (The
             // console adds a wave's floats in its own order, the host's
             // wave operations in theirs, and the halves' sums are added
@@ -1627,6 +1700,14 @@ impl<'a> Lower<'a> {
     fn run(mut self) -> Result<Lowered, Stop> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
+        }
+        // The console flow's group barriers are reached by every thread
+        // only in a group of one console wave.
+        if self.x.console_cf
+            && self.s.wave_size == Some(32)
+            && let Some(why) = self.no_console_flow
+        {
+            return Err(unsupported(0, why));
         }
         if let Some(n) = self.s.wave_size
             && !self.x.target.runs(n)
@@ -1768,6 +1849,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            group_waves: self.group_waves,
         })
     }
 
@@ -1842,6 +1924,9 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.group_waves > 1 => {
+                return Val::I32(self.host_group_x().0);
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -3291,9 +3376,17 @@ impl<'a> Lower<'a> {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self.console_threads;
         let e = self.s.entry;
-        let f = self.console_flat();
+        let mut f = self.console_flat();
+        if self.group_waves > 1 {
+            // This host group is one console wave of the console's group:
+            // the wave the host group id names, 64 flat ids each.
+            let wave = self.host_group_x().1;
+            let k6 = self.s.m.i32(6);
+            let first = self.s.m.bin(e, Bin::Shl, wave, k6);
+            f = self.s.m.bin(e, Bin::Add, first, f);
+        }
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -3303,6 +3396,21 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// The console's group id x and the console wave within that group,
+    /// from the host's group id x: with [`Self::group_waves`] host groups
+    /// per console group, consecutive in x.
+    fn host_group_x(&mut self) -> (V, V) {
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let k = self.s.m.i32(self.group_waves);
+        (
+            self.s.m.bin(e, Bin::UDiv, g, k),
+            self.s.m.bin(e, Bin::URem, g, k),
+        )
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's

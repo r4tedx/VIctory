@@ -4,10 +4,11 @@ Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
 half, divergent branches and loops, LDS shared in the console's
-instruction order, and (in groups of exactly 64 threads) whole-wave
-reductions and prefix sums, of integers and floats. Still open: groups of
-several console waves, whole-wave sections in other groups, and
-`ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
+instruction order, and (in groups of exactly 64 threads, or of 32 or
+fewer) whole-wave reductions and prefix sums, of integers and floats. A group of several
+console waves that share no LDS runs as one host group per wave. Still
+open: groups whose waves share LDS, whole-wave sections in other group
+sizes, and `ds_permute`; each stops with its own reason. (`ds_bpermute` gathers within each 32-lane half
 and is lowered as an in-half read, like `ds_swizzle`.)
 
 ## The problem
@@ -122,7 +123,7 @@ does (step 5, `lower::CONSOLE_FLOW`):
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
 waves, at most 64 threads per group, no `ds_permute`, and whole-wave
-sections only in a group of exactly 64 threads.
+sections only in a group of exactly 64 threads or of 32 or fewer.
 
 **LDS.** The console runs an instruction in all 64 lanes before the next,
 so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
@@ -145,7 +146,11 @@ halves, where the section is lowered: each half's reduction is exchanged
 and the two are combined with the section's own operation (sum, and, or,
 xor, minimum, maximum of integers); a prefix sum in the upper half adds the
 lower half's total. Only in a group of exactly 64 threads, so both halves
-are whole. Floats cross as their bits: minimum and maximum stay exact, and
+are whole, or of 32 threads or fewer, which is the lower half alone: the
+console wave's other lanes are in no mask a section reduces over, so the
+one host wave's reduction is the console wave's and nothing is exchanged
+(combined as in a full wave, a minimum or an AND would take the absent
+half's 0). Floats cross as their bits: minimum and maximum stay exact, and
 a sum is each half's sum added last, one more order of additions next to
 the console's and the host wave's own (the last bits may differ, as they
 already may in one host wave). A title run on #439 put sections next: 24
@@ -153,9 +158,9 @@ of the 45 programs the stack still stopped.
 
 What still stops says why: `console wave64 lanes in a group of more than 64
 threads`, `ds_permute across the halves`, or `a whole-wave section` (in
-other groups), each `on a host without 64-lane waves`.
+groups of 33 to 63 threads), each `on a host without 64-lane waves`.
 
-### Groups of several console waves (planned)
+### Groups of several console waves
 
 A group barrier is reached by every thread of the group only where all its
 console waves branch alike, and they need not: each console wave takes its
@@ -174,19 +179,24 @@ title's shaders, 43 programs stopped for their group size): groups of
 (2) and 32x32x1 (1). Nearly all count mask bits (`v_mbcnt`) and read a mask
 as a number; about two thirds have no LDS and no `s_barrier`.
 
-**Without LDS: one console wave per host group.** The console waves of
-such a group share nothing but the resources every group shares, so they
-can be separate host groups. The program is emitted with 64 threads per
+**Without LDS: one console wave per host group** (in). The console waves
+of such a group share nothing but the resources every group shares, so
+they are separate host groups. The program is emitted with 64 threads per
 group, and a dispatch of (x, y, z) groups of k console waves each becomes
 (x * k, y, z) host groups: host group id x gives the console group
 (x / k) and the wave in it (x % k), the flat thread id is 64 * wave +
 the id in the host group, and the console's thread and group ids follow
 from those. Each host group is then one console wave in two host waves,
-which is the console flow as it is. Needed outside the translator: the
-emitted shader says its k, direct dispatches multiply x (within D3D12's
-65535 groups per dimension; refuse beyond), and indirect dispatches
-multiply the record's x where the indirect records are already rewritten
-(`victory-gpu`'s clamp pass).
+which is the console flow as it is, whole-wave sections included. Taken
+by a wave64 group of a multiple of 64 threads with no LDS and no
+`s_barrier`. The emitted shader says its k (`HostShader::group_waves`,
+kept in the shader cache); `victory-gpu` multiplies a direct dispatch's x
+and drops the dispatch if that passes D3D12's 65535 groups per dimension.
+For k > 1, an indirect dispatch bounds and scales the records on the GPU
+in a list-owned buffer, with the effective count beside them. The title's
+arguments and count stay available to later GPU writers. Dispatches at
+k = 1 use the ordinary in-place clamp. The per-record cap is 2^20 host
+groups, which allows at most floor(2^20 / k) console groups.
 
 **With LDS and `s_barrier`:** the waves of a group do meet there, so they
 must stay one host group. Open; candidates are group barriers where every
@@ -247,8 +257,9 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
 6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
    console flow).~~
-7. Multi-wave groups without LDS: one console wave per host group (the
-   translator's ids, then direct and indirect dispatch counts).
+7. ~~Multi-wave groups without LDS: one console wave per host group.~~
+   Direct dispatch scales X on the CPU. Indirect dispatch scales X and
+   applies host work limits on the GPU in a list-owned argument buffer.
 8. Multi-wave groups with LDS.
 
 ## Credit

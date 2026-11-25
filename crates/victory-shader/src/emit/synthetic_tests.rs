@@ -119,6 +119,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        group_waves: lowered.group_waves,
     })
 }
 
@@ -714,6 +715,7 @@ fn pixel_programs_tested_before_they_run_keep_that_order() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        group_waves: l.group_waves,
     };
     let (early, late) = (pixel(early), pixel(late));
     let vs = super::host::position_vs();
@@ -846,6 +848,7 @@ fn a_program_tested_first_that_exports_depth_keeps_the_flag() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        group_waves: l.group_waves,
     };
     let vs = super::host::position_vs();
     let triangle = [

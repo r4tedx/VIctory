@@ -68,7 +68,7 @@ impl Pending {
         }
     }
 
-    fn make(&self) {
+    pub(super) fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());

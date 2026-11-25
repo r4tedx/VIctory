@@ -464,6 +464,30 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_pipeline(host: victory_shader::emit::HostShader) -> This {
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: Vec::new(),
+        })),
+    });
+    let mut out = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &[], &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    pipeline(out).host.make();
+    assert!(
+        host_pipeline(out).is_some(),
+        "host compute pipeline unavailable"
+    );
+    out
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,

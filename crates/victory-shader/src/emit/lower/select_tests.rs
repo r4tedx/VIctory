@@ -70,18 +70,15 @@ fn selects_from_independently_written_mask_words() {
             lanes_max: 32,
         };
         for target in [wave32_only, super::super::Target::ANY] {
-            let result = emit(&c, &native, &p, &st, &io, &res, target);
-            if uses_select && threads > 64 && !target.runs(64) {
-                assert!(matches!(
-                    result,
-                    Err(crate::ShaderError::Unsupported {
-                        what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                        ..
-                    })
-                ));
-                continue;
-            }
-            let shader = result.unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res, target).unwrap();
+            // Without 64-lane waves, a group of two console waves that
+            // needs its whole wave is one host group per wave.
+            let waves = if uses_select && threads > 64 && !target.runs(64) {
+                threads / 64
+            } else {
+                1
+            };
+            assert_eq!(shader.group_waves, waves);
             let emitted = Container::parse(&shader.dxil).unwrap();
             let features = emitted.part(FourCC::SFI0).unwrap();
             let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
