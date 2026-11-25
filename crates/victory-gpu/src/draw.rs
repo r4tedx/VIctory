@@ -91,19 +91,27 @@ pub(crate) struct State {
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
     /// The run of dynamic slots root views take from (view heap, next
-    /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
-    /// do not break up the runs fresh tables need.
+    /// slot, end): taken [`ROOT_VIEW_RUN`] at a time where the heap has a
+    /// run that long, so that single slots do not break up the runs fresh
+    /// tables need; what it has left goes back when the list closes or
+    /// takes another run ([`State::trim_root_run`]).
     root_run: (usize, u32, u32),
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
+            give_back(heap, first, n);
         }
+    }
+}
+
+/// Gives back `n` dynamic slots from `first` of the view heap keyed
+/// `heap` (a title heap's, or [`MEMORY_HEAP`]).
+fn give_back(heap: usize, first: u32, n: u32) {
+    match (heap, crate::memory::heap()) {
+        (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
+        _ => crate::descriptor::release_dynamic(heap, first, n),
     }
 }
 
@@ -114,8 +122,29 @@ const MEMORY_HEAP: usize = crate::memory::OURS;
 /// address takes).
 const SAMPLERS_OURS: usize = usize::MAX;
 
-/// Dynamic slots taken at a time for root views.
+/// Dynamic slots taken at a time for root views; fewer, down to the one
+/// the view needs, where the heap has no free run this long (a capped
+/// heap's 2^16 dynamic slots held by many lists).
 const ROOT_VIEW_RUN: u32 = 256;
+
+/// Why draws and dispatches were dropped for want of dynamic slots: root
+/// views, fresh tables. With the root-view runs shorter than
+/// [`ROOT_VIEW_RUN`] taken instead of dropping.
+static DYNAMIC_DROPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static SHORT_ROOT_RUNS: AtomicU64 = AtomicU64::new(0);
+const NO_ROOT_VIEW_SLOTS: usize = 0;
+const NO_TABLE_SLOTS: usize = 1;
+
+/// Draws and dispatches dropped since the last call for want of dynamic
+/// slots, for root views and for tables, and the root-view runs taken
+/// shorter than [`ROOT_VIEW_RUN`].
+pub(crate) fn take_dynamic_drops() -> (u64, u64, u64) {
+    (
+        DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS].swap(0, Ordering::Relaxed),
+        DYNAMIC_DROPS[NO_TABLE_SLOTS].swap(0, Ordering::Relaxed),
+        SHORT_ROOT_RUNS.swap(0, Ordering::Relaxed),
+    )
+}
 
 /// Dynamic slots taken for root views ([`State::root_view`]) since the last
 /// call.
@@ -639,6 +668,7 @@ impl State {
                 self.host_roots[1] = if compute { root } else { 0 };
             }
             if self.table_failed {
+                DYNAMIC_DROPS[NO_TABLE_SLOTS].fetch_add(1, Ordering::Relaxed);
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -683,7 +713,11 @@ impl State {
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    once!(slot = u.slot, "a shader reads a root view's offset in no host copy: dropped");
+                                    not_run("root view offset in no host copy");
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -848,10 +882,19 @@ impl State {
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
+            not_run("root view not set");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            once!(slot, "a shader reads a root view in no host copy: dropped");
+            not_run("root view in no host copy");
+            return None;
+        };
+        let Ok(offset) = u32::try_from(shadow.offset(address)) else {
+            once!(slot, "a shader reads a root view 4 GiB or more into its copy: dropped");
+            not_run("root view 4 GiB or more into its copy");
+            return None;
+        };
         shadow.refresh(list, address, shadow.left(address));
         if uav {
             // Writes through the view are marked wherever they land in the
@@ -860,11 +903,16 @@ impl State {
             shadow.gpu_writes(list, address, len, true);
         }
         let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
+            0 => (MEMORY_HEAP, crate::memory::heap()),
             h => (
                 std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
+                crate::descriptor::heap(h as This).host(),
             ),
+        };
+        let Some(host) = host else {
+            once!("a shader reads a root view without a host view heap: dropped");
+            not_run("root view without a host view heap");
+            return None;
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
@@ -872,12 +920,19 @@ impl State {
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
-            let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
+            self.trim_root_run();
+            let Some((first, n)) = host.dynamic_run(ROOT_VIEW_RUN, 1) else {
                 once!("no dynamic slots for root views: dropped");
+                DYNAMIC_DROPS[NO_ROOT_VIEW_SLOTS].fetch_add(1, Ordering::Relaxed);
+                not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
-            self.root_run = (key, first, first + ROOT_VIEW_RUN);
+            if n < ROOT_VIEW_RUN {
+                once!(n, "dynamic slots short: root views take runs under {ROOT_VIEW_RUN} slots");
+                SHORT_ROOT_RUNS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.dynamic.push((key, first, n));
+            self.root_run = (key, first, first + n);
         }
         let index = self.root_run.1;
         self.root_run.1 += 1;
@@ -888,6 +943,27 @@ impl State {
         }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
+    }
+
+    /// Gives back the slots of the root-view run no root view took: the
+    /// list closed (it records nothing more until reset) or takes another
+    /// run. No command names them, so another list may have them at once.
+    fn trim_root_run(&mut self) {
+        let (heap, next, end) = self.root_run;
+        if next >= end {
+            return;
+        }
+        give_back(heap, next, end - next);
+        if let Some(run) = self.dynamic.iter_mut().rev().find(|d| d.0 == heap && d.1 + d.2 == end) {
+            run.2 = next - run.1;
+        }
+        self.dynamic.retain(|d| d.2 > 0);
+        self.root_run = (heap, next, next);
+    }
+
+    /// The title closed the list.
+    pub(crate) fn close(&mut self) {
+        self.trim_root_run();
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -2503,6 +2579,68 @@ void main(uint3 id : SV_DispatchThreadID) {
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
+    }
+
+    /// A root view takes a run shorter than 256 slots where the heap has
+    /// no longer one, and is made instead of dropping its draw; what the
+    /// run has left comes back when the list closes, the rest when it is
+    /// reset after running; with no slot at all the draw is dropped and
+    /// counted.
+    #[test]
+    fn root_views_take_short_runs_and_their_slots_come_back() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let (free, total) = heap_host.dynamic_free();
+        assert_eq!(free, total, "a new heap's dynamic slots are free");
+        // Every dynamic slot held by other lists but 5 in a row.
+        let all = heap_host.dynamic(total).unwrap();
+        heap_host.release(all + 10, 5);
+        let address = |b: This| crate::resource::buffer_bytes(b).unwrap().0 as u64;
+        let (a, b) = (address(buffer(256)), address(buffer(256)));
+        take_dynamic_drops();
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, a);
+        let (index, _) = state.root_view(&list, true, 0, false).expect("a root view from the short run");
+        assert_eq!(index, all + 10);
+        assert_eq!(heap_host.dynamic_free().0, 0, "the run took all 5");
+        list.close();
+        state.close();
+        assert_eq!(heap_host.dynamic_free().0, 4, "the 4 no view took come back at close");
+        assert_eq!(take_dynamic_drops(), (0, 0, 1), "one short run, no drops");
+
+        // No slot left: the draw is dropped, and counted with its reason.
+        let other = host.new_list().unwrap();
+        let held = heap_host.dynamic(4).unwrap();
+        let mut starved = State::default();
+        starved.set_heaps(&[heap]);
+        starved.set_view(true, 0, b);
+        #[cfg(feature = "diagnostics")]
+        NOT_RUN.with(|w| w.set(""));
+        assert_eq!(starved.root_view(&other, true, 0, false), None);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(NOT_RUN.with(|w| w.replace("")), "no dynamic slots for root views");
+        assert_eq!(take_dynamic_drops(), (1, 0, 0));
+        drop(starved);
+        other.close();
+        heap_host.release(held, 4);
+
+        // The list ran (submissions are waited for); reset, its slot is free.
+        host.execute(&[&list]);
+        list.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free().0, 5);
+        heap_host.release(all, total);
+        assert_eq!(heap_host.dynamic_free(), (total, total));
     }
 
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
