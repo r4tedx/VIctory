@@ -200,7 +200,7 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
-pub use lower::heap_usage_marks;
+pub use lower::{heap_usage_marks, implicit_sample_compute};
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -2364,6 +2364,12 @@ mod tests {
     /// stored to the UAV at entry 2. With `lane_read` it also reads lane 40,
     /// which on a host without 64-lane waves needs the console flow.
     fn implicit_sample(lane_read: bool) -> crate::NativeProgram {
+        implicit_sample_of(lane_read, false)
+    }
+
+    /// [`implicit_sample`], or with `bias` its sample biased by 1
+    /// (`image_sample_b`, the bias in v1 before the coordinates).
+    fn implicit_sample_of(lane_read: bool, bias: bool) -> crate::NativeProgram {
         use crate::native::{ResourceType, RootParam, RootType, UsedResource};
         let mut words: Vec<u32> = vec![
             0xBE84_0300, // s_mov_b32 s4, s0
@@ -2388,9 +2394,19 @@ mod tests {
                 0x7E06_022C, // v_mov_b32 v3, s44
             ]);
         }
+        if bias {
+            words.extend([
+                0x7E02_02F2, // v_mov_b32 v1, 1.0
+                0xF094_0F08,
+                0x0046_0C01, // image_sample_b v[12:15], v[1:3], s[24:31], s[8:11] dmask:0xf 2D
+            ]);
+        } else {
+            words.extend([
+                0xF080_0F08,
+                0x0046_0C02, // image_sample v[12:15], v[2:3], s[24:31], s[8:11] dmask:0xf 2D
+            ]);
+        }
         words.extend([
-            0xF080_0F08,
-            0x0046_0C02, // image_sample v[12:15], v[2:3], s[24:31], s[8:11] dmask:0xf 2D
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
             0xE070_1000,
             0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
@@ -2467,6 +2483,40 @@ mod tests {
             Err(crate::ShaderError::Unsupported { what, .. })
                 if what == super::lower::IMPLICIT_SAMPLE_IN_HALVES
         ));
+    }
+
+    /// `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`: the console flow in halves takes
+    /// a compute program's implicit and biased samples, both at a level, and
+    /// the module validates; without it both stop as before.
+    #[test]
+    fn implicit_samples_in_halves_translate_with_the_switch() {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                super::lower::set_implicit_sample_compute(false);
+            }
+        }
+        let _off = Off;
+        for bias in [false, true] {
+            let program = implicit_sample_of(true, bias);
+            super::lower::set_implicit_sample_compute(false);
+            match emit_for(&program, NVIDIA) {
+                Err(crate::ShaderError::Unsupported { what, .. }) => {
+                    assert_eq!(what, super::lower::IMPLICIT_SAMPLE_IN_HALVES, "bias {bias}");
+                }
+                Err(e) => panic!("bias {bias}: {e}"),
+                Ok(_) => panic!("bias {bias}: translated without the switch"),
+            }
+            super::lower::set_implicit_sample_compute(true);
+            let shader = emit_for(&program, NVIDIA)
+                .unwrap_or_else(|e| panic!("bias {bias}, with the switch: {e}"));
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("bias {bias}: DXIL validation failed: {e}"));
+            }
+        }
     }
 
     #[test]
