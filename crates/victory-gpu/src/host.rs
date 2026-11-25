@@ -2392,15 +2392,22 @@ impl Meter {
             );
             // Over every frame since the last line.
             let logged_frames = std::mem::take(&mut self.logged_frames);
-            let (no_root_views, no_tables, short_runs) = crate::draw::take_dynamic_drops();
-            if no_root_views + no_tables + short_runs > 0 {
+            let d = crate::draw::take_dynamic_drops();
+            if d != crate::draw::DynamicDrops::default() {
                 let (free, total) = crate::descriptor::fullest_dynamic().unwrap_or_default();
                 tracing::info!(
-                    "dynamic descriptor slots: dropped {no_root_views} draws for root views and \
-                     {no_tables} for tables in {logged_frames} frames ({:.1}/frame); \
-                     {short_runs} root-view runs shorter than 256 slots; fullest view heap \
-                     {free} of {total} free",
-                    (no_root_views + no_tables) as f64 / logged_frames.max(1) as f64,
+                    "dynamic descriptor slots: dropped {} draws for root views and {} for tables \
+                     in {logged_frames} frames ({:.1}/frame); tables refused {} times with the \
+                     slots free but not in a row, {} with too few free; {} list runs shorter \
+                     than 256 slots; fullest view heap {free} of {total} free; {} held by lists \
+                     already submitted",
+                    d.root_views,
+                    d.tables,
+                    (d.root_views + d.tables) as f64 / logged_frames.max(1) as f64,
+                    d.fragmented,
+                    d.exhausted,
+                    d.short_runs,
+                    crate::draw::held_by_ran(),
                 );
             }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
