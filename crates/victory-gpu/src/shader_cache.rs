@@ -66,8 +66,19 @@ pub fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        // The host device sets the view heap cap; it must exist first.
-        let _ = crate::host::host();
+        // `VICTORY_VIEW_HEAP_CAP=<slots>` states the cap of the card the
+        // cache is for, so a translation pass on another adapter (the
+        // software one) keys and translates as that card will. Otherwise
+        // the host device sets the cap; it must exist first.
+        match std::env::var("VICTORY_VIEW_HEAP_CAP").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            Some(slots) => {
+                victory_shader::emit::set_view_heap_limit(slots);
+                tracing::info!(slots, "VICTORY_VIEW_HEAP_CAP: translations keep view indices below this cap");
+            }
+            None => {
+                let _ = crate::host::host();
+            }
+        }
         let cap = victory_shader::emit::view_heap_limit().unwrap_or(0);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
