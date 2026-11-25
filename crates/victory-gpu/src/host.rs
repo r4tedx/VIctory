@@ -2825,14 +2825,18 @@ impl Meter {
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let waiting = crate::resource::waiting_textures();
             let (let_go, let_go_bytes) = crate::resource::let_go_counts();
+            let (staging, staging_bytes, staging_let_go, staging_let_go_bytes) = crate::texture::staging_counts();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures waiting for a first use {waiting}, sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
                  placed textures let go while idle {let_go} ({:.0} MB); \
+                 staging buffers {staging} ({:.0} MB), let go while idle {staging_let_go} ({:.0} MB); \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
                 bytes as f64 / 1e6,
                 used as f64 / 1e6,
                 saved as f64 / 1e6,
                 let_go_bytes as f64 / 1e6,
+                staging_bytes as f64 / 1e6,
+                staging_let_go_bytes as f64 / 1e6,
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );

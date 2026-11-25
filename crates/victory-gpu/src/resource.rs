@@ -784,7 +784,7 @@ pub(crate) struct HostTexture {
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
-    pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
+    pub(crate) staging: std::sync::Mutex<crate::texture::Stage>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
@@ -813,7 +813,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
-            staging: std::sync::Mutex::new(None),
+            staging: std::sync::Mutex::default(),
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
@@ -1824,7 +1824,7 @@ static PLACED_TEXTURES: std::sync::Mutex<PlacedTextures> = std::sync::Mutex::new
 
 /// Milliseconds since the first call.
 #[cfg(windows)]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     u64::try_from(
         START

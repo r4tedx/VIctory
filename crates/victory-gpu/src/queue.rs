@@ -314,6 +314,8 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     crate::resource::let_go_idle();
+    #[cfg(windows)]
+    crate::texture::let_go_idle_staging();
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
