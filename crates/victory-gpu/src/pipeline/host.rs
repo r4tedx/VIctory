@@ -382,6 +382,10 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// Our root parameter of the loop-cut counter, in every pipeline while
+    /// translated loops count their cuts (`victory_shader::emit`, "Loop
+    /// cuts").
+    pub(crate) loop_cuts: Option<u32>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -585,6 +589,22 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
+        // Loop cuts (diagnostics): every pipeline declares the counter, since
+        // any translated loop may be left at the limit.
+        let loop_cuts = victory_shader::emit::loop_cuts().then(|| {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: victory_shader::emit::LOOP_CUTS,
+                        RegisterSpace: MEMORY_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.len() as u32 - 1
+        });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -637,6 +657,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                loop_cuts,
             });
         }
         let Some(g) = g else {
@@ -685,6 +706,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                loop_cuts,
             });
         }
 
@@ -787,6 +809,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             marks,
+            loop_cuts,
         })
     }
 }

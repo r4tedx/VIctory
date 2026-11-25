@@ -39,6 +39,8 @@ mod host;
 mod indirect;
 pub mod list;
 #[cfg(windows)]
+mod loop_cuts;
+#[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;

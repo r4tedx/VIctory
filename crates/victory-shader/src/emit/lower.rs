@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Atomic operations written (the loop-cut counter's among them).
+    #[cfg(test)]
+    pub atomics: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            atomics: self.s.m.written_calls("dx.op.atomicBinOp.i32") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -10187,6 +10192,7 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                let orig = cond;
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
@@ -10196,6 +10202,28 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // Loop cuts (diagnostics): a lane that would have gone round
+                // again and leaves because of the limit is counted. Its block
+                // ends after the count, so the back edge and the phis come
+                // from there.
+                if super::count_loop_cuts() {
+                    let back_to = [(taken, true), (not_taken, false)]
+                        .into_iter()
+                        .find(|&(to, _)| back(self, to));
+                    if let Some((to, on_true)) = back_to {
+                        let stop = self.at_limit(to);
+                        let no = self.s.m.bool(false);
+                        // Taken back edge: cut where the branch was taken and
+                        // the limit stopped it; not-taken: where it was not.
+                        let cut = if on_true {
+                            self.s.m.select(self.cur, orig, stop, no)
+                        } else {
+                            self.s.m.select(self.cur, orig, no, stop)
+                        };
+                        self.count_cut(cut, to);
+                        self.tail[b] = Some(self.cur);
+                    }
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -10254,12 +10282,46 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, p, next, limit)
     }
 
+    /// Whether the count just taken on the back edge to header `to`
+    /// ([`Lower::count_iteration`]) reached the limit.
+    fn at_limit(&mut self, to: usize) -> V {
+        let next = self.counters[&to].1.last().expect("an iteration counted").0;
+        let limit = self.s.m.i32(super::loop_limit());
+        self.s.m.cmp(self.cur, pred::IUGE, next, limit)
+    }
+
+    /// Adds one to the loop-cut counter (module notes, "Loop cuts") where
+    /// `cut` holds; the back edge to header `to` then leaves from the block
+    /// after the count.
+    fn count_cut(&mut self, cut: V, to: usize) {
+        let h = self.s.loop_cuts_handle();
+        let at = self.begin_guarded(Some(cut));
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 0 is ADD.
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[h, zero, zero, iu, iu, one]);
+        self.end_guarded(at, &[]);
+        if let Some(last) = self.counters.get_mut(&to).and_then(|c| c.1.last_mut()) {
+            last.1 = self.cur;
+        }
+    }
+
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
     fn abort_block(&mut self) -> usize {
         if let Some(a) = self.abort {
             return a;
         }
         let a = self.s.m.new_block();
+        // Diagnostics (`super::loop_cuts`): each lane that leaves here adds
+        // one to the counter's first dword, so a run can tell whether any
+        // loop reaches the limit (module notes, "Loop cuts").
+        if super::count_loop_cuts() {
+            let h = self.s.loop_cuts_handle();
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+            let iu = self.s.m.undef(self.s.t.i32);
+            // Operation 0 is ADD.
+            self.s.op(a, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[h, zero, zero, iu, iu, one]);
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

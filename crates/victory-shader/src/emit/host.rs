@@ -260,6 +260,10 @@ impl Host {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
+        // Loop cuts (diagnostics): the counter is in every root signature.
+        if super::count_loop_cuts() {
+            views.push((super::LOOP_CUTS, super::MEMORY_SPACE, 2));
+        }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {

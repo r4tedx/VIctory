@@ -52,6 +52,10 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// The loop-cut counter's register: `u2` (a raw root UAV) in
+/// [`MEMORY_SPACE`] (`emit`, "Loop cuts"): its first dword counts the
+/// lanes that left a loop at the loop limit.
+pub const LOOP_CUTS: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -129,6 +133,8 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
+    /// The loop-cut counter's handle, once a loop counts its cuts.
+    pub loop_cuts: Option<V>,
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
@@ -200,6 +206,7 @@ impl Shader {
             view_addresses: None,
             view_marks: None,
             view_writes: None,
+            loop_cuts: None,
             view_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
@@ -463,6 +470,17 @@ impl Shader {
         h
     }
 
+    /// The handle of the loop-cut counter (`u`[`LOOP_CUTS`] in
+    /// [`MEMORY_SPACE`], a raw buffer), made in the entry block.
+    pub fn loop_cuts_handle(&mut self) -> V {
+        if let Some(h) = self.loop_cuts {
+            return h;
+        }
+        let h = self.memory_space_handle(LOOP_CUTS, true);
+        self.loop_cuts = Some(h);
+        h
+    }
+
     /// A raw buffer bound at `register` in [`MEMORY_SPACE`] (`uav`: `u`,
     /// else `t`), made in the entry block.
     fn memory_space_handle(&mut self, register: u32, uav: bool) -> V {
@@ -588,7 +606,10 @@ impl Shader {
         // ranges declared below, not UAVs indexed from the heap.
         let compute = self.threads.is_some() && self.mesh.is_none() && self.gs.is_none();
         let declared_uavs =
-            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+            !self.root_uavs.is_empty()
+                || self.memory_dirty.is_some()
+                || self.view_writes.is_some()
+                || self.loop_cuts.is_some();
         if declared_uavs && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
@@ -608,6 +629,7 @@ impl Shader {
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
+            || self.loop_cuts.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -719,6 +741,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.loop_cuts.map(|_| (MEMORY_SPACE, LOOP_CUTS)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![

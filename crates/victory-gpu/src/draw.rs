@@ -902,6 +902,22 @@ impl State {
                 }
             }
         }
+        // Bind after building tables, which can run a depth-copy pipeline
+        // and reset the compute root signature.
+        if let Some(param) = p.loop_cuts {
+            let Some(counter) = crate::loop_cuts::address() else {
+                not_run("loop-cut counter unavailable");
+                return false;
+            };
+            // SAFETY: an open list; the counter lives for good.
+            unsafe {
+                if compute {
+                    l.SetComputeRootUnorderedAccessView(param, counter);
+                } else {
+                    l.SetGraphicsRootUnorderedAccessView(param, counter);
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
         true

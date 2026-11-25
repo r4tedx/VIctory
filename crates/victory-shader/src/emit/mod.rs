@@ -167,6 +167,12 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **Loop cuts** (diagnostics, [`loop_cuts`]): a lane that leaves a
+//!   loop at the loop limit ([`loop_limit`]) adds one to the first dword of
+//!   the root UAV `u`[`LOOP_CUTS`] in [`MEMORY_SPACE`] before it leaves. The
+//!   host then declares that root UAV in every root signature and binds a
+//!   counter of its own there, so a run can tell how often translated loops
+//!   are cut, and whether a lower limit cuts loops that would have ended.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
@@ -237,8 +243,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    LOOP_CUTS, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -262,6 +268,35 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// Whether translated loops count the lanes they leave at the loop limit
+/// (module notes, "Loop cuts"). With the `diagnostics` feature,
+/// `VICTORY_LOOP_CUTS=1` turns it on; off otherwise. Like the limit it is
+/// part of the translation, so the shader cache must key on it.
+pub fn loop_cuts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && parse_loop_cuts(std::env::var("VICTORY_LOOP_CUTS").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests turn loop cuts on for the translations of their own thread.
+    pub(crate) static TEST_LOOP_CUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`loop_cuts`], or a test's own switch.
+pub(crate) fn count_loop_cuts() -> bool {
+    #[cfg(test)]
+    if TEST_LOOP_CUTS.with(std::cell::Cell::get) {
+        return true;
+    }
+    loop_cuts()
+}
+
+/// `VICTORY_LOOP_CUTS`'s value: on for `1`. Pure, for testing.
+fn parse_loop_cuts(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -645,6 +680,15 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_loop_cuts_switch_is_on_only_for_1() {
+        assert!(super::parse_loop_cuts(Some("1")));
+        assert!(super::parse_loop_cuts(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("2")] {
+            assert!(!super::parse_loop_cuts(off), "{off:?}");
         }
     }
     use super::container::SigElement;
