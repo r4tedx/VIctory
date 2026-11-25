@@ -3172,17 +3172,20 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::procmem::log();
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
+                // Frames since the last of these lines (about 5 s): the
+                // tallies below cover them all. `frames` counts only the
+                // last 1 s window, as `take_drops` does.
+                let window = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::copystat::log(window);
+                crate::bindless::log(window);
+                crate::shadow::log_views(window);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames
                     );
                 }
-                costs::log(frames);
+                costs::log(window);
             }
         }
         if self.caption.is_none() {
