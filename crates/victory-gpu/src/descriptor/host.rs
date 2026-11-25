@@ -31,9 +31,8 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Which dynamic slots are taken (by lists not yet reset).
+    next: Mutex<Slots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -230,7 +229,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(Slots::new(extra)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -344,24 +343,45 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
-impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
-    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+/// A heap's dynamic slots: which are taken, how many are free, and where
+/// the search for free ones starts (past the last run taken).
+pub(crate) struct Slots {
+    next: u32,
+    taken: Vec<bool>,
+    free: u32,
+    /// No free run is longer: a search that found none of a length is not
+    /// walked again until a release makes a longer run (based on Belobug
+    /// 788ea467: once the slots ran out, every table of a frame walked them
+    /// all again, and frames took seconds).
+    longest: usize,
+}
+
+impl Slots {
+    pub(crate) fn new(n: u32) -> Self {
+        Slots { next: 0, taken: vec![false; n as usize], free: n, longest: n as usize }
+    }
+
+    /// The first of `want` consecutive free slots; else the longest free
+    /// run if it has at least `least`. Taken until released: the first and
+    /// how many. One search either way, and none when fewer than `least`
+    /// are free or no run that long is.
+    pub(crate) fn take(&mut self, want: u32, least: u32) -> Option<(u32, u32)> {
+        let len = self.taken.len();
+        let least = least.max(1) as usize;
+        if least > (want as usize).min(len) || (self.free as usize) < least || self.longest < least {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
+        // No run longer than `longest`: search for one that long.
+        let want = (want as usize).min(len).min(self.longest);
+        // Search from `next` on, then from the start (extending past the
+        // cursor by want - 1 so runs crossing the cursor are not missed).
+        let cursor = self.next as usize;
+        let second_end = cursor.saturating_add(want - 1).min(len);
+        let starts = (cursor..len).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
+        // The longest run seen: its first slot and length.
+        let mut best = (0, 0);
         let mut last = usize::MAX;
         for at in starts {
             // A run cannot wrap past the end.
@@ -369,20 +389,75 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
+            run = if self.taken[at] { 0 } else { run + 1 };
+            if run > best.1 {
+                best = (at + 1 - run, run);
+            }
+            if run == want {
+                found = Some((at + 1 - want, want));
                 break;
             }
         }
-        let Some(first) = found else {
+        if found.is_none() {
+            // Every slot was passed: no free run is longer than the best.
+            self.longest = best.1;
+        }
+        let (first, n) = found.or((best.1 >= least).then_some(best))?;
+        self.taken[first..first + n].fill(true);
+        self.free -= n as u32;
+        self.next = ((first + n) % len) as u32;
+        Some((first as u32, n as u32))
+    }
+
+    /// Gives back `n` slots from `first` (taken or not).
+    pub(crate) fn release(&mut self, first: u32, n: u32) {
+        let len = self.taken.len();
+        let (first, end) = ((first as usize).min(len), (first as usize).saturating_add(n as usize).min(len));
+        let mut freed = false;
+        for slot in self.taken[first..end].iter_mut().filter(|s| **s) {
+            *slot = false;
+            self.free += 1;
+            freed = true;
+        }
+        if freed {
+            // The free run the slots joined, which may be the longest now.
+            let left = self.taken[..first].iter().rev().take_while(|t| !**t).count();
+            let right = self.taken[end..].iter().take_while(|t| !**t).count();
+            self.longest = self.longest.max(left + (end - first) + right);
+        }
+    }
+}
+
+impl HostHeap {
+    /// `n` consecutive free dynamic slots (view heaps only), taken until
+    /// [`HostHeap::release`]: the first's index.
+    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let found = self.dynamic_run(n, n).map(|(first, _)| first);
+        if found.is_none() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+        }
+        found
+    }
+
+    /// `want` consecutive free dynamic slots (view heaps only), or if there
+    /// is no such run the longest free one of at least `least`, taken until
+    /// [`HostHeap::release`]: the first's index and how many.
+    pub(crate) fn dynamic_run(&self, want: u32, least: u32) -> Option<(u32, u32)> {
+        if self.sampler {
             return None;
-        };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        }
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        slots.take(want, least).map(|(first, n)| (self.count + first, n))
+    }
+
+    /// The dynamic slots free and in all.
+    pub(crate) fn dynamic_free(&self) -> (u32, u32) {
+        let slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        (slots.free, self.dynamic)
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -436,11 +511,7 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2542,6 +2613,60 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// With no free run as long as wanted, the longest free one of at
+    /// least the least is taken, in one search; none when fewer are free.
+    #[test]
+    fn a_shorter_run_is_taken_where_the_long_one_is_not_free() {
+        let mut slots = Slots::new(300);
+        assert_eq!(slots.take(100, 100), Some((0, 100)));
+        assert_eq!(slots.take(100, 100), Some((100, 100)));
+        assert_eq!(slots.take(100, 100), Some((200, 100)));
+        // A capped heap's pool held by lists: holes of 30 and 12.
+        slots.release(120, 30);
+        slots.release(260, 12);
+        assert_eq!(slots.free, 42);
+        assert_eq!(slots.take(256, 256), None, "no 256-slot run");
+        assert_eq!(slots.take(256, 40), None, "no run of 40 either");
+        assert_eq!(slots.take(256, 1), Some((120, 30)), "the longest hole");
+        assert_eq!(slots.take(256, 1), Some((260, 12)));
+        assert_eq!(slots.free, 0);
+        assert_eq!(slots.take(1, 1), None);
+        // A run as long as wanted is still taken whole, and first.
+        slots.release(0, 300);
+        assert_eq!(slots.free, 300);
+        assert_eq!(slots.take(256, 1), Some((0, 256)));
+        assert_eq!(slots.take(256, 1), Some((256, 44)));
+        // A failed search is remembered: no run of 40 is searched for until
+        // a release joins one, here the hole at 120 with the 10 after it.
+        slots.release(0, 300);
+        assert_eq!(slots.take(300, 300), Some((0, 300)));
+        slots.release(120, 30);
+        slots.release(200, 10);
+        assert_eq!(slots.take(40, 40), None);
+        assert_eq!(slots.longest, 30);
+        assert_eq!(slots.take(40, 40), None, "not walked again");
+        slots.release(150, 10);
+        assert_eq!(slots.longest, 40);
+        assert_eq!(slots.take(256, 1), Some((120, 40)));
+        assert_eq!(slots.take(256, 1), Some((200, 10)));
+        assert_eq!(slots.take(1, 1), None);
+        // Wanting more than the pool holds takes the pool.
+        let mut small = Slots::new(16);
+        assert_eq!(small.take(256, 1), Some((0, 16)));
+    }
+
+    /// Slots given back are free again, counted once however often.
+    #[test]
+    fn released_slots_are_counted_once() {
+        let mut slots = Slots::new(64);
+        let (first, n) = slots.take(32, 32).unwrap();
+        slots.release(first, n);
+        slots.release(first, n);
+        slots.release(60, 100);
+        assert_eq!(slots.free, 64);
+        assert_eq!(slots.take(64, 64), Some((0, 64)));
     }
 
     #[test]
