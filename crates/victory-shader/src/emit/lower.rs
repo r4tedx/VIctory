@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+pub(super) mod groups;
 
 /// The sampling operation of a stage, and its `dx.op` number: a compute
 /// shader has no derivatives to take, so its implicit sampling is level 0
@@ -338,8 +339,20 @@ struct Lower<'a> {
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
-    /// Group-shared slots the two halves exchange a dword through.
+    /// Group-shared slots the two halves exchange a dword through (one
+    /// per host wave in a group of several console waves).
     xchg: Option<V>,
+    /// A group of several console waves run as one host group
+    /// ([`groups`]): how it takes each branch.
+    groups: Option<groups::Plan>,
+    /// Per IR block, in such a group: whether this console wave runs it
+    /// for itself (`None`: every wave does). Vector instructions take
+    /// effect only where it holds.
+    here: Vec<Option<V>>,
+    /// Per [`groups::Branch::Skip`] or [`groups::Branch::Exit`] block: this
+    /// console wave's own way (into the region, on) and its vote (that,
+    /// where it runs the block for itself).
+    group_votes: HashMap<usize, (V, V)>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -669,6 +682,7 @@ impl<'a> Lower<'a> {
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
         let mut group_waves = 1;
+        let mut group_plan = None;
         let mut console_threads = [0; 3];
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -787,10 +801,37 @@ impl<'a> Lower<'a> {
                     group_waves = n / 64;
                     s.threads = Some([64, 1, 1]);
                 }
-                no_console_flow = if group_waves == 1 && n > 64 {
-                    Some(
-                        "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                    )
+                // One whose waves share LDS or meet at a barrier: the whole
+                // group as one host group, one control flow for all its
+                // threads ([`groups`]), where the program allows.
+                let many = (group_waves == 1
+                    && n > 64
+                    && n.is_multiple_of(64)
+                    && n <= 1024
+                    && x.target.runs(32))
+                .then(|| {
+                    let user = cs.user_sgprs();
+                    let mut same: HashSet<Value> = p
+                        .inputs
+                        .iter()
+                        .filter(|(r, _)| matches!(*r, Reg::S(c) if c < user))
+                        .map(|&(_, v)| v)
+                        .collect();
+                    same.extend(
+                        x.io.inputs
+                            .iter()
+                            .filter(|(_, i)| matches!(i, Input::GroupId(_)))
+                            .map(|&(v, _)| v),
+                    );
+                    groups::plan(p, &same, n, cs.lds_bytes())
+                });
+                no_console_flow = if group_waves == 1 && n > 64 && !matches!(many, Some(Ok(_))) {
+                    Some(match &many {
+                        Some(Err(why)) => *why,
+                        _ => {
+                            "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves"
+                        }
+                    })
                 } else if insts()
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
@@ -799,6 +840,7 @@ impl<'a> Lower<'a> {
                     .threads
                     .map(|t| t.iter().product::<u32>())
                     .is_some_and(|n| n != 64 && n > 32)
+                    && !matches!(many, Some(Ok(_)))
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     // (A group of 32 threads or fewer is the lower half
@@ -808,6 +850,7 @@ impl<'a> Lower<'a> {
                     None
                 };
                 wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
+                group_plan = many.and_then(Result::ok);
             }
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see
@@ -972,6 +1015,9 @@ impl<'a> Lower<'a> {
             console_threads,
             console_flat: None,
             xchg: None,
+            groups: group_plan,
+            here: vec![None; p.blocks.len()],
+            group_votes: HashMap::new(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1715,6 +1761,20 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            // A group of several console waves: a block a branch's vote
+            // goes into holds for the waves that voted; any other block as
+            // its dominator does.
+            if self.console_cf
+                && let Some(g) = &self.groups
+            {
+                self.here[b] = match g.entered_from.get(&b) {
+                    Some(x) => self.group_votes.get(x).map(|v| v.1),
+                    None => match g.idom[b] {
+                        d if d == b || d == usize::MAX => None,
+                        d => self.here[d],
+                    },
+                };
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -3112,10 +3172,17 @@ impl<'a> Lower<'a> {
                 inst.fields,
                 Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }
             );
-            return match self.x.st.execs[b].get(i).copied().flatten() {
-                Some(e) if !ignores && e != Bool::TRUE => Ok(Some(self.boolean(e, self.cur)?)),
-                _ => Ok(None),
+            let exec = match self.x.st.execs[b].get(i).copied().flatten() {
+                Some(e) if !ignores && e != Bool::TRUE => Some(self.boolean(e, self.cur)?),
+                _ => None,
             };
+            // In a group of several console waves, only in a wave that runs
+            // the block for itself ([`groups`]).
+            return Ok(match (self.here[b].filter(|_| !ignores), exec) {
+                (Some(h), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, e, h)),
+                (Some(h), None) => Some(h),
+                (None, e) => e,
+            });
         }
         match self.x.st.guards[b][i] {
             None => Ok(None),
@@ -10344,7 +10411,25 @@ impl<'a> Lower<'a> {
                 taken, not_taken, ..
             } if self.console_cf => {
                 let cond = self.console_branch(b).map_err(|w| unsupported(offset, w))?;
-                self.branch_term(b, cond, taken, not_taken)
+                let form = self
+                    .groups
+                    .as_ref()
+                    .and_then(|g| g.branches.get(&b))
+                    .copied();
+                match form {
+                    // The group's vote: in if some wave goes in, on if some
+                    // wave goes on ([`groups`]).
+                    Some(groups::Branch::Skip { region, join }) => {
+                        let g = self.group_vote(b, cond, region == taken);
+                        self.branch_term(b, g, region, join)
+                    }
+                    Some(groups::Branch::Exit { go_on }) => {
+                        let end = if go_on == taken { not_taken } else { taken };
+                        let g = self.group_vote(b, cond, go_on == taken);
+                        self.branch_term(b, g, go_on, end)
+                    }
+                    _ => self.branch_term(b, cond, taken, not_taken),
+                }
             }
             LaneExit::Branch {
                 when,
@@ -10588,25 +10673,29 @@ impl<'a> Lower<'a> {
             return (x, z);
         }
         let (_, half) = self.console_lane();
-        let slots = match self.xchg {
-            Some(g) => g,
-            None => {
-                let arr = self.s.m.array(2, self.s.t.i32);
-                let g = self.s.m.global("xchg", arr, 3);
-                self.xchg = Some(g);
-                g
-            }
+        let slots = self.xchg_slots();
+        let one = self.s.m.i32(1);
+        // In a group of several console waves, a slot per host wave: the
+        // console wave's halves are host waves 2w and 2w + 1.
+        let (me, low, high) = if threads > 64 {
+            let e = self.s.entry;
+            let hw = self.host_wave();
+            let even = self.s.m.i32(!1);
+            let low = self.s.m.bin(e, Bin::And, hw, even);
+            let high = self.s.m.bin(e, Bin::Or, low, one);
+            (hw, low, high)
+        } else {
+            (half, z, one)
         };
         let void = self.s.t.void;
         // Thread-group sync with a group-shared memory fence.
         let mode = self.s.m.i32(1 | 8);
-        let mine = self.s.m.element(at, slots, half);
+        let mine = self.s.m.element(at, slots, me);
         self.s.m.store(at, mine, x);
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        let one = self.s.m.i32(1);
-        let p0 = self.s.m.element(at, slots, z);
-        let p1 = self.s.m.element(at, slots, one);
+        let p0 = self.s.m.element(at, slots, low);
+        let p1 = self.s.m.element(at, slots, high);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // Both read before the next exchange writes.
@@ -11015,8 +11104,10 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
+            let mut from = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                from.push(q);
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
@@ -11059,6 +11150,8 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
+            let bypass: Vec<Option<V>> = incoming.iter().map(|x| Some(x.0)).collect();
+            let incoming = self.group_fix(b, &from, &bypass, incoming);
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
@@ -11068,9 +11161,27 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
+            let mut from = Vec::new();
+            let mut bypass = Vec::new();
+            let skips = self.groups.as_ref().and_then(|g| g.joins.get(&b)).cloned();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
+                from.push(q);
+                // A skipping edge's mask, also where the region's edges can
+                // use it: at the end of the skipping block.
+                let skipping = skips
+                    .as_ref()
+                    .is_some_and(|l| l.iter().any(|&(x, _)| x == q));
+                let tail = qb;
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let arg = phi.args[n];
+                let at_tail = match self.x.st.masks.get(&arg).or(self.x.st.other.get(&arg)) {
+                    Some(&m) if skipping && self.console_cf => {
+                        Some(self.boolean(m, tail).map_err(|w| unsupported(offset, w))?)
+                    }
+                    _ => None,
+                };
+                bypass.push(at_tail);
                 // Console flow: every lane arrives by every edge, so a join
                 // also takes masks that are constants or built from scalars,
                 // and none of the per-lane cases below applies.
@@ -11098,6 +11209,7 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
+            let incoming = self.group_fix(b, &from, &bypass, incoming);
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
