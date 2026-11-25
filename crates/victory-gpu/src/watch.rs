@@ -356,22 +356,26 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 }
 
 /// The pages of `[start, end)` that are the runtime's GPU memory: a
-/// write-watched pool, or (with `views`) anything but plain committed memory
-/// and images (views, placeholders, nothing mapped yet). Decided for every
-/// region the range covers, and a page touching any other memory is left
-/// out: a range can run past its allocation (a 4 MiB window of memory
-/// outside buffers, `crate::shadow`), and when the first page alone decided,
-/// a window starting in free memory had the process heap's pages after it
-/// guarded; the heap's own code then faulted while holding its lock, and the
-/// guard handler waited for the guard lock, whose holder waited for the heap
-/// lock (the crate's tests hung).
+/// write-watched pool, or (with `views`) anything but plain committed memory,
+/// images and free memory (views, placeholders, reserved memory with nothing
+/// mapped yet). Decided for every region the range covers, and a page
+/// touching any other memory is left out: a range can run past its
+/// allocation (a 4 MiB window of memory outside buffers, `crate::shadow`),
+/// and when the first page alone decided, a window starting in free memory
+/// had the process heap's pages after it guarded; the heap's own code then
+/// faulted while holding its lock, and the guard handler waited for the
+/// guard lock, whose holder waited for the heap lock (the crate's tests
+/// hung). Free memory is left out for the same reason: a null address's
+/// window is free, and guarding it would guard whatever is allocated there
+/// later (under Wine the process heap lies in the first 4 MiB).
 ///
-/// shortcut: memory free or reserved when the range is tracked counts as the
+/// shortcut: memory reserved when the range is tracked counts as the
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION,
+        VirtualQuery,
     };
     let watched = |at: usize, len: usize| {
         let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -395,7 +399,10 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         }
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
         let ours = watched(at, next - at)
-            || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+            || views
+                && info.State != MEM_FREE
+                && info.Type != MEM_IMAGE
+                && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
         at = next;
     }
@@ -1167,6 +1174,33 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Free memory is not tracked: tracked, it would be guarded once
+    /// something is allocated there (under Wine the process heap, in the
+    /// window of a null address: its writes then fault into the handler
+    /// while a thread holds the guard lock).
+    #[test]
+    fn free_memory_is_not_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        // SAFETY: a reservation of ours, released at once: free memory.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) }
+            as usize;
+        assert_ne!(r, 0);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+        let tracked = track(r, 2 * PAGE, true).is_some();
+        // Other tests allocate meanwhile: only memory still free counts.
+        // SAFETY: plain data filled in by the query, of the right size.
+        let still_free = unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(r as *const _, &mut info, size_of_val(&info)) != 0
+                && info.State == MEM_FREE
+                && info.BaseAddress as usize + info.RegionSize >= r + 2 * PAGE
+        };
+        assert!(!(tracked && still_free), "free memory");
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
