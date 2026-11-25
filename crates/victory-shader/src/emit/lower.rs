@@ -165,6 +165,37 @@ fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, Shader
     }
 }
 
+/// Emits a minimal compute shader exercising [`Lower::memory`] (write) or
+/// [`Lower::mark_view_write`] for `bytes`, optionally inside a non-entry branch.
+#[cfg(all(test, windows))]
+pub(super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_branch: bool) -> Vec<u8> {
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 1, layout: vec![], used: vec![],
+        io: StageIo::Cs(crate::native::ComputeIo { rsrc2: 0, threads: [1, 1, 1] }),
+        code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+    };
+    let p = crate::ir::build(&native.code, false, 1).expect("ir");
+    let st = crate::structure::structure(&p).expect("st");
+    let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
+    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark };
+    let bad = HashMap::new();
+    let mut l = Lower::new(&parts, &bad);
+    l.cur = l.s.entry;
+    let (z, iu) = (l.s.m.i32(0), l.s.m.undef(l.s.t.i32));
+    let at = in_branch.then(|| {
+        let tid = l.s.op(l.cur, "threadIdInGroup.i32", Attr::ReadNone, l.s.t.i32, 95, &[z]);
+        let cond = l.s.m.cmp(l.cur, pred::NE, tid, z);
+        l.begin_guarded(Some(cond))
+    }).flatten();
+    let (h, off) = if view_mark { (l.s.heap_handle(l.cur, z, false, false, (11 | 0x1000, 0)), z) } else { l.memory(z, z, bytes, true, None) };
+    let (m, al, v) = (l.s.m.i8(1), l.s.m.i32(4), l.s.t.void);
+    l.s.op(l.cur, "rawBufferStore.i32", Attr::NoUnwind, v, 140, &[h, off, iu, z, iu, iu, iu, m, al]);
+    if view_mark { l.mark_view_write(h, z, bytes, None); }
+    l.end_guarded(at, &[]);
+    l.s.m.terminate(l.cur, Term::Ret);
+    l.s.finish()
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -4926,6 +4957,48 @@ impl<'a> Lower<'a> {
         self.as_int(x)
     }
 
+    /// Two adjacent dwords starting at 8-byte-aligned byte `at` of raw buffer `h`.
+    fn raw_dword2(&mut self, h: V, at: V) -> (V, V) {
+        let c = self.cur;
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(3), self.s.m.i32(8));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, at, u, mask, al]);
+        let (a, b) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        (self.as_int(a), self.as_int(b))
+    }
+
+    /// Sets each page bit in `bits` (at most two, the second skipped when equal
+    /// to the first) in raw UAV bitmap `bitmap`, in the lanes `guard` lets
+    /// through, reading first so already-marked pages issue no atomic.
+    fn mark_dirty_bits(&mut self, bitmap: V, bits: &[V], guard: Option<V>) {
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let outer = self.begin_guarded(guard);
+        for (i, &n) in bits.iter().enumerate() {
+            let other = if i == 1 {
+                let diff = self.s.m.cmp(self.cur, pred::NE, n, bits[0]);
+                self.begin_guarded(Some(diff))
+            } else {
+                None
+            };
+            let c = self.cur;
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Most accesses find their page marked: a load, not an atomic.
+            let old = self.raw_dword(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            let inner = self.begin_guarded(Some(clear));
+            // Operation 2 is OR.
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.end_guarded(inner, &[]);
+            self.end_guarded(other, &[]);
+        }
+        self.end_guarded(outer, &[]);
+    }
+
     /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
     /// buffer view `h` touches, in the lanes `guard` lets through (module
     /// notes, "Write marks"): the bits of its first and last byte, each set
@@ -4941,11 +5014,9 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let table = self.s.view_marks_handle();
         let c = self.cur;
-        let (eight, four) = (k(self, 8), k(self, 4));
+        let eight = k(self, 8);
         let at = self.s.m.bin(c, Bin::Mul, index, eight);
-        let base = self.raw_dword(table, at);
-        let at = self.s.m.bin(c, Bin::Add, at, four);
-        let phase = self.raw_dword(table, at);
+        let (base, phase) = self.raw_dword2(table, at);
         let none = k(self, super::VIEW_MARK_NONE);
         let valid = self.s.m.cmp(c, pred::NE, base, none);
         let active = match guard {
@@ -4953,40 +5024,20 @@ impl<'a> Lower<'a> {
             None => valid,
         };
         let first = self.s.m.bin(c, Bin::Add, phase, x);
-        let span = k(self, bytes.max(1) - 1);
-        let last = self.s.m.bin(c, Bin::Add, first, span);
+        let last = (bytes > 1).then(|| {
+            let span = k(self, bytes - 1);
+            self.s.m.bin(c, Bin::Add, first, span)
+        });
         let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
         let mut bits = Vec::new();
-        for byte in [first, last] {
+        for byte in std::iter::once(first).chain(last) {
             let page = self.s.m.bin(c, Bin::LShr, byte, k16);
             let n = self.s.m.bin(c, Bin::Add, base, page);
             let over = self.s.m.cmp(c, pred::IUGT, n, cap);
             bits.push(self.s.m.select(c, over, cap, n));
         }
         let bitmap = self.s.view_writes_handle();
-        let outer = self.begin_guarded(Some(active));
-        for (i, &n) in bits.iter().enumerate() {
-            let c = self.cur;
-            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            // Most writes find their page marked: a load, not an atomic.
-            let old = self.raw_dword(bitmap, word);
-            let set = self.s.m.bin(c, Bin::And, old, bit);
-            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-            if i == 1 {
-                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
-                clear = self.s.m.bin(c, Bin::And, clear, other);
-            }
-            let inner = self.begin_guarded(Some(clear));
-            let iu = self.s.m.undef(self.s.t.i32);
-            // Operation 2 is OR.
-            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
-            self.end_guarded(inner, &[]);
-        }
-        self.end_guarded(outer, &[]);
+        self.mark_dirty_bits(bitmap, &bits, Some(active));
     }
 
     /// The byte stride of the buffer view at heap index `index`, from the
@@ -5065,7 +5116,7 @@ impl<'a> Lower<'a> {
         let missed = self.s.m.select(c, empty, e.l1, e.entry);
         let first = self.s.m.select(c, e.miss, missed, e.entry);
         let mut bits = vec![first];
-        if write {
+        if write && bytes > 1 {
             // A write marks the pages of its first and last byte (one block).
             let (last, k16) = (k(self, bytes - 1), k(self, 16));
             let end = self.s.m.bin(c, Bin::Add, lo, last);
@@ -5076,26 +5127,7 @@ impl<'a> Lower<'a> {
             bits.push(self.s.m.select(c, e.miss, first, next));
         }
         let bitmap = self.s.memory_dirty_handle();
-        let at = self.begin_guarded(marks);
-        let c = self.cur;
-        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        for n in bits {
-            // Byte offset of the bitmap dword; operation 2 is OR.
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            self.s.op(
-                c,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                self.s.t.i32,
-                78,
-                &[bitmap, k2, word, iu, iu, bit],
-            );
-        }
-        self.end_guarded(at, &[]);
+        self.mark_dirty_bits(bitmap, &bits, marks);
         (e.handle, e.offset)
     }
 
@@ -5125,12 +5157,9 @@ impl<'a> Lower<'a> {
         let entry = self.s.m.bin(c, Bin::Or, entry, page);
         let at = self.s.m.bin(c, Bin::Shl, entry, k3);
         let at = self.s.m.bin(c, Bin::Add, at, first);
-        let view = self.raw_dword(map, at);
-        let four = k(self, 4);
-        let at = self.s.m.bin(c, Bin::Add, at, four);
-        let start = self.raw_dword(map, at);
+        let (view, start) = self.raw_dword2(map, at);
         // Block 0's first entry names the null pair: no copy holds the page.
-        let null = self.raw_dword(map, first);
+        let null = self.s.memory_null();
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
         let (view, props) = if write {
