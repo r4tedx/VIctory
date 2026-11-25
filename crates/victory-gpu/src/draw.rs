@@ -459,6 +459,16 @@ impl State {
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        // Diagnostic: each distinct range a title sets, once (at most 16).
+        static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (min.to_bits(), max.to_bits());
+            if seen.len() < 16 && !seen.contains(&key) {
+                seen.push(key);
+                tracing::info!(min, max, pipeline = ?self.pipeline, "depth bounds set");
+            }
+        }
         self.depth_bounds = Some((min, max));
         if list.depth_bounds.is_none() {
             crate::host::warn_depth_bounds();
