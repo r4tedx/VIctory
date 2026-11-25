@@ -479,6 +479,13 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether [`Shadow::update`] of any range would copy nothing: the
+    /// memory is tracked and none of its pages changed since the copy took
+    /// them. Never so for memory copied whole each time.
+    pub(crate) fn unchanged(&self) -> bool {
+        self.tracked.as_ref().is_some_and(crate::watch::Tracked::unchanged)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
