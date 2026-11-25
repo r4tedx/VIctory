@@ -999,6 +999,9 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
     (kept, MARK.with(std::cell::Cell::take))
 }
 
+/// Typed depth formats with the colour formats shaders read them as.
+const DEPTH_READABLE: [(u32, u32); 4] = [(20, 21), (40, 41), (45, 46), (55, 56)];
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1008,9 +1011,6 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-/// Typed depth formats with the colour formats shaders read them as.
-const DEPTH_READABLE: [(u32, u32); 4] = [(20, 21), (40, 41), (45, 46), (55, 56)];
-
 fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -1441,7 +1441,6 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
-    /// The world's 16-byte view of 0 elements removed the device.
     /// A shader resource view of a depth texture the host made typeless,
     /// described in the typed depth format, is made in the readable one.
     #[test]
@@ -1470,6 +1469,7 @@ mod tests {
         assert_eq!(format, DXGI_FORMAT_R32_FLOAT);
     }
 
+    /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
         assert!(within(64, 0, 4, 16));
