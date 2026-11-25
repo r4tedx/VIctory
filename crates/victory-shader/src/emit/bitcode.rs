@@ -212,6 +212,9 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: HashMap<V, (V, V)>,
+    /// Blocks whose terminator moved to the tail of a branch added at their
+    /// end ([`Module::branch_at_end`]): block to that tail.
+    tails: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -507,10 +510,55 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        // An edge from a block that branches at its end leaves from its tail.
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.end_of(b))).collect();
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
-        self.blocks[block].term = Some(t);
+        let end = self.end_of(block);
+        self.blocks[end].term = Some(t);
+        if end != block {
+            self.repoint(t, block, end);
+        }
+    }
+
+    /// Ends `block` with a branch to `then` where `cond` holds, and to `tail`
+    /// otherwise; `then` must reach `tail`. The block's terminator, set
+    /// already or later through [`Module::terminate`], becomes the tail's,
+    /// and phis see the edges as leaving from the tail. Instructions still
+    /// go into `block` (before the branch), so code emitting into a block
+    /// it holds needs no new block: it is what an operation needing a
+    /// branch does where its callers keep emitting into the block they
+    /// started in.
+    pub fn branch_at_end(&mut self, block: usize, cond: V, then: usize, tail: usize) {
+        let end = self.end_of(block);
+        let old = self.blocks[end].term.replace(Term::CondBr(cond, then, tail));
+        self.tails.insert(end, tail);
+        if let Some(t) = old {
+            self.blocks[tail].term = Some(t);
+            self.repoint(t, end, tail);
+        }
+    }
+
+    /// The block that holds `block`'s terminator.
+    fn end_of(&self, mut block: usize) -> usize {
+        while let Some(&tail) = self.tails.get(&block) {
+            block = tail;
+        }
+        block
+    }
+
+    /// Phis of `t`'s targets: edges from `from` now leave from `to`.
+    fn repoint(&mut self, t: Term, from: usize, to: usize) {
+        for &s in successors(Some(t)).iter() {
+            for &i in &self.blocks[s].phis {
+                if let Op::Phi(incoming) = &mut self.insts[i as usize].op {
+                    for (_, b) in incoming.iter_mut().filter(|(_, b)| *b == from) {
+                        *b = to;
+                    }
+                }
+            }
+        }
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {
@@ -1081,6 +1129,55 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// A branch added at a block's end while code keeps going into the
+    /// block (as heap-use marks do): the block's own terminator, set after
+    /// or before, moves to the branch's tail, phis see the tail as the
+    /// predecessor, and values made in the block after the branch was added
+    /// still dominate their uses (no "forward reference outside a phi").
+    #[test]
+    fn a_branch_at_a_blocks_end_keeps_the_block_current() {
+        for terminated_first in [false, true] {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(i32t, vec![i32t, i32t]);
+            let f = m.function("dx.op.synthetic", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let b = m.new_block();
+            let (one, two) = (m.i32(1), m.i32(2));
+            let x = m.call(b, f, vec![one, two]);
+            let (join, other) = (m.new_block(), m.new_block());
+            let c = m.cmp(b, pred::EQ, x, one);
+            if terminated_first {
+                m.terminate(b, Term::CondBr(c, join, other));
+            }
+            // The added branch: `then` (a call) and `tail`.
+            let (then, tail) = (m.new_block(), m.new_block());
+            let is_two = m.cmp(b, pred::EQ, x, two);
+            m.call(then, f, vec![x, x]);
+            m.terminate(then, Term::Br(tail));
+            m.branch_at_end(b, is_two, then, tail);
+            // Code still emitted into `b`, after the branch was added.
+            let y = m.call(b, f, vec![x, two]);
+            if !terminated_first {
+                m.terminate(b, Term::CondBr(c, join, other));
+            }
+            m.terminate(other, Term::Br(join));
+            let p = m.phi(join, i32t);
+            m.set_phi(p, vec![(y, b), (x, other)]);
+            m.call(join, f, vec![p, y]);
+            m.terminate(join, Term::Ret);
+            assert!(matches!(m.blocks[b].term, Some(Term::CondBr(_, t, e)) if t == then && e == tail));
+            assert!(matches!(m.blocks[tail].term, Some(Term::CondBr(_, t, e)) if t == join && e == other));
+            let Op::Phi(incoming) = &m.insts[match p { V::Inst(i) => i as usize, _ => unreachable!() }].op else {
+                panic!()
+            };
+            assert_eq!(incoming.iter().map(|&(_, from)| from).collect::<Vec<_>>(), [tail, other]);
+            assert!(!m.write().is_empty(), "terminated first: {terminated_first}");
+        }
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

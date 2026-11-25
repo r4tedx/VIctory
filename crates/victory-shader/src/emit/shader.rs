@@ -51,6 +51,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// A UAV in a stage other than pixel and compute (`UAVsAtEveryStage`).
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -499,6 +500,14 @@ impl Shader {
         }
         let h = self.memory_space_handle(HEAP_USAGE, true);
         self.heap_used = Some(h);
+        // The bitmap is the only UAV vertex, geometry and mesh shaders get:
+        // without the flag the validator refuses them ("Flags must match
+        // usage", 7,256 mesh and 74 vertex programs of a title's shader
+        // pack).
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if !self.pixel && !compute {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
         h
     }
 

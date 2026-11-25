@@ -5543,12 +5543,14 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                if mark {
-                    self.mark_heap_use(index, !per_lane);
-                }
+                // The handle first, in this block: callers may keep
+                // emitting into it after the mark's branch (`mark_heap_use`).
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
+                if mark {
+                    self.mark_heap_use(index, !per_lane);
+                }
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -5664,10 +5666,11 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 let index = self.buffer_guard(src, phi, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, false, props);
                 if mark {
                     self.mark_heap_use(index, true);
                 }
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(h)
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -5686,10 +5689,11 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, false, props);
                 if mark {
                     self.mark_heap_use(index, true);
                 }
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(h)
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -5697,10 +5701,11 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, true, props);
                 if mark {
                     self.mark_heap_use(index, false);
                 }
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(h)
             }
         }
     }
@@ -5863,11 +5868,20 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
-    /// Sets bit `index` of the heap-usage bitmap, in every lane.
-    /// shortcut: no branch to a single lane when the index is uniform:
-    /// callers keep emitting into the block they started in, so a split
-    /// here broke dominance ("forward reference outside a phi", run vu12);
-    /// every lane's atomic OR costs more GPU time.
+    /// Sets bit `index` of the heap-usage bitmap. One lane of each host
+    /// wave does it where the index is the same in every lane (checked at
+    /// run time: a console wave's uniform index need not be one host wave's,
+    /// as pixel waves are packed by the host), every lane otherwise: an atomic OR in
+    /// every lane put millions of atomics a frame on a few bitmap dwords
+    /// (every pixel of every draw reading a texture from the heap), and the
+    /// GPU time of a world frame grew several times over with the scene.
+    /// A marking lane first loads the dword, and does the atomic only where
+    /// the bit is still clear (as buffer write marks do).
+    ///
+    /// The bitmap is a root view, which has no bounds, so the other lanes
+    /// branch around the atomic instead of being sent out of bounds. The
+    /// branch is at the end of the current block (`bitcode::Module::branch_at_end`),
+    /// which stays current.
     fn mark_heap_use(&mut self, index: V, _uniform: bool) {
         let bitmap = self.s.heap_used_handle();
         let c = self.cur;
@@ -5882,7 +5896,32 @@ impl<'a> Lower<'a> {
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, index, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        // Which lanes mark: the first, and all where lanes differ.
+        self.s.flags |= flags::WAVE_OPS;
+        let i1 = self.s.t.i1;
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let equal = self.s.op(c, "waveActiveAllEqual.i32", Attr::NoUnwind, i1, 115, &[index]);
+        let t = self.s.m.bool(true);
+        let differ = self.s.m.bin(c, Bin::Xor, equal, t);
+        let marks = self.s.m.bin(c, Bin::Or, first, differ);
+        // The branch goes at the end of this block, which stays current:
+        // callers keep emitting into the block they started in, and a new
+        // current block broke dominance there ("forward reference outside
+        // a phi").
+        let (then, atomic, tail) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        // Most reads find their slot marked: a load, not an atomic (the
+        // bitmap is in system memory, so each atomic crosses the bus).
+        let zero = k(self, 0);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let old = self.s.op(then, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[bitmap, word, iu, mask, align]);
+        let old = self.s.m.extract(then, old, 0);
+        let old = self.s.m.cast(then, Cast::Bitcast, old, self.s.t.i32);
+        let set = self.s.m.bin(then, Bin::And, old, bit);
+        let clear = self.s.m.cmp(then, pred::EQ, set, zero);
+        self.s.m.terminate(then, Term::CondBr(clear, atomic, tail));
+        self.s.op(atomic, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.s.m.terminate(atomic, Term::Br(tail));
+        self.s.m.branch_at_end(c, marks, then, tail);
     }
 
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
@@ -10957,6 +10996,18 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether translated shaders mark the heap slots they read
+/// (`VICTORY_HEAP_USAGE`, on unless 0).
+pub fn heap_usage_marks() -> bool {
+    // shortcut: off in unit tests, whose hardware harness binds only the
+    // root parameters each test names (the bitmap would be unbound).
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
@@ -11916,16 +11967,4 @@ mod select_tests {
             }
         }
     }
-}
-
-/// Whether translated shaders mark the heap slots they read
-/// (`VICTORY_HEAP_USAGE`, on unless 0).
-pub fn heap_usage_marks() -> bool {
-    // shortcut: off in unit tests, whose hardware harness binds only the
-    // root parameters each test names (the bitmap would be unbound).
-    if cfg!(test) {
-        return false;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
 }
