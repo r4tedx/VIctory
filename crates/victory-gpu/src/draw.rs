@@ -2935,7 +2935,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A structured view the title places off its buffer's elements (the
     /// culling constants at a ring position) is made over a copy of its own
-    /// bytes; one on an element views the buffer's copy.
+    /// bytes; so is one on an element but not on 16 bytes, since the host
+    /// makes it raw (from marquezinii's review of #1762: element 1 of the
+    /// 456-byte constants); one on an element and on 16 bytes views the
+    /// buffer's copy.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
         let Some(host) = crate::host::host() else {
@@ -2969,8 +2972,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 4 * 456), 1 << 16, "on an element and 16 bytes: the buffer's copy");
+        assert_ne!(width(start + 456), 1 << 16, "on an element only: a copy of its own bytes (in a shared buffer)");
         assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
+        // Draws refresh the copy the view shows: its own for element 1.
+        let (copy, _, _) = crate::descriptor::host::view_copy(&view(start + 456)).unwrap();
+        assert_eq!(copy.range(), (start + 456, 4 * 456), "element 1's copy is its own");
+        drop(copy);
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
         drop(copy);
