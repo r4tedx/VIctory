@@ -4,6 +4,8 @@
 //! without 64-lane waves, programs whose lanes read only their own 32-lane
 //! half run as two host waves of 32 (see `lower::Lower::new`).
 
+mod mask_join_tests;
+
 use super::host::{Dispatch, Host, Root, View, adapters};
 use super::tests::{compute, emit_for};
 use crate::native::{RootParam, RootType, StageIo};

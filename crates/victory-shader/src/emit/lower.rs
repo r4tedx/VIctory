@@ -329,9 +329,9 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+fn reads_mask_as_data(st: &Structured, joins: &HashSet<Value>, i: &Inst) -> bool {
     reads_as_data(i, |v| {
-        st.masks.contains_key(&v) || st.highs.contains_key(&v)
+        st.masks.contains_key(&v) || st.highs.contains_key(&v) || joins.contains(&v)
     })
 }
 
@@ -462,12 +462,36 @@ impl<'a> Lower<'a> {
                     || i.name() == "ds_bpermute_b32"
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
+            // A scalar phi can hold a lane mask on just one incoming edge.
+            // Follow chains of those phis when one console wave spans two host halves.
+            let mut mask_joins = HashSet::new();
+            if x.native.wave64 && !x.target.runs(64) && x.target.runs(32)
+                && cs.threads.iter().product::<u32>() <= 64
+            {
+                loop {
+                    let before = mask_joins.len();
+                    for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+                        if matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                            && phi.args.iter().any(|a| {
+                                x.st.masks.contains_key(a)
+                                    || x.st.highs.contains_key(a)
+                                    || mask_joins.contains(a)
+                            })
+                        {
+                            mask_joins.insert(phi.value);
+                        }
+                    }
+                    if mask_joins.len() == before {
+                        break;
+                    }
+                }
+            }
             let whole = |i: &Inst| {
                 let n = i.name();
                 (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || reads_mask_as_data(x.st, i)
+                    || reads_mask_as_data(x.st, &mask_joins, i)
             };
             let reads_whole = insts().any(whole);
             let masks_held = {
@@ -7686,6 +7710,23 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    // The whole console wave follows the same edge here. Take
+                    // that edge's mask dword, including on each pass through a
+                    // loop body. A loop-carried phi needs a different rule.
+                    (Some(Val::Missing(_)) | None, false)
+                        if self.console_cf
+                            && self.split
+                            && self.group_waves == 1
+                            && p.blocks[b].preds.iter().all(|&q| self.rpo[q] < self.rpo[b])
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.cur_ir = usize::MAX;
+                        match self.mask_dword(arg) {
+                            Ok(x) => x,
+                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+                        }
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
