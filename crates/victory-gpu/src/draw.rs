@@ -70,6 +70,8 @@ pub(crate) struct State {
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
+    /// The last [`Self::dispatch`] ran (else its stand-ins take its place).
+    dispatch_ran: bool,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
@@ -1127,36 +1129,57 @@ impl State {
             return;
         }
         if let Some(stage) = p.stages.first() {
-            self.stand_in(list, &stage.shader.hash, &stage.translated().used, rules);
+            self.stand_in(list, &stage.shader.hash, Some(&stage.translated().used), rules);
         }
     }
 
-    /// The views of `rules` for `program`, whose code uses `used`, cleared
-    /// to their values: how many were.
+    /// In place of a dispatch that did not run (held back, dropped, or
+    /// without a host pipeline): the stand-ins `VICTORY_STAND_IN` sets for
+    /// its program (`crate::ambient`). Nothing of the program runs. Its
+    /// translation is not asked for: it may have none.
+    fn instead(&mut self, list: &HostList) {
+        let rules = crate::ambient::instead_rules();
+        if rules.is_empty() {
+            return;
+        }
+        if let Some(program) = crate::pipeline::compute_hash(self.pipeline as This) {
+            // The stand-in's clear writes GPU memory: an open window of
+            // batched clamps ends before it, as before any such command.
+            crate::indirect::end(list);
+            self.stand_in(list, program, None, rules);
+        }
+    }
+
+    /// The views of `rules` for `program`, whose code uses `used` (none:
+    /// not known, as for a program that did not run), cleared to their
+    /// values: how many were.
     fn stand_in(
         &mut self,
         list: &HostList,
         program: &str,
-        used: &[UsedResource],
+        used: Option<&[UsedResource]>,
         rules: &[crate::ambient::Rule],
     ) -> usize {
         let mut filled = 0;
         for rule in rules.iter().filter(|r| r.program == program) {
             let uavs = || -> Vec<String> {
-                used.iter()
+                used.unwrap_or_default()
+                    .iter()
                     .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
                     .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
                     .collect()
             };
             let first = !rule.seen.swap(true, Ordering::Relaxed);
-            let named = used.iter().any(|u| {
-                u.kind == ResourceType::Uav
-                    && u.root == RootType::Table
-                    && (u.slot, u.table_offset_dwords) == (rule.slot, rule.offset)
+            let named = used.is_none_or(|used| {
+                used.iter().any(|u| {
+                    u.kind == ResourceType::Uav
+                        && u.root == RootType::Table
+                        && (u.slot, u.table_offset_dwords) == (rule.slot, rule.offset)
+                })
             });
             if !named {
                 if first {
-                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "ambient stand-in: the program has no such unordered view in a table");
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "stand-in: the program has no such unordered view in a table");
                 }
                 crate::ambient::note(false);
                 continue;
@@ -1178,7 +1201,7 @@ impl State {
             };
             let Some((view, (format, own, size))) = view.and_then(|v| formats(&v).map(|f| (v, f))) else {
                 if first {
-                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: no unordered view of a texture there");
+                    tracing::warn!(program, view = %rule.view(), "stand-in: no unordered view of a texture there");
                 }
                 crate::ambient::note(false);
                 continue;
@@ -1195,7 +1218,8 @@ impl State {
                     ?size,
                     value = ?rule.value,
                     ?fill,
-                    "ambient stand-in: first dispatch of the program"
+                    ran = used.is_some(),
+                    "stand-in: first dispatch of the program"
                 );
             }
             let recorded = match fill {
@@ -1207,7 +1231,7 @@ impl State {
                 }
                 Err(why) => {
                     if first {
-                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "ambient stand-in: {why}");
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "stand-in: {why}");
                     }
                     false
                 }
@@ -1218,10 +1242,22 @@ impl State {
         filled
     }
 
-    /// Runs a dispatch on the host.
+    /// Runs a dispatch on the host; if it does not run, the stand-ins
+    /// `VICTORY_STAND_IN` names for its program take its place
+    /// ([`Self::instead`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // Indirect executions after it clamp what it writes.
+        // Indirect executions after it clamp what it writes (it or the
+        // stand-ins that take its place).
         crate::indirect::end(list);
+        self.dispatch_ran = false;
+        self.run_dispatch(list, x, y, z);
+        if !self.dispatch_ran {
+            self.instead(list);
+        }
+    }
+
+    /// [`Self::dispatch`] itself; `dispatch_ran` says whether it ran.
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1277,6 +1313,7 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.dispatch_ran = true;
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1881,7 +1918,26 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// If an indirect dispatch does not run, the stand-ins
+    /// `VICTORY_STAND_IN` names for its program take its place
+    /// ([`Self::instead`]).
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        const DISPATCH: u32 = 2;
+        let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if !ran && kind == DISPATCH {
+            self.instead(list);
+        }
+        ran
+    }
+
+    /// [`Self::execute_indirect`] itself.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -2985,8 +3041,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         run(&list, &slots, &write, 0, None, (N / 8, N / 8));
         let before = crate::ambient::filled();
-        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", &program_uses, &rules), 2, "the two views of its rules");
-        assert_eq!(state.stand_in(&list, "cccccccccccccccc", &program_uses, &rules), 0, "a program no rule names");
+        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", Some(&program_uses), &rules), 2, "the two views of its rules");
+        assert_eq!(state.stand_in(&list, "cccccccccccccccc", Some(&program_uses), &rules), 0, "a program no rule names");
         assert_eq!(crate::ambient::filled() - before, 2);
         for v in &reads {
             readable(&list, &used(ResourceType::Srv), v, false);
@@ -3005,6 +3061,155 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             assert_eq!(words, [grey, 0xdeadbeef], "texel {i}: the packed grey, and the unnamed view as written");
             assert_eq!(colour, [0.25, 0.5, 1.0, 1.0], "texel {i}: the colour as halves");
+        }
+    }
+
+    /// A title compute pipeline of `bytes`, which do not translate: it never
+    /// gets a host pipeline, so its dispatches do not run (the gate), and
+    /// its program's hash.
+    fn gated_compute(bytes: &'static [u8]) -> (This, String) {
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+        let desc = ComputeDesc { root: std::ptr::null(), code: bytes.as_ptr(), size: bytes.len() };
+        let mut out = std::ptr::null();
+        let made = crate::pipeline::create_compute(
+            std::ptr::null(),
+            std::ptr::from_ref(&desc).cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        (out, blake3::hash(bytes).to_hex()[..16].to_owned())
+    }
+
+    /// `VICTORY_STAND_IN` (`crate::ambient`): dispatches of programs that
+    /// cannot run (no host pipeline: the gate a held-back program meets
+    /// too) clear the views their rules name in their place, direct and
+    /// indirect; a program no rule names and an indirect draw clear
+    /// nothing, and nothing of the gated programs runs.
+    #[test]
+    fn stand_ins_take_the_place_of_dispatches_that_do_not_run() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R16_FLOAT (a shadow mask, say), R8_UINT, R16_FLOAT.
+        let formats = [54u32, 62, 54];
+        let textures: Vec<This> = formats
+            .iter()
+            .map(|&f| texture_at_address(title_memory(1 << 20), &texture_words(N, N, f, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Unordered(t as usize, 0, Some([f, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        for (i, (&t, f)) in textures.iter().zip(formats).enumerate() {
+            let desc = [f, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, t, null, &desc, title_heap.start + 32 * i as u64);
+        }
+        let slots = Slots::new(6);
+        for (i, v) in uavs.iter().enumerate() {
+            slots.make(i as u32, v);
+        }
+        let reads: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Shader(t as usize, Some([f, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])))
+            .collect();
+        for (i, v) in reads.iter().enumerate() {
+            slots.make(3 + i as u32, v);
+        }
+        // What the views held before: last frame's, say.
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=3))"
+RWTexture2D<float> a : register(u0);
+RWTexture2D<uint> b : register(u1);
+RWTexture2D<float> c : register(u2);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    a[id.xy] = 0.25;
+    b[id.xy] = 7;
+    c[id.xy] = 0.25;
+}
+"#,
+        );
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u1)"
+Texture2D<float> a : register(t0);
+Texture2D<uint> b : register(t1);
+Texture2D<float> c : register(t2);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store3((id.y * 16 + id.x) * 12, uint3(asuint(a.Load(at)), b.Load(at), asuint(c.Load(at))));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 12).unwrap();
+        let (direct, direct_hash) = gated_compute(b"stand-in test: a program that does not translate (direct)");
+        let (indirect, indirect_hash) = gated_compute(b"stand-in test: a program that does not translate (indirect)");
+        let (unnamed, _) = gated_compute(b"stand-in test: a program no rule names");
+        assert!(crate::pipeline::host_pipeline(direct).is_none(), "the gate");
+        let rules: &'static [crate::ambient::Rule] = Vec::leak(
+            crate::ambient::parse(&format!(
+                "{direct_hash}:s1+0:1,1,1; {direct_hash}:s1+8:mask; {indirect_hash}:s1+16:0.5,0.5,0.5"
+            ))
+            .unwrap(),
+        );
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(Some(rules)));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 1, title_heap.start);
+        for v in &uavs {
+            readable(&list, &used(ResourceType::Uav), v, false);
+        }
+        run(&list, &slots, &write, 0, None, (N / 8, N / 8));
+        let filled = crate::ambient::filled();
+        let ran = dispatched();
+        state.set_pipeline(direct);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(crate::ambient::filled() - filled, 2, "both views of the direct program's rules");
+        state.set_pipeline(indirect);
+        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None), "the indirect dispatch does not run");
+        assert_eq!(crate::ambient::filled() - filled, 3, "the view of the indirect program's rule");
+        state.set_pipeline(direct);
+        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None));
+        state.set_pipeline(unnamed);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(crate::ambient::filled() - filled, 3, "nothing for an indirect draw or a program no rule names");
+        assert_eq!(dispatched(), ran, "nothing of the programs ran");
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(None));
+        for v in &reads {
+            readable(&list, &used(ResourceType::Srv), v, false);
+        }
+        run(&list, &slots, &read, 3, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output.
+            let [a, b, c] = unsafe { (data.add(i * 12) as *const [u32; 3]).read() };
+            assert_eq!((f32::from_bits(a), b, f32::from_bits(c)), (1.0, 0xff, 0.5), "texel {i}");
+        }
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for p in [direct, indirect, unnamed] {
+            assert_eq!(release(p), 0);
         }
     }
 
