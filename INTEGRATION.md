@@ -37,6 +37,7 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 | #1428 | fuzeofficlal | `0e3796e` | `OMSetRenderTargets` reads no handle for zero targets, and bounds the count |
 | #2043 | Deilach | `7686b6f` | a pixel discard in a loop whose exit depends on it kills its lanes, as the console does |
 | #1989 | BastienRodz | `0f11320` | a vertex (or mesh, geometry) program writing through views declares the UAV flags the validator requires |
+| #1763 | n-romanovich | `50d91b1` | typed UAVs in formats the adapter does not support are refused whatever their family or castability, and the supported ones are pinned by tests (on NVIDIA, `main` removes the device at boot) |
 
 Left out for now: #2150 (one instruction per value on the finished
 module). It rewrites every emitted shader for a module-size gain; it has
@@ -70,8 +71,10 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 
 - `cargo build --release -p victory`, the test builds and
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- Checked at `0a31d51` (the #1763 merge; this file's later commits change
+  only text).
 - `victory-gpu` tests on WARP (diagnostics build, `VICTORY_D3D12_WARP=1`,
-  one test per process): 168 passed, 0 failed.
+  one test per process): 170 passed, 0 failed (#1763 adds two).
 - `victory-shader` tests with `VICTORY_WARP=1`, one test per process: 268
   passed, 2 failed. The two failures are hardware-only checks that
   `VICTORY_WARP=1` sends to WARP (`gathers_at_a_level_match_the_hardware`,
@@ -89,8 +92,13 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
   branch does not validate on `main` either.
 - The speed numbers of #2136 and #2111 in their PRs come from synthetic
   benchmarks, not from the game; times from the title are what they need.
-- Nothing from this branch was run on the RTX 5070, and **the title was not
-  run** with it. It makes no claim about results in the game.
+- In-game check by us (local title data, RTX 5070, driver 616.92,
+  diagnostics build): main 940d32f removes the device at boot after
+  9.5-11 s (debug layer: typed UAV of B5G5R5A1_UNORM unsupported, then
+  RemoveDevice); main + #1763 ran 10 minutes with no device removal.
+- Apart from that check of #1763 alone on `main`, nothing from this branch
+  was run on the RTX 5070, and **the title was not run** with this branch.
+  It makes no claim about results in the game.
 
 ## What a useful report from the title contains
 
