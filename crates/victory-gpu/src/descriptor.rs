@@ -289,18 +289,19 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 }
 
 /// The free and total dynamic slots of the title's view heap with the
-/// fewest free, for the log.
+/// fewest free, for the log. Each heap's fewest-free mark starts again
+/// from its slots free now.
 #[cfg(windows)]
-pub(crate) fn fullest_dynamic() -> Option<(u32, u32)> {
+pub(crate) fn fullest_dynamic() -> Option<host::DynamicStats> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     heaps
         .iter()
         // SAFETY: registered heaps are live (removed when dropped, which
         // waits for the lock we hold).
         .filter_map(|&(_, _, h)| unsafe { &*(h as *const Heap) }.host.get()?.as_ref())
-        .map(host::HostHeap::dynamic_free)
-        .filter(|&(_, total)| total > 0)
-        .min_by_key(|&(free, _)| free)
+        .map(host::HostHeap::dynamic_stats)
+        .filter(|d| d.total > 0)
+        .min_by_key(|d| d.free)
 }
 
 /// Runs `f` on the host heap behind the title heap at `heap` while that

@@ -38,6 +38,9 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
+    /// Dynamic slots title memory copies' view pairs hold, where the heap
+    /// has no room past the dynamic slots (a capped heap).
+    pair_slots: std::sync::atomic::AtomicU32,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -236,6 +239,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra)),
             pairs: Mutex::new((count + extra, Vec::new())),
+            pair_slots: std::sync::atomic::AtomicU32::new(0),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ if !sampler && cap == Some(total) => total - 1,
@@ -348,6 +352,15 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// What [`HostHeap::dynamic_stats`] tells.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DynamicStats {
+    pub(crate) free: u32,
+    pub(crate) total: u32,
+    pub(crate) low: u32,
+    pub(crate) pairs: u32,
+}
+
 /// A heap's dynamic slots: which are taken, how many are free, and where
 /// the search for free ones starts (past the last run taken).
 pub(crate) struct Slots {
@@ -359,11 +372,41 @@ pub(crate) struct Slots {
     /// 788ea467: once the slots ran out, every table of a frame walked them
     /// all again, and frames took seconds).
     longest: usize,
+    /// The fewest free since the last [`Slots::take_low`]: the pool's
+    /// high-water mark is its size less this.
+    low: u32,
 }
 
 impl Slots {
     pub(crate) fn new(n: u32) -> Self {
-        Slots { next: 0, taken: vec![false; n as usize], free: n, longest: n as usize }
+        Slots { next: 0, taken: vec![false; n as usize], free: n, longest: n as usize, low: n }
+    }
+
+    /// The fewest slots free since the last call; from now on, those free
+    /// now.
+    pub(crate) fn take_low(&mut self) -> u32 {
+        std::mem::replace(&mut self.low, self.free)
+    }
+
+    /// `n` consecutive free slots, the last such run from the end, taken
+    /// until released: the first. For what is held long (title memory
+    /// copies' view pairs, for as long as a copy lives), so that it lies
+    /// together at the top and does not break up the runs lists take from
+    /// the cursor on.
+    pub(crate) fn take_top(&mut self, n: u32) -> Option<u32> {
+        let n = n as usize;
+        if n == 0 || (self.free as usize) < n || self.longest < n {
+            return None;
+        }
+        let mut run = 0;
+        let first = (0..self.taken.len()).rev().find(|&at| {
+            run = if self.taken[at] { 0 } else { run + 1 };
+            run == n
+        })?;
+        self.taken[first..first + n].fill(true);
+        self.free -= n as u32;
+        self.low = self.low.min(self.free);
+        Some(first as u32)
     }
 
     /// The first of `want` consecutive free slots; else the longest free
@@ -410,6 +453,7 @@ impl Slots {
         let (first, n) = found.or((best.1 >= least).then_some(best))?;
         self.taken[first..first + n].fill(true);
         self.free -= n as u32;
+        self.low = self.low.min(self.free);
         self.next = ((first + n) % len) as u32;
         Some((first as u32, n as u32))
     }
@@ -435,7 +479,10 @@ impl Slots {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. Lists take theirs in runs
+    /// (`crate::draw`), title memory copies' view pairs from the top
+    /// ([`HostHeap::pair`]): tests take them so.
+    #[cfg(test)]
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
@@ -465,6 +512,18 @@ impl HostHeap {
         (slots.free, self.dynamic)
     }
 
+    /// The dynamic slots free now, in all, the fewest free since the last
+    /// call, and how many title memory copies' view pairs hold.
+    pub(crate) fn dynamic_stats(&self) -> DynamicStats {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        DynamicStats {
+            free: slots.free,
+            total: self.dynamic,
+            low: slots.take_low(),
+            pairs: self.pair_slots.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     /// Two consecutive slots (view heaps only) kept until
     /// [`HostHeap::free_pair`]: past the dynamic slots where the heap has
     /// room (a host copy's views, `crate::memory`, for as long as it
@@ -483,7 +542,12 @@ impl HostHeap {
                 return Some(pairs.0 - 2);
             }
         }
-        self.dynamic(2)
+        // From the top of the dynamic slots: a pair lives as long as its
+        // copy, and scattered among the runs lists take it would leave holes
+        // too short for a table when they come back.
+        let first = self.next.lock().unwrap_or_else(|e| e.into_inner()).take_top(2)?;
+        self.pair_slots.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Some(self.count + first)
     }
 
     /// Gives back a pair [`HostHeap::pair`] returned.
@@ -491,6 +555,7 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
+            self.pair_slots.fetch_sub(2, std::sync::atomic::Ordering::Relaxed);
             self.release(index, 2);
         }
     }
@@ -2152,6 +2217,30 @@ mod tests {
         // Wanting more than the pool holds takes the pool.
         let mut small = Slots::new(16);
         assert_eq!(small.take(256, 1), Some((0, 16)));
+    }
+
+    /// What is held long (title memory copies' view pairs) is taken from
+    /// the top, away from the runs taken from the cursor on; the fewest
+    /// free since the last look is kept.
+    #[test]
+    fn long_held_pairs_come_from_the_top() {
+        let mut slots = Slots::new(64);
+        assert_eq!(slots.take_top(2), Some(62));
+        assert_eq!(slots.take_top(2), Some(60));
+        assert_eq!(slots.take(16, 16), Some((0, 16)), "runs still start at the bottom");
+        slots.release(60, 2);
+        assert_eq!(slots.take_top(2), Some(60), "a pair given back is the top's again");
+        assert_eq!(slots.take_low(), 44);
+        slots.release(0, 16);
+        assert_eq!(slots.take_low(), 44, "the fewest since the last look");
+        assert_eq!(slots.take_low(), 60, "then from the slots free when last looked");
+        // No two free in a row: none.
+        let mut full = Slots::new(4);
+        assert_eq!(full.take(4, 4), Some((0, 4)));
+        full.release(1, 1);
+        full.release(3, 1);
+        assert_eq!(full.take_top(2), None);
+        assert_eq!(full.take_top(1), Some(3));
     }
 
     /// Slots given back are free again, counted once however often.

@@ -119,16 +119,30 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        // Before running them: the title may release a list as soon as it
-        // sees the submission done.
+        // Each list's dynamic slots, taken before running them: the title
+        // may release a list as soon as it sees the submission done. A list
+        // whose slots were taken back since it last ran does not run.
+        let mut host_lists = Vec::with_capacity(lists.len());
+        let mut leases = Vec::with_capacity(lists.len());
         for &l in lists {
-            crate::list::with_state(l, |_, state| state.submitted());
+            let Some(host_list) = crate::list::host_list(l) else { continue };
+            let mut lease = None;
+            crate::list::with_state(l, |_, state| lease = Some(state.lease()));
+            if let Some(lease) = lease {
+                if !lease.start() {
+                    continue;
+                }
+                leases.push(lease);
+            }
+            host_lists.push(host_list);
         }
+        let unwaited = crate::host::unwaited();
         host.execute(&host_lists);
+        // Every submission was waited for: the GPU is done with the lists.
+        let done = crate::host::unwaited() == unwaited;
+        for lease in &leases {
+            lease.finish(done);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
