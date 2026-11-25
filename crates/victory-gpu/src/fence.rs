@@ -1,5 +1,6 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it, moved by the
+//! title's signals and by our queues' once the submissions before them have
+//! finished.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -82,11 +83,25 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+
+/// Drops a reference a queue kept until its signal was done.
+#[cfg(windows)]
+pub(crate) fn release_kept(this: This) {
+    release(this);
+}
 extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    if event.is_null() && fence.value.load(Ordering::Acquire) < value {
+        // A null event means "block until reached": a queue's signal waits
+        // for the submissions before it, so those are finished first.
+        #[cfg(windows)]
+        if let Some(host) = crate::host::made() {
+            host.drain();
+        }
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -95,8 +110,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
+        // shortcut: what is left to reach it is the title's own signal,
+        // which could come from this thread; fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }

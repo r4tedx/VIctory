@@ -74,9 +74,6 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -89,17 +86,6 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
-        }
-    }
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -553,7 +539,7 @@ impl State {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
             };
-            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), list.view_writes()) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
                 return false;
@@ -581,7 +567,7 @@ impl State {
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()
             {
-                list.defer_heap(&host.viewed);
+                list.defer_heap(&host.viewed, writes);
             }
             crate::bindless::note_draw(writes);
         }
@@ -718,10 +704,16 @@ impl State {
                 }
             }
             if let Some(param) = stage.view_addresses {
-                let gpu = (self.heaps[0] != 0)
+                let heap = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                    .flatten()
-                    .and_then(|h| h.view_addresses());
+                    .flatten();
+                let gpu = heap.and_then(|h| {
+                    let gpu = h.view_addresses()?;
+                    if let Some(buffer) = h.view_addresses_buffer() {
+                        list.keep(buffer);
+                    }
+                    Some(gpu)
+                });
                 let Some(gpu) = gpu else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
@@ -742,6 +734,11 @@ impl State {
                     not_run("title memory without a view heap or page table");
                     return false;
                 };
+                let heap = match self.heaps[0] {
+                    0 => MEMORY_HEAP,
+                    h => h,
+                };
+                list.defer_memory(heap, stage.memory_dirty.is_some());
                 crate::memory::note_use(&p.name);
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
@@ -818,7 +815,11 @@ impl State {
                 once!("no dynamic slots for root views: dropped");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            let lease = match self.heaps[0] {
+                0 => crate::memory::OURS_ID,
+                h => crate::descriptor::heap(h as This).id(),
+            };
+            list.keep_dynamic(lease, first, ROOT_VIEW_RUN);
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -883,8 +884,7 @@ impl State {
         let Some(slot) = visible.dynamic(1) else {
             return;
         };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        list.keep_dynamic(heap.id(), slot, 1);
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1162,8 +1162,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            list.keep_dynamic(heap.id(), first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1257,7 +1256,7 @@ impl State {
                 let Some(shadow) = crate::shadow::find(at, len) else { continue };
                 let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
                 let (s, w) = (shadow.clone(), who.clone());
-                list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
+                list.defer_host((0, 0), (0, 0), move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
                 list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
             }
         }
@@ -1459,7 +1458,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host((from, n * 3 * stride), (to, n * 6 * stride), move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
@@ -1594,6 +1593,7 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
+        list.defer_indirect(arguments as usize, len as usize);
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -2021,6 +2021,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 }
             }
             host.execute(&[&list]);
+            host.drain();
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
     }
@@ -2197,6 +2198,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();
             host.execute(&[&list]);
+            host.drain();
             let copied = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed) > copies;
             assert_eq!(copied, !shared, "round {round}: a copy only where not shared");
             let n = read_size as usize;
@@ -2301,6 +2303,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.close();
         host.execute(&[&list]);
+        host.drain();
         let d24 = |u: u32| u * 256 + (u * 255 + 32767) / 65535;
         for (x, y) in [(0usize, 0usize), (5, 0), (63, 2), (17, 40), (63, 63)] {
             let k = (1 + x + 64 * y) as u32;
@@ -2353,6 +2356,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.close();
         host.execute(&[&list]);
+        host.drain();
         for (x, y) in [(0usize, 0usize), (63, 63)] {
             // SAFETY: inside the mapped buffer, by the footprints.
             let (half, byte) = unsafe {
@@ -2423,6 +2427,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             run(&list, &slots, &read, 1, Some(&out), (8, 8));
             list.close();
             host.execute(&[&list]);
+            host.drain();
             // SAFETY: inside the mapped output: texel (7, 2) of the read.
             let got = unsafe { (data.add((2 * 64 + 7) * 16) as *const [f32; 4]).read() };
             assert_eq!(got, want, "round {round}");
@@ -2490,6 +2495,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);
+        crate::host::release_retired();
         assert!(shown.upgrade().is_none(), "released with the slot");
     }
 }

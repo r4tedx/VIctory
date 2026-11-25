@@ -51,6 +51,10 @@ const CAPACITY: usize = 512;
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
 
+/// Our view heap's id for dynamic slot leases (`crate::host::HostList::keep_dynamic`);
+/// title heaps' ids count up from 1.
+pub(crate) const OURS_ID: u64 = u64::MAX;
+
 /// A list's use of title memory with a view heap bound.
 pub(crate) struct Map {
     /// The heap's page table's host GPU address (the root SRV).
@@ -335,14 +339,32 @@ fn layout(key: usize) -> Arc<Layout> {
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+/// until a step writes title memory). A table out of date is rewritten
+/// once `settle` has finished the submissions in flight that read it
+/// (outside our locks: finishing one runs its lists' work, which takes
+/// them); one that went out of date only since is rewritten next time.
+pub(crate) fn prepare(
+    key: usize,
+    settle: impl FnOnce(),
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let stale = with_heap(key, |heap| {
+        let host = std::ptr::from_ref(heap) as usize;
+        shared()
+            .iter()
+            .find(|(k, s)| *k == key && s.host == host)
+            .is_some_and(|(_, s)| s.generation != crate::shadow::generation())
+    })
+    .unwrap_or(false);
+    if stale {
+        settle();
+    }
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
+        if s.generation != now && stale {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -384,7 +406,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     // SAFETY: a live buffer.
     let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
-    list.defer_memory(key);
+    list.defer_memory(key, false);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let data = data as usize;
@@ -668,6 +690,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[0] + 16, 0x100);
         fill(memory[1] + PAGE, 0x200);
         host.execute(&[&lists[0], &lists[1]]);
+        host.drain();
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
         assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
@@ -680,6 +703,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[2] + 32, 0x300);
         fill(memory[0] + 16, 0x400);
         host.execute(&[&lists[0], &lists[1]]);
+        host.drain();
         assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
         assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
         assert!(pair_of(OURS, &c).is_some());

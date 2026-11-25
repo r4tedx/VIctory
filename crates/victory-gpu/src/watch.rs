@@ -350,6 +350,20 @@ impl Tracked {
             .contains(&page)
     }
 
+    /// Whether a page of `[from, to)` (bytes) changed since it was taken.
+    pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && self
+                .changed
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
+    }
+
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
@@ -377,6 +391,14 @@ impl Tracked {
     /// is under way.
     pub(crate) fn unarm(&self, page: usize) {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+    }
+
+    /// Page `page` has no pending GPU write left: disarm it and drop any
+    /// saved bytes so a withheld write does not retain stale armed state.
+    pub(crate) fn disarm_page(&self, page: usize) {
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.armed.remove(&page);
+        saved.bytes.remove(&page);
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.

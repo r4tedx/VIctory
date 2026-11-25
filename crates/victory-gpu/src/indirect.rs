@@ -283,6 +283,7 @@ mod tests {
             }
             list.close();
             host.execute(&[&list]);
+            host.drain();
             for at in all - per..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
             }
