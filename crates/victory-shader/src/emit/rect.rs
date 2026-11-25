@@ -103,8 +103,8 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     let mut completion: [Vec<Vec<_>>; 3] = Default::default();
     for (id, e) in elements.iter().enumerate() {
         let [mut a, mut bs, mut fourth] = [Vec::new(), Vec::new(), Vec::new()];
-        for col in 0..usize::from(e.cols) {
-            let [v0, v1, v2] = [0, 1, 2].map(|k| corners[k][id][col]);
+        let columns = corners[0][id].iter().zip(&corners[1][id]).zip(&corners[2][id]);
+        for ((&v0, &v1), &v2) in columns.take(usize::from(e.cols)) {
             let (va, vb) = (pick(&mut s.m, [v2, v0, v1]), pick(&mut s.m, [v1, v2, v0]));
             a.push(va);
             bs.push(vb);
