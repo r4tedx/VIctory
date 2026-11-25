@@ -429,6 +429,51 @@ mod tests {
         );
     }
 
+    /// PR #160's decoder test, every row reported
+    /// (`[image-tests] image_address_dwords_by_form | <form> | <outcome>`).
+    #[test]
+    fn image_address_dwords_by_form() {
+        // 2D: offset, bias and reference a dword each; 16-bit derivatives
+        // (g16 opcodes) two per dword, each direction its own; a16 packs
+        // the coordinates and the level, not the derivatives (the counts
+        // with a16 are those of LLVM's gfx10_asm_mimg.s).
+        let mut wrong = Vec::new();
+        for (op, a16, n) in [
+            (0x22u32, false, 6), // image_sample_d
+            (0x22, true, 5),     // image_sample_d, a16
+            (0x23, true, 6),     // image_sample_d_cl, a16
+            (0xA2, false, 4),    // image_sample_d_g16
+            (0xA2, true, 3),     // image_sample_d_g16, a16
+            (0xBB, false, 7),    // image_sample_c_d_cl_o_g16
+            (0x33, true, 7),     // image_sample_d_cl_o, a16
+        ] {
+            let w0 = 0xF000_0000 | (op & 0x7F) << 18 | op >> 7 | 1 << 3 | 1 << 8;
+            let d = decode(&bytes(&[w0, u32::from(a16) << 30, S_ENDPGM])).unwrap();
+            let Fields::Image { addr, .. } = d[0].fields(false) else {
+                panic!("{:?}", d[0].name())
+            };
+            let form = format!(
+                "{}{}",
+                d[0].name().unwrap_or("?"),
+                if a16 { " (a16)" } else { "" }
+            );
+            let got = match addr[..] {
+                [Operand::Vector { reg: 0, dwords }] => dwords,
+                _ => panic!("{form}: {addr:?}"),
+            };
+            let outcome = if got == n {
+                format!("passes ({n} address dwords)")
+            } else {
+                format!("WRONG: {got} address dwords, expected {n}")
+            };
+            eprintln!("[image-tests] image_address_dwords_by_form | {form} | {outcome}");
+            if got != n {
+                wrong.push(format!("{form}: {outcome}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn follows_branches_and_skips_data() {
         let code = [

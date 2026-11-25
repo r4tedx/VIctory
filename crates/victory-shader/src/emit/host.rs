@@ -1229,6 +1229,8 @@ pub enum View<'a> {
     /// An RGBA32F square texture SRV (size, levels) whose texels in level
     /// `n` are all `n`.
     Levels(u32, u32),
+    /// An R32F texture SRV (width, height, texels), for comparison sampling.
+    Depth(u32, u32, &'a [f32]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1535,6 +1537,42 @@ impl Host {
                             );
                             keep.push(upload);
                         }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
+                    View::Depth(w, h, texels) => {
+                        let format = DXGI_FORMAT_R32_FLOAT;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 4).next_multiple_of(256);
+                        let upload = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for y in 0..h as usize {
+                            let row = &texels[y * w as usize..(y + 1) * w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(y * pitch),
+                                row.len() * 4,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        let mut src = footprint_as(&upload, w, h, 1);
+                        src.Anonymous.PlacedFootprint.Footprint.Format = format;
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &src, None);
+                        keep.push(upload);
                         list.ResourceBarrier(&[transition(
                             &tex,
                             D3D12_RESOURCE_STATE_COPY_DEST,
