@@ -951,3 +951,6 @@ mod tests {
         let _ = offsets(&inputs);
     }
 }
+
+#[cfg(test)]
+mod root_constant_pixels;
