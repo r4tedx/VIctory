@@ -1435,6 +1435,12 @@ impl Host {
         }
     }
 
+    /// The queue lists run on: tile mappings (`crate::tiles`) go on it
+    /// ahead of the lists submitted after them.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         self.submit(runs);
@@ -3680,6 +3686,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
+            crate::tiles::status();
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
