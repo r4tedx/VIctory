@@ -136,6 +136,9 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
 }

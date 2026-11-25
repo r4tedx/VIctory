@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -92,17 +92,36 @@ fn key(translator: &str, encoding: &[u8], limit: u32, cap: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+/// The wave sizes a run translates for: the host device's, any without one.
+/// The warm-up asks here too, so its entries are the ones a run looks up.
+pub fn host_target() -> Target {
+    crate::host::host().map_or(Target::ANY, |h| h.target())
+}
+
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one, and whether it
+/// came from there.
+pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        target,
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &host_key(build(), target), container, translate),
         None => (translate(container), false),
     }
+}
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn host_key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -469,6 +488,22 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(host_key(&build, nvidia), host_key(&build, nvidia));
+        assert_ne!(host_key(&build, nvidia), host_key(&build, rdna));
+        assert_ne!(host_key(&build, nvidia), host_key(&[8; 32], nvidia));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
