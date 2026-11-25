@@ -1608,6 +1608,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Zero records cannot run any work: skip shadow refreshes, clamp
+        // dispatch, barriers, transitions, and pipeline/root invalidation.
+        if max == 0 && matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
+            return true;
+        }
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -1657,9 +1662,18 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        let Some(clamped) = crate::indirect::bound(
+            list,
+            &args.buffer,
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at))),
+            args.gpu(arguments),
+            (kind, stride, max),
+        ) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        };
+        if !clamped.transitioned() {
+            return true;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1678,7 +1692,12 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(
+                list,
+                &args.buffer,
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                clamped,
+            );
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1717,7 +1736,12 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(
+            list,
+            &args.buffer,
+            counter.as_ref().map(|(s, _)| &s.buffer),
+            clamped,
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
