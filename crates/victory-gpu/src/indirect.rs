@@ -863,7 +863,7 @@ pub(crate) fn member(
         end(list);
         return None;
     };
-    let Some(budget) = list.budget() else {
+    let Some((_, budget)) = list.budget() else {
         end(list);
         return None;
     };
@@ -1268,7 +1268,6 @@ mod tests {
         assert!(twice.iter().all(|&count| count == 0));
     }
 
-    use windows::Win32::Graphics::Direct3D12::*;
 
     /// The batched clamp's shaders compile with the system's compiler and
     /// the host takes them and their command signature.
@@ -1515,8 +1514,8 @@ mod tests {
         let old_gpu = unsafe { old.GetGPUVirtualAddress() };
         for ((kind, records, _), &offset) in calls.iter().zip(&offsets) {
             let spec = (*kind, words(*kind) as u32 * 4, *records);
-            assert!(super::bound(&list, &old, old_gpu + offset, spec));
-            super::done(&list, &old);
+            let clamped = super::bound(&list, &old, None, old_gpu + offset, spec).unwrap();
+            super::done(&list, &old, None, clamped);
         }
         list.close();
         host.execute(&[&list]);
@@ -1530,8 +1529,8 @@ mod tests {
             let spec = (*kind, words(*kind) as u32 * 4, *records);
             if inline(i) {
                 super::end(&batched);
-                assert!(super::bound(&batched, &new, new_gpu + offset, spec));
-                super::done(&batched, &new);
+                let clamped = super::bound(&batched, &new, None, new_gpu + offset, spec).unwrap();
+                super::done(&batched, &new, None, clamped);
                 members.push(None);
             } else {
                 // The first window fills (one run); then 30 executions name
@@ -1919,7 +1918,7 @@ mod tests {
                                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                             )]);
                             l.ExecuteIndirect(&signature, 1, &args, at, None, 0);
-                            super::done(&list, &args);
+                            super::done(&list, &args, None, super::Clamped::Ready);
                         } else if batched {
                             let m = super::member(&list, (a, at), None, (2, 12, 1)).unwrap();
                             if m.opened {
@@ -1929,12 +1928,12 @@ mod tests {
                                 l.ExecuteIndirect(&signature, 1, &m.buffer, m.offset, None, 0);
                             }
                         } else {
-                            assert!(super::bound(&list, &args, a + at, (2, 12, 1)));
+                            let clamped = super::bound(&list, &args, None, a + at, (2, 12, 1)).unwrap();
                             title();
                             if executes {
                                 l.ExecuteIndirect(&signature, 1, &args, at, None, 0);
                             }
-                            super::done(&list, &args);
+                            super::done(&list, &args, None, clamped);
                         }
                     }
                     super::end(&list);
