@@ -59,17 +59,32 @@ Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
 the host has no 64-lane waves and the program:
 - reads other lanes only through DPP and `ds_swizzle`, and has no
   `v_readfirstlane` (the console wave's first lane is not in the upper
-  half; such programs take the console flow);
+  half);
 - reads no mask whole and tests no bit of a mask held as a number;
 - has no whole-wave sections (their reductions would cover a half);
 - uses no LDS (the console compiler may have left out barriers between
   lanes of one wave).
 
-Anything else still stops with the step 1 reason. `mask_dword`, the wave
-reduction lowering and `lane_bit` refuse the split form as a safety net.
-(A wave64 program that declares no wave size at all still runs in whatever
-waves the host forms, as on `main`: its `v_readfirstlane` reads the host
-wave's first lane.)
+`mask_dword`, the wave reduction lowering and `lane_bit` reject
+operations the split form cannot express.
+
+An otherwise per-lane wave64 compute shader prefers console flow for an
+ordinary `v_readfirstlane_b32` when the host supports 32-lane waves but
+cannot run 64-lane waves, the group has 33–64 threads, and the source
+is not known to be uniform. A group of up to 32 threads fits in
+one host wave. Straight-line scalar and vector arithmetic over uniform
+inputs and constants can also keep the per-lane form. This includes scalar
+dword loads when every word of the base address or buffer descriptor and
+the scalar byte offset are uniform. Waterfall reads
+keep their existing descriptor lowering. The existing console-flow
+exclusions still apply. When the first-lane read alone requests console
+flow and that lowering declines the program, the emitter retries the
+per-lane form.
+
+An undeclared program reads the first active lane of each host wave. For
+a varying source the upper half can therefore read a different value from
+the console, including in groups larger than 64. On a host supporting both
+wave sizes an undeclared program can also run in 32-lane waves.
 
 **What crosses halves** goes through an exchange in groupshared memory:
 
@@ -124,6 +139,9 @@ flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
 waves, at most 64 threads per group, no `ds_permute`, and whole-wave
 sections only in a group of exactly 64 threads or of 32 or fewer.
+If an ordinary first-lane
+read is the sole reason to try console flow, the group must also have
+more than 32 threads and at least one read must lack a uniformity proof.
 
 **LDS.** The console runs an instruction in all 64 lanes before the next,
 so one wave shares LDS without `s_barrier`: a lane reads what a lane of the

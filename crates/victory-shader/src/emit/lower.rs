@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Encoding, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -327,6 +327,101 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// Whether an ordinary first-lane read could see a different value in the
+/// other host half. Follow straight-line arithmetic and scalar dword loads
+/// at uniform addresses. Joins and partial writes provide no such proof.
+fn needs_first_lane_exchange(x: &Parts<'_>) -> bool {
+    let ordinary_read = |i: &Inst| {
+        i.name() == "v_readfirstlane_b32"
+            && !i
+                .writes
+                .first()
+                .is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+    };
+    if !x.p.blocks.iter().flat_map(|b| &b.insts).any(ordinary_read) {
+        return false;
+    }
+    let mut uniform: HashSet<Value> =
+        x.p.inputs
+            .iter()
+            .filter_map(|&(reg, value)| matches!(reg, Reg::S(0..=105)).then_some(value))
+            .collect();
+    for b in crate::ir::reverse_postorder(&x.p.blocks) {
+        for (n, i) in x.p.blocks[b].insts.iter().enumerate() {
+            let known = |operand: &Operand| match *operand {
+                Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                    i.read(Reg::V(reg + k))
+                        .is_some_and(|v| uniform.contains(&v))
+                }),
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Scalar { code, dwords } => (0..dwords).all(|k| {
+                    i.read(Reg::S(code + k))
+                        .is_some_and(|v| uniform.contains(&v))
+                }),
+                Operand::Literal(_) | Operand::Const(128..=208 | 240..=248) => true,
+                _ => false,
+            };
+            if ordinary_read(i)
+                && let Fields::Valu(v) = &i.fields
+                && !v.src.first().is_some_and(known)
+            {
+                return true;
+            }
+            if x.st.reach[b] != Bool::TRUE || x.st.guards[b][n].is_some() {
+                continue;
+            }
+            let uniform_result = match &i.fields {
+                Fields::Sop { src, .. } => {
+                    // SOP2 arithmetic and SOPC comparisons depend on their
+                    // operands, including implicit SCC for carries and selects.
+                    (matches!(i.machine.encoding, Encoding::Sop2 | Encoding::Sopc)
+                        || matches!(i.name(), "s_mov_b32" | "s_mov_b64" | "s_movk_i32"))
+                        && src.iter().all(known)
+                        && i.reads.iter().all(|(_, v)| uniform.contains(v))
+                }
+                Fields::Smem { base, soffset, .. }
+                    if i.name().starts_with("s_load_dword")
+                        || i.name().starts_with("s_buffer_load_dword") =>
+                {
+                    // The immediate displacement is fixed. Check every word
+                    // of the address pair or descriptor, and the scalar offset.
+                    known(base) && known(soffset)
+                }
+                Fields::Valu(v) => {
+                    v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && matches!(
+                            i.name(),
+                            "v_mov_b32"
+                                | "v_add_nc_u32"
+                                | "v_sub_nc_u32"
+                                | "v_add3_u32"
+                                | "v_mul_lo_u32"
+                                | "v_lshlrev_b32"
+                                | "v_lshrrev_b32"
+                                | "v_ashrrev_i32"
+                                | "v_lshl_add_u32"
+                                | "v_and_b32"
+                                | "v_or_b32"
+                                | "v_xor_b32"
+                                | "v_add_f32"
+                                | "v_mul_f32"
+                                | "v_sub_f32"
+                        )
+                        && v.src.iter().all(known)
+                }
+                _ => false,
+            };
+            if uniform_result {
+                uniform.extend(i.writes.iter().filter_map(|&(reg, v)| {
+                    matches!(reg, Reg::V(_) | Reg::S(0..=105) | Reg::Scc).then_some(v)
+                }));
+            }
+        }
+    }
+    false
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -512,7 +607,8 @@ impl<'a> Lower<'a> {
             };
             console_lanes = reads_whole || masks_held || insts().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
             // lane reads is in its host wave, at its host lane's place in the
@@ -542,14 +638,25 @@ impl<'a> Lower<'a> {
             // group's form must come out the same.)
             let needs_wave64 = x.native.wave64
                 && (x.console_cf || (console_lanes || one_wave && s.lds_dwords > 0) && !split);
-            if needs_wave64 && !x.target.runs(64) {
+            // A first-lane read can need the other half even when nothing
+            // else selects console lanes. Prefer console flow when eligible,
+            // keeping the existing per-lane fallback if it cannot be used.
+            let prefers_console = !needs_wave64
+                && x.native.wave64
+                && !x.target.runs(64)
+                && (33..=64).contains(&threads)
+                && x.target.runs(32)
+                && !x.console_cf
+                && !x.per_lane_only
+                && needs_first_lane_exchange(x);
+            if (needs_wave64 || prefers_console) && !x.target.runs(64) {
                 // A group of several console waves that share no LDS and
                 // never meet at a barrier: its waves share nothing but what
                 // every group shares, so each becomes a host group of its
                 // own (64 threads), which is one console wave in the
                 // console flow. The dispatch runs that many times the
                 // groups (`HostShader::group_waves`).
-                let n: u32 = cs.threads.iter().product();
+                let n = threads;
                 if n > 64
                     && n.is_multiple_of(64)
                     && s.lds_dwords == 0
@@ -559,7 +666,7 @@ impl<'a> Lower<'a> {
                     group_waves = n / 64;
                     s.threads = Some([64, 1, 1]);
                 }
-                no_console_flow = if group_waves == 1 && n > 64 {
+                let excluded = if group_waves == 1 && n > 64 {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -579,7 +686,10 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
+                wants_console_flow = excluded.is_none() && x.target.runs(32);
+                if needs_wave64 {
+                    no_console_flow = excluded;
+                }
             }
             // On a host that runs the console's wave size: lane reads and
             // writes in a program whose lanes branch differently (see

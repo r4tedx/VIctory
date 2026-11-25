@@ -11,11 +11,11 @@ use crate::native::{RootParam, RootType, StageIo};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
-fn wave_size(dxil: &[u8]) -> Option<u32> {
-    let c = crate::Container::parse(dxil).ok()?;
-    let psv = c.part(crate::FourCC::PSV0)?.data;
-    let u = |at: usize| crate::dxbc::u32_at(psv, at).ok();
-    let (min, max) = (u(4 + 16)?, u(4 + 20)?);
+pub(super) fn wave_size(dxil: &[u8]) -> Option<u32> {
+    let c = crate::Container::parse(dxil).expect("DXIL container");
+    let psv = c.part(crate::FourCC::PSV0).expect("PSV0").data;
+    let u = |at| crate::dxbc::u32_at(psv, at).expect("PSV0 wave lane count");
+    let (min, max) = (u(4 + 16), u(4 + 20));
     (min == max).then_some(min)
 }
 
@@ -67,6 +67,19 @@ const IN_HALF: &[u32] = &[
 ];
 
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
+    let StageIo::Cs(io) = &native.io else {
+        unreachable!()
+    };
+    let n = io.threads.iter().product::<u32>() * groups;
+    run_with_views(host, native, groups, &[View::RawUav(n)])
+}
+
+fn run_with_views(
+    host: &Host,
+    native: &crate::NativeProgram,
+    groups: u32,
+    views: &[View<'_>],
+) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
     // The validator, where one is installed: drivers take some modules it
@@ -79,17 +92,12 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
     }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
-    let StageIo::Cs(io) = &native.io else {
-        unreachable!()
-    };
-    let n = io.threads.iter().product::<u32>() * groups;
-    let views = [View::RawUav(n)];
     let out = host.dispatch(
         &root,
         &pso,
         &Dispatch {
             roots: vec![(0, Root::Constants(data))],
-            views: &views,
+            views,
             samplers: &[],
             // One host group per console wave where the shader says so.
             groups: [groups * cs.group_waves, 1, 1],
@@ -1356,5 +1364,179 @@ fn wave32_loop_exit_mask_counts_a_partial_second_wave() {
         } else {
             eprintln!("{name}: native Wave32 support not reported; skipped");
         }
+    }
+}
+
+/// `v_readfirstlane_b32 s12, v4` of v4 = 3t + 7, inside `if (t >= 10)`:
+/// the console's first lane in EXEC is lane 10 (37) for every active lane.
+/// Without other lane reads in the program the host's first lane of its
+/// 32-lane wave stood for it, and lanes 32-63 read lane 32's 103 (RTX 4090).
+const DIVERGENT_FIRST_LANE: &[u32] = &[
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x3408_0081, // v_lshlrev_b32 v4, 1, v0
+    0x4A08_0900, // v_add_nc_u32 v4, v0, v4
+    0x4A08_0887, // v_add_nc_u32 v4, 7, v4
+    0x7D82_0089, // v_cmp_lt_u32 vcc, 9, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF88_0002, // s_cbranch_execz 2
+    0x7E18_0504, // v_readfirstlane_b32 s12, v4
+    0x7E04_020C, // v_mov_b32 v2, s12
+    0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+];
+
+/// `v_readfirstlane_b32 s9, v0` at entry, nothing else reading lanes: the
+/// console's first lane is 0; the upper host wave's was 32.
+const ENTRY_FIRST_LANE: &[u32] = &[
+    0x7E12_0500, // v_readfirstlane_b32 s9, v0
+    0x7E04_0209, // v_mov_b32 v2, s9
+];
+
+#[test]
+fn first_lane_reads_span_the_console_wave_on_wave32_hosts() {
+    let mut ran = false;
+    for name in hardware_adapters() {
+        let Ok(host) = Host::on(&name) else { continue };
+        let target = host.target();
+        if !target.runs(32) || target.runs(64) {
+            continue;
+        }
+        for threads in [32, 48, 64] {
+            for (body, divergent) in [(ENTRY_FIRST_LANE, false), (DIVERGENT_FIRST_LANE, true)] {
+                let groups = 2;
+                let out = run(&host, &program(body, threads), groups)
+                    .unwrap_or_else(|e| panic!("{name}: {threads} threads: {e}"));
+                let expected: Vec<u32> = (0..groups * threads)
+                    .map(|lane| {
+                        if divergent && lane % threads >= 10 {
+                            37
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    out, expected,
+                    "{name}: {threads} threads, divergent={divergent}"
+                );
+            }
+        }
+        let out = run(&host, &program(UNIFORM_FIRST_LANE, 64), 2).expect("uniform first-lane read");
+        assert_eq!(out[..64], [2; 64], "{name}: group 0");
+        assert_eq!(out[64..], [3; 64], "{name}: group 1");
+        ran = true;
+        eprintln!("{name}: entry and divergent first-lane reads matched in both groups");
+    }
+    if !ran {
+        eprintln!("no eligible Wave32 adapter; skipping first-lane readback");
+    }
+}
+
+// The group ID s1 is shared by all lanes. Exercise both scalar and
+// vector arithmetic, including a VGPR used as its own source.
+const UNIFORM_FIRST_LANE: &[u32] = &[
+    0x800D_8101, // s_add_u32 s13, s1, 1
+    0x7E08_020D, // v_mov_b32 v4, s13
+    0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+    0x7E18_0504, // v_readfirstlane_b32 s12, v4
+    0x7E04_020C, // v_mov_b32 v2, s12
+];
+
+// Load a descriptor from the second table slot, then read a pair of
+// dwords from its buffer. The first-lane read uses the second dword.
+fn scalar_load_first_lane(offset: u32, threads: u32) -> crate::NativeProgram {
+    program(
+        &[
+            0xF408_0401,
+            0xFA00_0020, // s_load_dwordx4 s[16:19], s[2:3], 32
+            offset,      // defines s15, the buffer byte offset
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF424_0508,
+            0x1E00_0000, // s_buffer_load_dwordx2 s[20:21], s[16:19], s15
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_0215, // v_mov_b32 v4, s21
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ],
+        threads,
+    )
+}
+
+#[test]
+fn first_lane_reads_of_uniform_scalar_loads_stay_per_lane() {
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [48, 64] {
+        let p = scalar_load_first_lane(0x8F0F_8301, threads); // s_lshl_b32 s15, s1, 3
+        assert_eq!(wave_size(&emit_for(&p, target).unwrap().dxil), None);
+        // s_not_b32 s15, -1 gives zero, but is outside the arithmetic proof.
+        let unproven = scalar_load_first_lane(0xBE8F_07C1, threads);
+        assert_eq!(
+            wave_size(&emit_for(&unproven, target).unwrap().dxil),
+            Some(32)
+        );
+        for name in hardware_adapters() {
+            let Ok(host) = Host::on(&name) else { continue };
+            if !host.target().runs(32) || host.target().runs(64) {
+                continue;
+            }
+            let out = run_with_views(
+                &host,
+                &p,
+                2,
+                &[View::RawUav(2 * threads), View::Cbv(&[11, 37, 13, 91])],
+            )
+            .unwrap();
+            assert_eq!(out.len(), 2 * threads as usize);
+            assert!(out[..threads as usize].iter().all(|&v| v == 37));
+            assert!(out[threads as usize..].iter().all(|&v| v == 91));
+            eprintln!("{name}: {threads} threads read 37 and 91 in the two groups");
+        }
+    }
+}
+
+#[test]
+fn first_lane_reads_declare_a_wave_only_for_a_varying_upper_half() {
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let declared =
+        |body: &[u32], threads| wave_size(&emit_for(&program(body, threads), target).unwrap().dxil);
+    for threads in [32, 48, 64] {
+        let expected = (threads > 32).then_some(32);
+        assert_eq!(declared(ENTRY_FIRST_LANE, threads), expected);
+        assert_eq!(declared(DIVERGENT_FIRST_LANE, threads), expected);
+        assert_eq!(declared(UNIFORM_FIRST_LANE, threads), None);
+    }
+
+    // Each constant is uniform until the masked write combines them.
+    let joined = [
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7D82_0089, // v_cmp_lt_u32 vcc, 9, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0x7E08_02AA, // v_mov_b32 v4, 42
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x7E04_020C, // v_mov_b32 v2, s12
+    ];
+    assert_eq!(declared(&joined, 64), Some(32));
+}
+
+/// Groups of more than one console wave keep the form they had: admitted
+/// on 32-lane hosts, each host wave reading its own first lane (inexact
+/// where the value differs across the lanes; the console flow is for one
+/// console wave per group).
+#[test]
+fn first_lane_reads_in_larger_groups_stay_admitted() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for body in [DIVERGENT_FIRST_LANE, ENTRY_FIRST_LANE] {
+        assert!(emit_for(&program(body, 64), nvidia).is_ok());
+        assert!(emit_for(&program(body, 128), nvidia).is_ok());
+        assert!(emit_for(&program(body, 256), nvidia).is_ok());
     }
 }

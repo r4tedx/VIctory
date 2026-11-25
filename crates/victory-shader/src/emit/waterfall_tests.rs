@@ -73,14 +73,21 @@ fn lower_as(
     buffers: bool,
     console_cf: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
-    let native = native(words, buffers);
+    lower_for(&native(words, buffers), super::Target::ANY, console_cf)
+}
+
+fn lower_for(
+    native: &NativeProgram,
+    target: super::Target,
+    console_cf: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let console = structure::structure_console(&p).expect("structure_console");
     lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: if console_cf { &console } else { &st },
         io: &io,
@@ -89,7 +96,7 @@ fn lower_as(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: super::Target::ANY,
+        target,
         console_cf,
         per_lane_only: false,
     })
@@ -351,6 +358,83 @@ fn joined_descriptors_keep_the_per_lane_form_when_the_console_flow_is_asked_for(
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
             v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}
+
+/// [`WATERFALL_JOINED_WAVE32`] as a wave64 program (the masks in SGPR
+/// pairs, encodings from llvm-mc for gfx1030 wave64), with `first_lane`
+/// the sample's second coordinate read from the first lane's id
+/// (`v_readfirstlane_b32 s44, v0`, outside the waterfall loop).
+///
+/// [`WATERFALL_JOINED_WAVE32`]: crate::resource::tests::WATERFALL_JOINED_WAVE32
+fn joined_wave64(first_lane: bool) -> Vec<u32> {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let mut words = Vec::new();
+    for &w in WATERFALL_JOINED_WAVE32 {
+        match w {
+            0x7E06_0302 if first_lane => words.extend([
+                0x7E58_0500, // v_readfirstlane_b32 s44, v0
+                0x7E06_022C, // v_mov_b32 v3, s44
+            ]),
+            0xBE94_3C6A => words.push(0xBE94_246A), // s_and_saveexec_b64 s[20:21], vcc
+            0x8914_147E => words.push(0x8994_147E), // s_xor_b64 s[20:21], exec, s[20:21]
+            0xBE94_3D14 => words.push(0xBE94_2514), // s_or_saveexec_b64 s[20:21], s[20:21]
+            0x897E_147E => words.push(0x89FE_147E), // s_xor_b64 exec, exec, s[20:21]
+            0x887E_147E => words.push(0x88FE_147E), // s_or_b64 exec, exec, s[20:21]
+            0xBE97_037E => words.push(0xBEAE_047E), // s_mov_b64 s[46:47], exec
+            0xD4E2_0015 => words.push(0xD4E2_0030), // v_cmp_eq_u64_e64 s[48:49], ...
+            0xD4E2_0016 => words.push(0xD4E2_0032), // v_cmp_eq_u64_e64 s[50:51], ...
+            0x8715_1615 => words.push(0x87B0_3230), // s_and_b64 s[48:49], s[48:49], s[50:51]
+            0xBE95_3C15 => words.push(0xBEB0_2430), // s_and_saveexec_b64 s[48:49], s[48:49]
+            0x897E_157E => words.push(0x89FE_307E), // s_xor_b64 exec, exec, s[48:49]
+            0xBEFE_0317 => words.push(0xBEFE_042E), // s_mov_b64 exec, s[46:47]
+            w => words.push(w),
+        }
+    }
+    words
+}
+
+/// On a 32..32 host, a native wave64 group of 33-64 threads whose only
+/// cross-lane operation outside the waterfall is a first-lane read of a
+/// varying value asks for the console flow by that read alone; the console
+/// flow refuses the descriptor joined per lane, and `emit` keeps the
+/// per-lane form, declaring no wave size.
+#[test]
+fn a_first_lane_read_with_joined_descriptors_falls_back_to_the_per_lane_form() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for threads in [48u32, 64] {
+        let program = |first_lane| {
+            let mut cs = native(&joined_wave64(first_lane), false);
+            cs.wave64 = true;
+            cs.io = StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [threads, 1, 1],
+            });
+            cs
+        };
+        assert!(lower_for(&program(false), nvidia, false).is_ok());
+        let cs = program(true);
+        for (console_cf, expected) in [
+            (false, lower::CONSOLE_FLOW),
+            (true, lower::LANE_PHI_IN_CONSOLE_FLOW),
+        ] {
+            match lower_for(&cs, nvidia, console_cf) {
+                Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(what, expected),
+                Err(e) => panic!("{threads} threads: {e}"),
+                Ok(_) => panic!("{threads} threads: expected {expected}"),
+            }
+        }
+        let mut shader = super::tests::emit_for(&cs, nvidia).expect("per-lane retry");
+        assert_eq!(super::split_tests::wave_size(&shader.dxil), None);
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil)
                 .expect("DXIL validation failed");
         }
     }
