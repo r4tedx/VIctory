@@ -320,10 +320,14 @@ mod tests {
         (queue, allocator, list)
     }
 
-    /// Closes the list and submits it (run and waited for with a host GPU).
+    /// Closes the list and submits it (run and waited for with a host GPU:
+    /// tests take the asynchronous path, so the timeline is drained).
     fn run(queue: This, list: This) {
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        if let Some(host) = crate::host::made() {
+            host.drain();
+        }
     }
 
     fn read(data: *mut u8, index: usize) -> u64 {

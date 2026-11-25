@@ -880,8 +880,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.close();
         host.execute(&[&list]);
+        host.drain();
 
-        // SAFETY: GPU work waited on in `execute`; offsets lie inside `readback`.
+        // SAFETY: GPU work waited on (drained); offsets lie inside `readback`.
         unsafe {
             for x in [0usize, 3, 7] {
                 let got = (ptr.add(fp32.Offset as usize + x * 4) as *const f32).read();
