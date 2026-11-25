@@ -3205,7 +3205,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::procmem::count_buffer(&buffer, crate::procmem::Kind::Upload, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
@@ -3270,7 +3274,10 @@ impl Host {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, mapped whole.
         match unsafe { buffer.Map(0, None, Some(&mut data)) } {
-            Ok(()) => Some((buffer, data.cast_const().cast())),
+            Ok(()) => {
+                crate::procmem::count_buffer(&buffer, crate::procmem::Kind::Readback, size);
+                Some((buffer, data.cast_const().cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -3516,6 +3523,7 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
+                crate::procmem::log();
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::frame::log();
                 log_gpu_times(copy_frames);
@@ -3844,7 +3852,16 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                let kind = if upload {
+                    crate::procmem::Kind::GpuUpload
+                } else {
+                    crate::procmem::Kind::Shared
+                };
+                crate::procmem::count_buffer(&buffer, kind, size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None

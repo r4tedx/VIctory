@@ -335,6 +335,8 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 let ms = started.elapsed().as_millis() as u64;
                 let (bytes, mapped) = (blob.bytes().len(), matches!(blob, Blob::Mapped(_)));
                 tracing::info!(bytes, mapped, ms, "host pipeline library loaded");
+                crate::procmem::LIBRARY_BYTES.store(bytes as u64, Ordering::Relaxed);
+                crate::procmem::LIBRARY_MAPPED.store(mapped.into(), Ordering::Relaxed);
                 return Some(Library {
                     library,
                     _blob: blob,
@@ -436,7 +438,9 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let pso = create()?;
+        crate::procmem::count(&pso, crate::procmem::Kind::Pipeline, 0);
+        return Ok(pso);
     };
     let _held = NAMES.hold(name);
     // The interface alone under the lock: loads take up to seconds. Its
@@ -448,6 +452,7 @@ pub(crate) fn pipeline(
         .clone();
     if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
+        crate::procmem::count(&pso, crate::procmem::Kind::Pipeline, 0);
         return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
@@ -455,6 +460,7 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), false)));
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
+    crate::procmem::count(&pso, crate::procmem::Kind::Pipeline, 0);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
@@ -576,6 +582,7 @@ pub(crate) fn save(now: bool) {
         } else {
             // SAFETY: a plain query.
             let size = unsafe { l.library.GetSerializedSize() };
+            crate::procmem::LIBRARY_SERIALIZED.store(size as u64, Ordering::Relaxed);
             // SAFETY: a buffer of the size the library asks for.
             let written = write_library(dir, size, |out| unsafe { l.library.Serialize(out) });
             match written {

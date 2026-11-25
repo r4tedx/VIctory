@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -153,6 +153,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // A new reservation (not a placeholder, whose pages are sections):
+    // its commit shows in the GPU side's memory line.
+    if !at.is_null() && kind & MEM_RESERVE != 0 && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        victory_gpu::title_reserved(at as usize);
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -313,6 +318,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
+    victory_gpu::title_heap(layout.size() as i64);
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -338,6 +344,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::title_heap(-(size as i64));
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -357,7 +364,52 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    /// Its bytes, and a bit per page committed so far (once per page,
+    /// whichever view): for the GPU side's memory line
+    /// (`victory_gpu::title_sections`).
+    bytes: usize,
+    committed: Box<[AtomicU64]>,
+}
+
+impl Section {
+    /// A section of `bytes` made with `handle`; `committed` if the host
+    /// commits it whole (Wine).
+    fn new(handle: HANDLE, bytes: usize, committed: bool) -> Section {
+        let pages = bytes.div_ceil(PAGE);
+        let bits = (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+        let section = Section {
+            handle,
+            bytes,
+            committed: bits,
+        };
+        victory_gpu::title_sections(bytes as i64, 0);
+        if committed {
+            section.note_committed(0, pages);
+        }
+        section
+    }
+
+    /// Pages `[first, first + n)` are committed now: returns how many were
+    /// not before.
+    fn note_committed(&self, first: usize, n: usize) -> u64 {
+        let mut new = 0u64;
+        for page in first..(first + n).min(self.bytes.div_ceil(PAGE)) {
+            let Some(word) = self.committed.get(page / 64) else {
+                break;
+            };
+            let bit = 1u64 << (page % 64);
+            if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                new += 1;
+            }
+        }
+        if new > 0 {
+            victory_gpu::title_sections(0, (new * PAGE as u64) as i64);
+        }
+        new
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -366,8 +418,14 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        let committed: u64 = self
+            .committed
+            .iter()
+            .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
+            .sum();
+        victory_gpu::title_sections(-(self.bytes as i64), -((committed * PAGE as u64) as i64));
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -509,7 +567,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, size, on_wine()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -566,7 +624,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -577,7 +635,11 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        let committed = commit(at.Value as usize, len);
+        if committed {
+            slice.section.note_committed(slice.index, n);
+        }
+        committed.then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -805,7 +867,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -830,6 +892,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.note_committed(slice.index, len / PAGE);
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {
@@ -1050,6 +1113,38 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_section_counts_each_page_committed_once() {
+        // SAFETY: plain section creation (closed by the section's drop).
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                (130 * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = Section::new(handle, 130 * PAGE, false);
+        assert_eq!(section.note_committed(0, 3), 3);
+        assert_eq!(
+            section.note_committed(1, 3),
+            1,
+            "pages 1 and 2 were committed"
+        );
+        // Across a word of the bitset, and stopping at the section's end.
+        assert_eq!(section.note_committed(62, 4), 4);
+        assert_eq!(section.note_committed(128, 10), 2);
+        let total: u32 = section
+            .committed
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones())
+            .sum();
+        assert_eq!(total, 3 + 1 + 4 + 2);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
