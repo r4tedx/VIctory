@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+use victory_shader::emit::{self, counts::Counts, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -74,6 +74,10 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// With `--count`: the instructions of the emitted shaders, by stage
+    /// (with the programs counted) and in all.
+    count: bool,
+    counted: BTreeMap<&'static str, (usize, Counts)>,
 }
 
 impl Tally {
@@ -134,6 +138,11 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        for (stage, (n, counts)) in other.counted {
+            let total = self.counted.entry(stage).or_default();
+            total.0 += n;
+            total.1.add(&counts);
+        }
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -157,6 +166,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    count: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
@@ -207,6 +217,7 @@ pub fn run(
                         s.spawn(|| {
                             let mut t = Tally {
                                 list,
+                                count,
                                 ..Tally::default()
                             };
                             let mut checks = Checks {
@@ -286,6 +297,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if count {
+        print_counts(&t.counted);
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -611,6 +625,30 @@ fn check(
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
+    if t.count {
+        match emit::counts::of(&shader.dxil) {
+            Ok(counts) => {
+                if t.list {
+                    t.lines.push(format!(
+                        "{}  {} host instructions in {} blocks",
+                        label(),
+                        counts.instructions,
+                        counts.blocks
+                    ));
+                }
+                let stage = match shader.stage {
+                    HwStage::Cs => "compute",
+                    HwStage::Ms => "mesh",
+                    HwStage::Ps => "pixel",
+                    _ => "vertex",
+                };
+                let total = t.counted.entry(stage).or_default();
+                total.0 += 1;
+                total.1.add(&counts);
+            }
+            Err(e) => t.fail(format!("count: {e}"), &label),
+        }
+    }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
@@ -682,6 +720,31 @@ fn check(
             }
             t.fail(format!("validator: {first}"), label);
         }
+    }
+}
+
+/// With `--count`: what the emitted shaders hold, by stage and then by kind
+/// of instruction (most first). Counts only, so it can be posted as it is.
+fn print_counts(counted: &BTreeMap<&'static str, (usize, Counts)>) {
+    let mut all = (0, Counts::default());
+    for (n, counts) in counted.values() {
+        all.0 += n;
+        all.1.add(counts);
+    }
+    println!(
+        "host code    {} instructions in {} blocks of {} emitted programs",
+        all.1.instructions, all.1.blocks, all.0
+    );
+    for (stage, (n, counts)) in counted {
+        println!(
+            "             {stage}: {} instructions in {} blocks of {n} programs",
+            counts.instructions, counts.blocks
+        );
+    }
+    let mut kinds: Vec<_> = all.1.kinds.iter().collect();
+    kinds.sort_by_key(|&(kind, n)| (std::cmp::Reverse(*n), kind));
+    for (kind, n) in kinds {
+        println!("  {n:>11}  {kind}");
     }
 }
 
@@ -879,7 +942,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, false, Some(1)).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
