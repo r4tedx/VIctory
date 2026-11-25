@@ -326,11 +326,20 @@ pub(crate) fn small_float(v: f32, mantissa: u32) -> u32 {
 static FILLED: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+// The stand-ins recorded on this thread (tests): tests run in parallel,
+// each on its own thread, and record their stand-ins there.
+#[cfg(test)]
+thread_local! {
+    static TEST_FILLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A stand-in recorded (`filled`) or not, logged every 5 s with the counts
 /// so far.
 pub(crate) fn note(filled: bool) {
     if filled {
         FILLED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        TEST_FILLED.with(|n| n.set(n.get() + 1));
     } else {
         SKIPPED.fetch_add(1, Ordering::Relaxed);
     }
@@ -351,10 +360,11 @@ pub(crate) fn note(filled: bool) {
     }
 }
 
-/// How many stand-ins were recorded (tests).
+/// How many stand-ins this thread recorded (tests): not the run's count,
+/// which tests running alongside add to.
 #[cfg(test)]
 pub(crate) fn filled() -> u64 {
-    FILLED.load(Ordering::Relaxed)
+    TEST_FILLED.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

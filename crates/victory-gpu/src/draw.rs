@@ -988,14 +988,17 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
-        self.clear_view(list, &view, values, float, rects, false);
+        self.clear_view(list, &view, values, float, rects, false, None);
     }
 
     /// The clear of [`Self::clear_unordered`] of `view`; `written`: a
     /// dispatch just wrote it, so unordered access barriers go before and
-    /// after the clear. Whether it was recorded. Its shader-visible slot is
-    /// a dynamic one the list holds until reset, one per view however often
-    /// the list clears it (`clear_slots`).
+    /// after the clear. `predicate`: a word the clear alone (not what
+    /// readies the view for it) is predicated on, skipped where it holds
+    /// zero. Whether it was recorded. Its shader-visible slot is a dynamic
+    /// one the list holds until reset, one per view however often the list
+    /// clears it (`clear_slots`).
+    #[allow(clippy::too_many_arguments)]
     fn clear_view(
         &mut self,
         list: &HostList,
@@ -1004,6 +1007,7 @@ impl State {
         float: bool,
         rects: &[RECT],
         written: bool,
+        predicate: Option<&ID3D12Resource>,
     ) -> bool {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
@@ -1059,6 +1063,9 @@ impl State {
             if written {
                 list.list.ResourceBarrier(&[barrier()]);
             }
+            if let Some(predicate) = predicate {
+                list.list.SetPredication(predicate, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
@@ -1066,6 +1073,9 @@ impl State {
             } else {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
+            if predicate.is_some() {
+                list.list.SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
             }
             if written {
                 list.list.ResourceBarrier(&[barrier()]);
@@ -1075,25 +1085,87 @@ impl State {
     }
 
     /// After a dispatch of `p`: the stand-ins `VICTORY_AMBIENT` sets for
-    /// its program (`crate::ambient`).
-    fn stand_ins(&mut self, list: &HostList, p: &HostPipeline) {
+    /// its program (`crate::ambient`). `indirect`: an indirect dispatch's
+    /// most records and its record count ([`Self::stand_in_after_indirect`]).
+    fn stand_ins(&mut self, list: &HostList, p: &HostPipeline, indirect: Option<(u32, Records<'_>)>) {
         let rules = crate::ambient::rules();
         if rules.is_empty() {
             return;
         }
-        if let Some(stage) = p.stages.first() {
-            self.stand_in(list, &stage.shader.hash, &stage.translated().used, rules);
+        let Some(stage) = p.stages.first() else { return };
+        let (program, used) = (&stage.shader.hash, &stage.translated().used);
+        match indirect {
+            None => {
+                self.stand_in(list, program, used, rules, None);
+            }
+            Some((max, records)) => {
+                self.stand_in_after_indirect(list, program, used, rules, max, records);
+            }
         }
     }
 
+    /// Whether `VICTORY_AMBIENT` names the program of the bound pipeline:
+    /// whether a dispatch of it has stand-ins after it.
+    fn names_stand_ins(&self) -> bool {
+        let rules = crate::ambient::rules();
+        !rules.is_empty()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .and_then(|p| p.stages.first())
+                .is_some_and(|s| rules.iter().any(|r| r.program == s.shader.hash))
+    }
+
+    /// [`Self::stand_in`] after an indirect dispatch of at most `max`
+    /// records, as many as `records` says. The stand-ins follow shader
+    /// work, so where no record runs the views keep what they held: no
+    /// records at most, no clears; with a count, the clears are predicated
+    /// on it, so a count of zero skips them on the GPU; without one, every
+    /// clear. How many were recorded.
+    fn stand_in_after_indirect(
+        &mut self,
+        list: &HostList,
+        program: &str,
+        used: &[UsedResource],
+        rules: &[crate::ambient::Rule],
+        max: u32,
+        records: Records<'_>,
+    ) -> usize {
+        if max == 0 || !rules.iter().any(|r| r.program == program) {
+            return 0;
+        }
+        let predicate = match records {
+            Records::Uncounted => return self.stand_in(list, program, used, rules, None),
+            Records::Counted(predicate) => predicate,
+            Records::Unknown => {
+                once!(program, "stand-ins after an indirect dispatch with a count: no predicate word took it, so they are skipped");
+                for _ in rules.iter().filter(|r| r.program == program) {
+                    crate::ambient::note(false);
+                }
+                return 0;
+            }
+        };
+        use crate::host::transition;
+        // SAFETY: an open list; our word, common between uses.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION)]);
+        }
+        let filled = self.stand_in(list, program, used, rules, Some(predicate));
+        // SAFETY: as above.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        filled
+    }
+
     /// The views of `rules` for `program`, whose code uses `used`, cleared
-    /// to their values: how many were.
+    /// to their values (each clear predicated on `predicate`, if given,
+    /// [`Self::clear_view`]): how many were.
     fn stand_in(
         &mut self,
         list: &HostList,
         program: &str,
         used: &[UsedResource],
         rules: &[crate::ambient::Rule],
+        predicate: Option<&ID3D12Resource>,
     ) -> usize {
         let mut filled = 0;
         for rule in rules.iter().filter(|r| r.program == program) {
@@ -1155,10 +1227,10 @@ impl State {
             }
             let recorded = match fill {
                 Ok(crate::ambient::Fill::Float(rgba)) => {
-                    self.clear_view(list, &view, rgba.map(f32::to_bits), true, &[], true)
+                    self.clear_view(list, &view, rgba.map(f32::to_bits), true, &[], true, predicate)
                 }
                 Ok(crate::ambient::Fill::Uint(words)) => {
-                    self.clear_view(list, &view, words, false, &[], true)
+                    self.clear_view(list, &view, words, false, &[], true, predicate)
                 }
                 Err(why) => {
                     if first {
@@ -1210,7 +1282,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        self.stand_ins(list, p);
+        self.stand_ins(list, p, None);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1887,6 +1959,14 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // The count where the execution reads it, for the stand-ins after
+        // it: the same value, whatever the records then write.
+        let predicate = match &counter {
+            Some((s, at)) if kind == DISPATCH && max > 0 && self.names_stand_ins() => {
+                count_predicate(list, &s.buffer, s.offset(*at))
+            }
+            _ => None,
+        };
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1915,13 +1995,49 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
-                self.stand_ins(list, p);
+                let records = match (&counter, predicate) {
+                    (None, _) => Records::Uncounted,
+                    (Some(_), Some(predicate)) => Records::Counted(predicate),
+                    (Some(_), None) => Records::Unknown,
+                };
+                self.stand_ins(list, p, Some((max, records)));
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
+}
+
+/// The records an indirect dispatch ran, for the stand-ins after it
+/// ([`State::stand_in_after_indirect`]).
+#[derive(Clone, Copy)]
+enum Records<'a> {
+    /// No count: as many as its arguments give, up to its most.
+    Uncounted,
+    /// As many as its count says, copied into the list's predicate word
+    /// ([`count_predicate`]) where the execution read it.
+    Counted(&'a ID3D12Resource),
+    /// A count no predicate word took.
+    Unknown,
+}
+
+/// The list's predicate word ([`HostList::predicate`]) holding the 32-bit
+/// count at `offset` of `buffer` in its low half (the high half stays
+/// zero), copied where this is recorded: just before the execution that
+/// reads the count, so the word holds what it read. Common before and
+/// after. None without the word.
+fn count_predicate<'a>(list: &'a HostList, buffer: &ID3D12Resource, offset: u64) -> Option<&'a ID3D12Resource> {
+    use crate::host::transition;
+    let predicate = list.predicate()?;
+    // SAFETY: an open list; our word, and the count's host copy, which the
+    // list keeps.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.list.CopyBufferRegion(predicate, 0, buffer, offset, 4);
+        list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+    }
+    Some(predicate)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -2929,8 +3045,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         run(&list, &slots, &write, 0, None, (N / 8, N / 8));
         let before = crate::ambient::filled();
-        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", &program_uses, &rules), 2, "the two views of its rules");
-        assert_eq!(state.stand_in(&list, "cccccccccccccccc", &program_uses, &rules), 0, "a program no rule names");
+        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", &program_uses, &rules, None), 2, "the two views of its rules");
+        assert_eq!(state.stand_in(&list, "cccccccccccccccc", &program_uses, &rules, None), 0, "a program no rule names");
         assert_eq!(crate::ambient::filled() - before, 2);
         for v in &reads {
             readable(&list, &used(ResourceType::Srv), v, false);
@@ -2949,6 +3065,139 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             assert_eq!(words, [grey, 0xdeadbeef], "texel {i}: the packed grey, and the unnamed view as written");
             assert_eq!(colour, [0.25, 0.5, 1.0, 1.0], "texel {i}: the colour as halves");
+        }
+    }
+
+    /// The ambient stand-in after an indirect dispatch clears only where
+    /// records ran: a view is seeded with a
+    /// sentinel, an indirect dispatch of a program that writes it runs,
+    /// then its stand-in. With at most one record and a count of zero the
+    /// sentinel survives; with a count of one the record writes the view
+    /// and the stand-in clears it after; with at most no records nothing
+    /// changes; with no count the stand-in clears. The count sits at an
+    /// offset that is not 8-byte aligned with a nonzero word after it, so a
+    /// 64-bit predicate read in place would get it wrong.
+    #[test]
+    fn the_ambient_stand_in_follows_only_indirect_dispatches_that_ran_records() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        const SENTINEL: u32 = 0x5e5e_5e5e;
+        const RECORD: u32 = 0xdead_beef;
+        const STAND_IN: u32 = 0x1234_5678;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R32_UINT.
+        let texture = texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4));
+        let desc = [42, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let uav = View::Unordered(texture as usize, 0, Some(desc));
+        crate::descriptor::create_uav(null, texture, null, &desc, title_heap.start);
+        let srv = View::Shader(texture as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+        let slots = Slots::new(2);
+        slots.make(0, &uav);
+        slots.make(1, &srv);
+        let writes = |value: u32| {
+            compile_cs(&format!(
+                r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<uint> a : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    a[id.xy] = {value}u;
+}}
+"#
+            ))
+        };
+        let (seed, record) = (writes(SENTINEL), writes(RECORD));
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<uint> t : register(t0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store((id.y * 16 + id.x) * 4, t.Load(int3(id.xy, 0)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 4).unwrap();
+        let signature = host_signature(2, 12).expect("a dispatch signature");
+        let (arguments, words) = host.shared_buffer(12).unwrap();
+        // SAFETY: the mapped record, written before any list reads it.
+        unsafe { (words as *mut [u32; 3]).write([N / 8, N / 8, 1]) };
+        let (counts, count_words) = host.shared_buffer(16).unwrap();
+        let rules = crate::ambient::parse(&format!("aaaaaaaaaaaaaaaa:s1+0:{STAND_IN:#x}")).unwrap();
+        let program_uses = [UsedResource { slot: 1, ..used(ResourceType::Uav) }];
+        let uav_barrier = || D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        };
+        // (most records, count, the view after, stand-ins recorded)
+        let cases = [
+            (1, Some(0), SENTINEL, 1),
+            (1, Some(1), STAND_IN, 1),
+            (0, None, SENTINEL, 0),
+            (1, None, STAND_IN, 1),
+        ];
+        for (max, count, want, recorded) in cases {
+            if let Some(n) = count {
+                // SAFETY: the mapped words, written before the list runs.
+                unsafe { (count_words as *mut [u32; 4]).write([1, n, u32::MAX, u32::MAX]) };
+            }
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 1, title_heap.start);
+            readable(&list, &used(ResourceType::Uav), &uav, false);
+            run(&list, &slots, &seed, 0, None, (N / 8, N / 8));
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.ResourceBarrier(&[
+                    uav_barrier(),
+                    crate::host::transition(&arguments, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                ]);
+                list.list.SetComputeRootSignature(&record.0);
+                list.list.SetPipelineState(&record.1);
+                list.list.SetComputeRootDescriptorTable(0, slots.gpu(0));
+            }
+            // The count where the execution reads it.
+            let records = match count {
+                Some(_) => Records::Counted(count_predicate(&list, &counts, 4).expect("a predicate word")),
+                None => Records::Uncounted,
+            };
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.ExecuteIndirect(&signature, max, &arguments, 0, count.map(|_| &counts), count.map_or(0, |_| 4));
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &arguments,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            assert_eq!(
+                state.stand_in_after_indirect(&list, "aaaaaaaaaaaaaaaa", &program_uses, &rules, max, records),
+                recorded,
+                "max {max} count {count:?}: stand-ins recorded"
+            );
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+            run(&list, &slots, &read, 1, Some(&out), (N / 8, N / 8));
+            list.close();
+            host.execute(&[&list]);
+            for i in [0usize, 5, 7 * 16 + 9, 255] {
+                // SAFETY: inside the mapped output, after the list ran.
+                let got = unsafe { (data.add(i * 4) as *const u32).read() };
+                assert_eq!(got, want, "max {max} count {count:?} texel {i}: {got:#x}");
+            }
         }
     }
 
@@ -3000,12 +3249,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         for k in 1..=8 {
-            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true), "clear {k}");
+            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true, None), "clear {k}");
         }
         assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
-        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true));
+        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true, None));
         assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
-        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true));
+        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true, None));
         assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
         for t in &textures {
             let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
@@ -3024,7 +3273,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
         // A new recording takes a slot afresh.
         state.set_heaps(&[heap]);
-        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true));
+        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true, None));
         assert_eq!(heap_host.dynamic_free(), free - 1);
         list.close();
         host.execute(&[&list]);

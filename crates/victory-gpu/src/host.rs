@@ -802,6 +802,9 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// A predicate for stand-ins after an indirect dispatch with a count
+    /// ([`HostList::predicate`]), made on first use.
+    predicate: OnceLock<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1113,6 +1116,7 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                predicate: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2210,6 +2214,46 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's predicate word: 8 bytes of video memory, zeroed at
+    /// creation (a committed resource), common between uses. A predicate
+    /// is 64 bits at an 8-byte aligned offset while an indirect count is a
+    /// 32-bit word anywhere, so the count is copied into its low half,
+    /// whose high half stays zero (`crate::draw`, stand-ins).
+    pub(crate) fn predicate(&self) -> Option<&ID3D12Resource> {
+        self.predicate
+            .get_or_init(|| {
+                let host = host()?;
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                // SAFETY: plain creation.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                }
+                .ok()?;
+                let buffer = buffer?;
+                name(&buffer, || "stand-in predicate".into());
+                Some(buffer)
+            })
+            .as_ref()
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
