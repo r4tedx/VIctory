@@ -1344,6 +1344,10 @@ impl Host {
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
         crate::shadow::pull(&snapshots);
+        // Copies whose system memory side stays current
+        // (`VICTORY_VRAM_COPIES`, `crate::vram`): the withheld ranges too,
+        // so that side holds what the GPU side holds wherever shaders wrote.
+        crate::shadow::pull_current(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -3186,6 +3190,7 @@ impl Meter {
                 crate::copystat::log(window);
                 crate::bindless::log(window);
                 crate::shadow::log_views(window);
+                crate::vram::log(window);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -3661,6 +3666,18 @@ impl Host {
                 ..Default::default()
             }
         };
+        self.mapped_in(size, &heap, upload)
+    }
+
+    /// A buffer of `size` bytes in `heap`, mapped, that shaders read and
+    /// write (`upload`: counted as in a GPU upload heap). Starts in the
+    /// common state.
+    pub(crate) fn mapped_in(
+        &self,
+        size: u64,
+        heap: &D3D12_HEAP_PROPERTIES,
+        upload: bool,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -3681,7 +3698,7 @@ impl Host {
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
-                    &heap,
+                    heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,

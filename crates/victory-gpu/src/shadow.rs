@@ -62,7 +62,7 @@ struct Vram {
     /// The mirror's buffer (system memory), where [`pull`] copies to.
     mirror: ID3D12Resource,
     /// The copy in video memory, mapped (written, never read).
-    data: *mut u8,
+    bar: Bar,
     /// A bit per [`PAGE`] of the copy (by offset) whose mirror is behind
     /// video memory: refreshes write video memory only, and the mirror
     /// catches up when the CPU reads it ([`Shadow::freshen`]).
@@ -71,6 +71,26 @@ struct Vram {
     /// ([`snapshots_ahead`]): refreshes there write the mirror too, so that
     /// the snapshots need no copy back from video memory.
     ahead: Mutex<Vec<(usize, usize)>>,
+}
+
+/// The CPU mapping of a mirrored copy's video memory.
+enum Bar {
+    /// `VICTORY_GPU_UPLOAD_WRITES` (#2130): refreshes write video memory
+    /// alone and the mirror catches up when the CPU reads it
+    /// ([`Shadow::freshen`]).
+    Lazy(*mut u8),
+    /// `VICTORY_VRAM_COPIES` ([`crate::vram`]): every CPU write goes into
+    /// the mirror and then through this mapping, which cannot be read, so
+    /// the mirror (the copy's system memory side) is always current where
+    /// the CPU wrote, and no page is ever stale.
+    Current(crate::vram::WriteOnly, crate::vram::Class),
+}
+
+impl Vram {
+    /// Whether the mirror is kept current ([`Bar::Current`]).
+    fn current(&self) -> bool {
+        matches!(self.bar, Bar::Current(..))
+    }
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -256,9 +276,17 @@ impl Shadow {
     fn push(&self, at: usize, len: usize) {
         if let Some(v) = &self.vram {
             let len = len.min((self.len as usize).saturating_sub(at));
-            // SAFETY: inside both mappings (cut to the copy); the mirror is
-            // system memory, the video memory is only written.
-            unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), v.data.add(at), len) };
+            match &v.bar {
+                // SAFETY: inside both mappings (cut to the copy); the mirror
+                // is system memory, the video memory is only written.
+                Bar::Lazy(data) => unsafe {
+                    std::ptr::copy_nonoverlapping(self.data.add(at), data.add(at), len)
+                },
+                // SAFETY: inside the mirror's mapping (cut to the copy).
+                Bar::Current(bar, _) => bar.write(at, unsafe {
+                    std::slice::from_raw_parts(self.data.add(at), len)
+                }),
+            }
         }
     }
 
@@ -677,6 +705,8 @@ impl Shadow {
         // A title write while the page is read saves its bytes from before.
         t.arm(from, to);
         let written = self.put_back(page, from, to, saved);
+        #[cfg(test)]
+        tests::before_taken();
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             // SAFETY: inside the mapping; only the submitting thread writes it.
@@ -777,8 +807,8 @@ impl Shadow {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
                 if s < e {
                     // The mirror too (with no snapshot ahead, a refresh
-                    // wrote video memory only).
-                    if self.vram.is_some() {
+                    // wrote video memory only; a current mirror has it).
+                    if self.vram.as_ref().is_some_and(|v| !v.current()) {
                         self.copy_both(s, e);
                     }
                     // SAFETY: inside the mapping.
@@ -850,7 +880,9 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        if let Some(v) = &self.vram {
+        if let Some(v) = &self.vram
+            && !v.current()
+        {
             let (a, b) = (from - start, to - start);
             let ahead = v.ahead.lock().unwrap_or_else(|e| e.into_inner());
             let mut at = a;
@@ -873,6 +905,9 @@ impl Shadow {
             }
             return to - from;
         }
+        // A current mirror ([`Bar::Current`]): the mirror, then video memory
+        // ([`Shadow::push`]), so every refresh, queued ones included
+        // ([`Shadow::copy_queued`]), reaches video memory.
         self.copy_both(from - start, to - start);
         to - from
     }
@@ -880,8 +915,12 @@ impl Shadow {
     /// Title memory at offsets `[from, to)` into the copy in video memory
     /// only: the mirror is behind there until [`Shadow::freshen`].
     fn copy_video(&self, v: &Vram, from: usize, to: usize) {
+        let Bar::Lazy(data) = v.bar else {
+            // A current mirror is never behind.
+            return self.copy_both(from, to);
+        };
         // SAFETY: inside the video memory mapping (offsets within the copy).
-        let at = unsafe { v.data.add(from) };
+        let at = unsafe { data.add(from) };
         crate::host::copy_mapped(
             at,
             (self.start as usize + from) as *const u8,
@@ -1181,6 +1220,21 @@ pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
     bring_back(&mut runs);
 }
 
+/// [`pull`] of the ranges of copies whose mirror is kept current
+/// ([`Bar::Current`]) alone: ranges whose writes stay out of title memory
+/// (withheld), so that the mirror holds what video memory holds wherever
+/// shaders wrote. Nothing for other copies, as before `crate::vram`.
+pub(crate) fn pull_current(ranges: &[(Arc<Shadow>, usize, usize)]) {
+    let current: Vec<_> = ranges
+        .iter()
+        .filter(|(c, ..)| c.vram.as_ref().is_some_and(Vram::current))
+        .cloned()
+        .collect();
+    if !current.is_empty() {
+        pull(&current);
+    }
+}
+
 /// Before a submission whose lists declared that shaders write title
 /// address ranges `(copy, address, len)` (not marked): their snapshots
 /// ([`Shadow::writing`]) read the copies' mirrors. The pages there the
@@ -1266,6 +1320,10 @@ fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
     #[cfg(test)]
     if !regions.is_empty() {
         BROUGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !regions.is_empty() {
+        crate::vram::PULLED[0].fetch_add(regions.iter().map(|r| r.4).sum(), Relaxed);
+        crate::vram::PULLED[1].fetch_add(1, Relaxed);
     }
     if let Some(host) = host() {
         host.copy_now(&regions);
@@ -1376,16 +1434,39 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // copies may be in upload memory.
         let size = len.next_multiple_of(1 << 16);
         let host = host()?;
-        let upload = entry
-            .read_only
+        // `VICTORY_VRAM_COPIES` ([`crate::vram`]): a GPU side in video memory
+        // if the DXGI budget has room, with the system memory buffer as the
+        // CPU's side, always current. Refused, the copy is made as below.
+        let class = crate::vram::wanted(entry.read_only);
+        let current = (class != crate::vram::Class::System)
+            .then(|| {
+                // Admitted first: a refused copy makes no second buffer.
+                let (video, bar) = crate::vram::make(host, size, class)?;
+                let (home, home_data) = host.shared_buffer(size)?;
+                crate::host::name(&home, || {
+                    format!("title buffer {:#x}+{len:#x} (system memory side)", key.0)
+                });
+                Some((video, home, home_data, bar))
+            })
+            .flatten();
+        let upload = (current.is_none() && entry.read_only)
             .then(|| host.gpu_upload_buffer(size))
             .flatten();
         let in_upload = upload.is_some();
         // A buffer shaders may write: in video memory too, with a mirror.
         let mut vram = None;
-        let (buffer, data) = match upload {
-            Some(made) => made,
-            None => {
+        let (buffer, data) = match (current, upload) {
+            (Some((video, home, home_data, bar)), _) => {
+                vram = Some(Vram {
+                    mirror: home,
+                    bar: Bar::Current(bar, class),
+                    stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
+                    ahead: Mutex::new(Vec::new()),
+                });
+                (video, home_data)
+            }
+            (None, Some(made)) => made,
+            (None, None) => {
                 let mirror = host.shared_buffer(size)?;
                 match (!entry.read_only && host.gpu_upload_writes())
                     .then(|| host.gpu_upload_buffer(size))
@@ -1394,7 +1475,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                     Some((video, video_data)) => {
                         vram = Some(Vram {
                             mirror: mirror.0,
-                            data: video_data,
+                            bar: Bar::Lazy(video_data),
                             stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
                             ahead: Mutex::new(Vec::new()),
                         });
@@ -1555,27 +1636,34 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    // (host address, start, length, its class where its GPU side is in
+    // video memory under `VICTORY_VRAM_COPIES`)
+    let side = |s: &Shadow| match s.vram.as_ref().map(|v| &v.bar) {
+        Some(Bar::Current(_, class)) => Some(*class),
+        _ => None,
+    };
+    let mut all: Vec<(u64, u64, u64, Option<crate::vram::Class>)> = buffers()
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len, side(s))))
         .collect();
     all.extend(
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|s| (s.gpu, s.start, s.len, None)),
     );
-    let below = all.iter().filter(|c| c.0 <= va).max();
-    let above = all.iter().filter(|c| c.0 > va).min();
+    let below = all.iter().filter(|c| c.0 <= va).max_by_key(|c| (c.0, c.1, c.2));
+    let above = all.iter().filter(|c| c.0 > va).min_by_key(|c| (c.0, c.1, c.2));
     let mut text = match below {
-        Some(&(gpu, start, len)) => format!(
-            "; the nearest title memory copy below it: {start:#x}+{len:#x} at host {gpu:#x}, offset {:#x}",
+        Some(&(gpu, start, len, video)) => format!(
+            "; the nearest title memory copy below it: {start:#x}+{len:#x} at host {gpu:#x}{}, offset {:#x}",
+            video.map_or(String::new(), |c| format!(" (in video memory, {c:?})")),
             va - gpu
         ),
         None => "; no title memory copy below it".into(),
     };
-    if let Some(&(gpu, start, len)) = above {
+    if let Some(&(gpu, start, len, _)) = above {
         text.push_str(&format!(
             "; the nearest above: {start:#x}+{len:#x} at host {gpu:#x} ({} copies in all)",
             all.len()
@@ -2656,5 +2744,341 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    thread_local! {
+        /// Run in a marked page's copy-back between its write into title
+        /// memory and the page being taken again.
+        static BEFORE_TAKEN: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The hook a test set with [`BEFORE_TAKEN`], if any.
+    pub(super) fn before_taken() {
+        BEFORE_TAKEN.with(|h| {
+            if let Some(f) = &*h.borrow() {
+                f();
+            }
+        });
+    }
+
+    /// Where a copy's GPU side is under `VICTORY_VRAM_COPIES`.
+    fn class(copy: &Shadow) -> crate::vram::Class {
+        match copy.vram.as_ref().map(|v| &v.bar) {
+            Some(Bar::Current(_, class)) => *class,
+            _ => crate::vram::Class::System,
+        }
+    }
+
+    /// A byte of title memory.
+    fn title(at: usize) -> u8 {
+        // SAFETY: a byte of a test's pool.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// The title writes a byte.
+    fn write_title(at: usize, byte: u8) {
+        // SAFETY: a byte of a test's pool (guarded or not).
+        unsafe { (at as *mut u8).write_volatile(byte) };
+    }
+
+    /// W0. With `VICTORY_VRAM_COPIES=2`, the copy of a read-only buffer and
+    /// that of a written one get a GPU side in video memory (a GPU upload
+    /// heap, or its stand-in here if the host has none), charged to the
+    /// copies' bytes; the CPU's side is the system memory mirror. The bytes
+    /// go back when the last holder of the buffer (here a clone, as heap
+    /// slots keep) lets go, not with the copy.
+    #[test]
+    fn copies_in_video_memory_are_made_charged_and_given_back() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "shadow::tests::copies_in_video_memory_are_made_charged_and_given_back",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        eprintln!(
+            "GPU upload heaps used: {}",
+            !crate::vram::tests::stand_in(host)
+        );
+        let base = crate::vram::own();
+        let (p, q) = (crate::watch::tests::pool(2), crate::watch::tests::pool(1));
+        register_read_only(p, p as u64, 2 * PAGE as u64);
+        register(q, q as u64, PAGE as u64);
+        let (read, written) = (
+            find(p as u64, 2 * PAGE as u64).unwrap(),
+            find(q as u64, PAGE as u64).unwrap(),
+        );
+        assert_eq!(
+            (class(&read), class(&written)),
+            (Class::VramRead, Class::VramWritten)
+        );
+        assert!(
+            !read.upload.load(Relaxed),
+            "not a #2120 copy: the CPU reads its mirror"
+        );
+        assert_eq!(crate::vram::own(), base + 3 * PAGE as u64, "charged");
+        let heap = |b: &ID3D12Resource| {
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: a live committed buffer.
+            unsafe { b.GetHeapProperties(Some(&mut props), None) }.unwrap();
+            props.Type == D3D12_HEAP_TYPE_GPU_UPLOAD
+                || props.Type == D3D12_HEAP_TYPE_CUSTOM
+                    && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+        };
+        assert!(
+            heap(&read.buffer) && heap(&written.buffer),
+            "the GPU sides are in the video memory heap"
+        );
+        assert!(
+            !heap(&read.vram.as_ref().unwrap().mirror),
+            "the CPU side is in system memory"
+        );
+        let held = read.buffer.clone();
+        unregister(p, p as u64);
+        unregister(q, q as u64);
+        drop((read, written));
+        assert_eq!(
+            crate::vram::own(),
+            base + 2 * PAGE as u64,
+            "held by the clone"
+        );
+        drop(held);
+        assert_eq!(crate::vram::own(), base, "given back");
+        crate::watch::tests::free(p);
+        crate::watch::tests::free(q);
+    }
+
+    /// The #693 and Belobug #105 traps. With a 64 MiB budget the copies in
+    /// video memory stop at a quarter of it; with use by others near the
+    /// budget, none is made. Copies refused stay in system memory, and the
+    /// GPU's writes into each kind, marked and declared (a snapshot), all
+    /// reach title memory.
+    #[test]
+    fn copies_past_the_cap_stay_in_system_memory_and_lose_no_writes() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "shadow::tests::copies_past_the_cap_stay_in_system_memory_and_lose_no_writes",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((64 << 20, 0));
+        let len = 4 << 20;
+        let pools: Vec<usize> = (0..6)
+            .map(|_| crate::watch::tests::pool(len / PAGE))
+            .collect();
+        let refused = crate::vram::REFUSED[0].load(Relaxed);
+        let mut copies = Vec::new();
+        for (k, &p) in pools.iter().enumerate() {
+            if k == 5 {
+                // Room under the cap, none under the budget.
+                *FAKE.lock().unwrap() = Some((1 << 30, (1 << 30) - (64 << 20)));
+            }
+            register(p, p as u64, len as u64);
+            copies.push(find(p as u64, len as u64).unwrap());
+        }
+        let classes: Vec<Class> = copies.iter().map(|c| class(c)).collect();
+        assert_eq!(classes[..4], [Class::VramWritten; 4], "within the cap");
+        assert_eq!(
+            classes[4..],
+            [Class::System; 2],
+            "past the cap; past nine tenths of the budget"
+        );
+        assert!(
+            copies[4..].iter().all(|c| c.vram.is_none()),
+            "refused copies are plain system memory copies"
+        );
+        assert_eq!(crate::vram::REFUSED[0].load(Relaxed), refused + 2);
+        // The GPU writes each kind, marked and declared.
+        let list = host.new_list().unwrap();
+        let cases = [(0, true), (1, false), (4, true), (5, false)];
+        for &(k, marked) in &cases {
+            let (copy, p) = (copies[k].clone(), pools[k]);
+            copy.update(p, len);
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, PAGE as u64, marked);
+            gpu_store(&list, &copy, p + 10, &[0x40 + k as u8]);
+        }
+        list.close();
+        for &(k, marked) in &cases {
+            if marked {
+                copies[k].mark_written(pools[k] as u64 + 10);
+            }
+        }
+        host.execute(&[&list]);
+        for &(k, _) in &cases {
+            assert_eq!(
+                title(pools[k] + 10),
+                0x40 + k as u8,
+                "copy {k}: the GPU's byte reached title memory"
+            );
+        }
+        for &p in &pools {
+            unregister(p, p as u64);
+        }
+        drop(copies);
+        for p in pools {
+            crate::watch::tests::free(p);
+        }
+    }
+
+    /// A refresh of a copy in video memory writes video memory, and the
+    /// mirror too (it is never behind): what the GPU reads is the title's
+    /// bytes after the first refresh, after a title write, and under a
+    /// range a list submitted earlier declared as written by shaders.
+    #[test]
+    fn refreshes_of_copies_in_video_memory_reach_video_memory() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "shadow::tests::refreshes_of_copies_in_video_memory_reach_video_memory",
+            "1",
+        ) {
+            return;
+        }
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 3 * PAGE;
+        let p = crate::watch::tests::pool(3);
+        for at in 0..len {
+            write_title(p + at, (at % 251) as u8);
+        }
+        register_read_only(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(class(&copy), Class::VramRead);
+        assert_eq!(copy.update(p, len), len);
+        // SAFETY: our pool.
+        let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) }.to_vec();
+        assert!(gpu_bytes(&copy, p, len) == bytes, "the first refresh");
+        assert!(copy.stale_pages().is_empty(), "the mirror is never behind");
+        // SAFETY: the mirror's bytes (system memory).
+        let mirror = unsafe { std::slice::from_raw_parts(copy.data, len) };
+        assert!(mirror == bytes, "the mirror has the refresh too");
+        write_title(p + PAGE + 5, 0xee);
+        assert_eq!(copy.update(p, len), PAGE, "the page written");
+        assert_eq!(gpu_bytes(&copy, p + PAGE + 5, 1), [0xee], "a title write");
+        copy.writing(p, len, false);
+        write_title(p + 2 * PAGE + 7, 0xdd);
+        assert!(copy.update(p + 2 * PAGE, 16) > 0);
+        assert_eq!(
+            gpu_bytes(&copy, p + 2 * PAGE + 7, 1),
+            [0xdd],
+            "under a busy range"
+        );
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The GPU writes a copy in video memory (a read-only buffer's, as
+    /// through a view that writes): a marked page and a declared range go
+    /// back by the bytes the GPU changed, brought back by a GPU copy (the
+    /// CPU never reads video memory); a title write in the marked page
+    /// after the GPU ran and before the copy-back stays, and reaches both
+    /// sides.
+    #[test]
+    fn shader_writes_into_copies_in_video_memory_come_back() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "shadow::tests::shader_writes_into_copies_in_video_memory_come_back",
+            "1",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 2 * PAGE;
+        let p = crate::watch::tests::pool(2);
+        register_read_only(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(class(&copy), Class::VramRead);
+        copy.update(p, len);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, PAGE as u64, true);
+        copy.gpu_writes(&list, (p + PAGE) as u64, PAGE as u64, false);
+        gpu_store(&list, &copy, p + 10, &[0xaa]);
+        gpu_store(&list, &copy, p + PAGE + 20, &[0xbb]);
+        // After the GPU ran, before the copy-backs: the title writes the
+        // marked page.
+        list.defer_missed(move || {
+            write_title(p + 40, 0x11);
+            false
+        });
+        list.close();
+        copy.mark_written(p as u64 + 10);
+        let pulls = crate::vram::PULLED[1].load(Relaxed);
+        host.execute(&[&list]);
+        assert_eq!(
+            (title(p + 10), title(p + 40), title(p + PAGE + 20)),
+            (0xaa, 0x11, 0xbb)
+        );
+        assert!(
+            crate::vram::PULLED[1].load(Relaxed) > pulls,
+            "brought back by the GPU"
+        );
+        assert_eq!(
+            copy.read_host(p as u64 + 40, 1)[0] & 0xff,
+            0x11,
+            "the system memory side"
+        );
+        assert_eq!(
+            gpu_bytes(&copy, p + 40, 1),
+            [0x11],
+            "and video memory have the title's byte"
+        );
+        assert_eq!(copy.update(p, len), 0, "both pages current");
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The order of a copy-back into a copy in video memory: the title
+    /// writes the page after the copy-back wrote it and before the page is
+    /// taken again (its guard is open then). The mirror reads the page
+    /// again after taking it, and video memory gets the bytes after that,
+    /// so the title's write is on the GPU side, where no later refresh
+    /// would bring it (the page is taken).
+    #[test]
+    fn a_title_write_during_a_copy_back_reaches_video_memory() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "shadow::tests::a_title_write_during_a_copy_back_reaches_video_memory",
+            "2",
+        ) {
+            return;
+        }
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let copy = find(p as u64, PAGE as u64).unwrap();
+        assert_eq!(class(&copy), Class::VramWritten);
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host(p as u64 + 10, &[0xaa]);
+        copy.mark_written(p as u64 + 10);
+        BEFORE_TAKEN.with(|h| *h.borrow_mut() = Some(Box::new(move || write_title(p + 100, 0x77))));
+        copy_back_marks(&[]);
+        BEFORE_TAKEN.with(|h| *h.borrow_mut() = None);
+        assert_eq!((title(p + 10), title(p + 100)), (0xaa, 0x77));
+        assert_eq!(
+            copy.update(p, PAGE),
+            0,
+            "taken: no refresh brings the title's write"
+        );
+        assert_eq!(gpu_bytes(&copy, p + 100, 1), [0x77], "video memory has it");
+        assert_eq!(gpu_bytes(&copy, p + 10, 1), [0xaa]);
+        copy.copy_back(p, PAGE);
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 }

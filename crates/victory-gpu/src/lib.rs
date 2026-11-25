@@ -74,6 +74,8 @@ mod tiles;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod vram;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

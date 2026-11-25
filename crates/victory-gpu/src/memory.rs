@@ -482,12 +482,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // shortcut: root UAV writes of such a list still go back (their
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
-        if withheld == 0 {
-            // The pages from copies in video memory, into their mirrors.
-            let pulled: Vec<_> = writes
-                .iter()
-                .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
-                .collect();
+        // The pages from copies in video memory, into their mirrors. Those
+        // whose system memory side stays current (`VICTORY_VRAM_COPIES`,
+        // `crate::vram`) take them withheld or not: it holds what the GPU
+        // side holds.
+        let pulled: Vec<_> = writes
+            .iter()
+            .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
+            .collect();
+        if withheld > 0 {
+            crate::shadow::pull_current(&pulled);
+        } else {
             crate::shadow::pull(&pulled);
         }
         let mut written = 0;
