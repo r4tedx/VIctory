@@ -1930,6 +1930,64 @@ mod tests {
         list.close();
     }
 
+    /// Outside code recording into the host list (`crate::external`, the
+    /// host's upscaler, say) ends an open window first, as a title dispatch
+    /// does: here it writes the second execution's record, and that
+    /// execution opens a window of its own whose clamp reads the write.
+    /// With no window open (batching off) it leaves none open.
+    #[test]
+    fn clamps_read_what_outside_code_before_them_wrote() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (root, pso) = pipeline(
+            "#define RS \"UAV(u0)\"
+RWByteAddressBuffer b : register(u0);
+             [RootSignature(RS)][numthreads(1, 1, 1)] void main() { b.Store3(0, uint3(5, 6, 7)); }",
+        );
+        let (buffer, data) = host.shared_buffer(512).unwrap();
+        let data = data.cast::<u32>();
+        // SAFETY: our mapped buffer, before the list runs.
+        unsafe {
+            for i in 0..128 {
+                data.add(i).write_volatile(1);
+            }
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let open = |list: &crate::host::HostList| list.clamps_open.load(std::sync::atomic::Ordering::Relaxed);
+        crate::external::record_on(&list, &mut state, |_| ());
+        assert!(!open(&list) && list.clamps.lock().unwrap().window.is_none(), "no window to end");
+        let first = super::member(&list, (gpu, 0), None, (2, 12, 1)).unwrap();
+        assert!(first.opened && open(&list));
+        crate::external::record_on(&list, &mut state, |l| {
+            // SAFETY: an open list, our pipeline and buffer.
+            unsafe {
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootUnorderedAccessView(0, gpu + 256);
+                l.Dispatch(1, 1, 1);
+            }
+        });
+        assert!(!open(&list), "the outside code ended the window");
+        let second = super::member(&list, (gpu, 256), None, (2, 12, 1)).unwrap();
+        assert!(second.opened, "a window of its own, after the write");
+        super::end(&list);
+        let (back, starts) = read_back(
+            &list,
+            &[
+                (&first.buffer, first.offset, 12),
+                (&second.buffer, second.offset, 12),
+            ],
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(words_of(&back, starts[0], 3), [1, 1, 1]);
+        assert_eq!(words_of(&back, starts[1], 3), [5, 6, 7], "the clamp read the outside write");
+    }
+
     /// Executions read the window's records and counts: draws, a mesh
     /// dispatch and dispatches in one window; the dispatches run with their
     /// count (3 of 4 records: 1 + 2 + 3 groups) and without (all 4: 10).

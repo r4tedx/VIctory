@@ -40,9 +40,22 @@ pub fn record<R>(
     f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
 ) -> Option<R> {
     let mut out = None;
-    crate::list::with_state(list, |host, state| {
-        out = Some(f(&host.list));
-        state.host_state_lost();
-    });
+    crate::list::with_state(list, |host, state| out = Some(record_on(host, state, f)));
+    out
+}
+
+/// [`record`] on the host list `host` with the title list's draw state
+/// `state`. What `f` records may write GPU memory (an argument buffer, say),
+/// so an open window of batched indirect clamps (`VICTORY_BATCH_CLAMPS`)
+/// ends first, as before any such command: executions after `f` clamp what
+/// it wrote. Without batching no window is open and the end does nothing.
+pub(crate) fn record_on<R>(
+    host: &crate::host::HostList,
+    state: &mut crate::draw::State,
+    f: impl FnOnce(&ID3D12GraphicsCommandList) -> R,
+) -> R {
+    crate::indirect::end(host);
+    let out = f(&host.list);
+    state.host_state_lost();
     out
 }
