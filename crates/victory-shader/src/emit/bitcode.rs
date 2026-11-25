@@ -140,6 +140,7 @@ enum Op {
     Phi(Vec<(V, usize)>),
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
+    LocalI32(V),
     Load(V),
     /// Pointer, value.
     Store(V, V),
@@ -474,6 +475,14 @@ impl Module {
         let zero = self.i32(0);
         self.push(block, ty, Op::Gep(arr, ptr, vec![zero, index]))
     }
+    /// One private, four-byte integer local for the current shader lane.
+    pub fn local_i32(&mut self, block: usize) -> V {
+        let i32t = self.int(32);
+        let ptr = self.ptr(i32t);
+        let one = self.i32(1);
+        self.push(block, ptr, Op::LocalI32(one))
+    }
+
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
             panic!("load from a non-pointer")
@@ -995,6 +1004,12 @@ impl Module {
                         r.extend(idx.iter().map(|&i| rel(i)));
                         w.record(43, &r);
                     }
+                    Op::LocalI32(count) => {
+                        let ty = u64::from(self.type_of(*count).0);
+                        // Allocated type, count type and absolute count ID. Bit 6
+                        // marks the explicit element type and 3 encodes align 4.
+                        w.record(19, &[ty, ty, u64::from(abs(*count)), (1 << 6) | 3]);
+                    }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
@@ -1095,7 +1110,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::LocalI32(v) | Op::Load(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);
