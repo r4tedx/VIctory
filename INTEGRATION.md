@@ -105,3 +105,75 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 
 Counts, messages and hashes only: never game files, shader dumps or
 captures.
+
+## `integration/play`: playable candidate for NVIDIA
+
+`integration/play` is this branch (`915978c`) plus the NVIDIA boot, heap
+and format PRs and the wave64 stack, so that one build on a 32-lane NVIDIA
+card gets as far as the ztrx fork does. It is a **candidate**: built and
+checked only (`cargo check --locked -p victory --features diagnostics`
+after every merge, then `cargo build --locked --profile diag -p victory
+--features diagnostics`); no test suite was run on it and the title has
+not been run with it yet. Every PR is its own merge commit
+(`git log --first-parent`), authors' commits unchanged.
+
+### Merged, in order
+
+| PR | Head | What it does |
+|---|---|---|
+| #1763 | `50d91b1` | typed UAVs in formats the host does not support are refused, whatever their family or castability |
+| #1751 | `4521591` | a host that caps view heaps (NVIDIA, 1,000,000) keeps the larger dynamic range |
+| #1133 | `cae16e6` | translated shaders clamp view indices to the host's cap, whose last slot stays null |
+| #2180 | `e1bf670` | UAV/render-target flags a format cannot take are stripped or widened; an early-list-only save writes no library |
+| #1778 | `ba67548` | a sampler heap of our own is bound when the title binds none |
+| #2129 | `2ef0c75` | the pipeline library file is mapped, not read into memory (intermittent device loss) |
+| #1906 | `bcd0d3d` | view addresses for tables made afresh in dynamic slots |
+| #1849 | `de95e51` | free memory is not the runtime's to watch (world-load deadlock) |
+| #454 | `85c04d1` | opt-in `VICTORY_NO_WATCHDOG` hook for the title's watchdog (unset: off) |
+| #223, #233, #320, #439 | `5a11cf4` | wave64 compute on 32-lane hosts, in halves and in the console flow, with the implicit-sample and recursion guards (fork `shader/console-flow-lds`; not `831cdb3`) |
+
+Conflicts resolved at the merges (each merge commit says how): #1133 with
+#1751 (both heap branches kept, #1133's guard slot on each) and with
+#158's depth-bounds query; #2129 with #2180 in the library save (#2129's
+mapped write, #2180's skip when only the early list changed); #1906 with
+#1133 (two tests at one place); the wave64 stack with #2115 (`--count`
+and `--host-lanes` both), #1133 (`view_limit` and `ops`), #1883 (mask
+joins: the stack's rule in the console flow, #1883's per-lane cases
+elsewhere, a numeric mask's lane bit refused in halves) and #2043 (the
+killing form for trapped discards first, then the per-lane form, the
+console flow, the killing form for discards).
+
+### Considered and left out
+
+- #89 (packed 16-bit formats 86/115 as R8G8B8A8): based on `35b054e`,
+  before the maintainer's drop; eight conflicting hunks in
+  `descriptor/host.rs`, `list.rs` and `texture.rs`, two of them large.
+  #2180 is taken instead; it strips or widens the flags rather than
+  widening the format.
+- #1777 and #1779 (views past a capped heap): #1133 is taken. It clamps
+  in the shader to a null last slot of the capped heap, keeps the larger
+  dynamic range #1751 asks for, and is based on `940d32f`; #1777 is based
+  on the older `70564ae`, and #1779 rewrites ten files (884 lines). Like
+  #1777, #1133 creates the host device when the shader cache key is first
+  computed (also in `victory translate --cache`).
+
+### Ray tracing (not changed here)
+
+The ztrx and fxceless forks run with the title's ray-tracing structure
+builder off: the compute pipelines of `XboxBvhBuilder.dll` (the programs
+with a spilled user-data table) are dropped at dispatch unless
+`VICTORY_BVH_BUILDER=1` (ztrx `crates/victory-gpu/src/pipeline.rs:285`
+`builder_runs`, called from `draw.rs:1677` and `draw.rs:2278`; detection
+`of_builder`, `pipeline.rs:238`, needs that fork's
+`victory_shader::spill`). The programs that walk the structures still
+run there. Upstream `main` has no such gate and no `spill` module, so it
+is not a small port and is not in this branch. For the hang in compute
+`f607780aa8e502d0` (the probe shadow trace), a diagnostics build of this
+branch takes `VICTORY_SKIP_PIPELINES=f607780aa8e502d0`, as `main` does.
+
+### Build
+
+`CARGO_TARGET_DIR=C:\Users\PC\.t3\targets\play`, `cargo build --locked
+--profile diag -p victory --features diagnostics` at `0ab7ca3`:
+`diag\victory.exe`, sha256
+`5b8bf42def4777099794b9a9ce2ef64330c0edf0a2a0a9dd507ee3de0e155a30`.
