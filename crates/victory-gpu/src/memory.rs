@@ -182,9 +182,15 @@ pub(crate) fn note_withheld(bytes: u64) {
     stats(|s| s.withheld_bytes += bytes);
 }
 
-/// A draw or dispatch of `pipeline` uses title memory.
+/// A draw or dispatch of `pipeline` uses title memory (the name is copied
+/// once per frame, not per draw).
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| match s.uses.get_mut(pipeline) {
+        Some(n) => *n += 1,
+        None => {
+            s.uses.insert(pipeline.to_owned(), 1);
+        }
+    });
 }
 
 /// Logs what title memory did since the last call, if anything: a line per

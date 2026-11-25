@@ -1457,17 +1457,22 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
-    let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    // Asked for every placed view a draw reads: the cheap tests first, the
+    // layouts (a mip chain each) only for textures the GPU writes there.
+    let mut written = map
+        .get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
-        .filter(|&r| r != placed)
-        .find(|&r| {
+        .filter(|&r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
+            r != placed
+                && a.desc.flags & WRITTEN != 0
                 && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
         })
+        .peekable();
+    written.peek()?;
+    let want = bytes(&b.desc)?;
+    written.find(|&r| bytes(&resource(r).desc) == Some(want))
 }
 
 #[cfg(windows)]
