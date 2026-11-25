@@ -983,10 +983,6 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
-        if crate::pipeline::builder_dropped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1599,9 +1595,6 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
-            return false;
-        }
-        if crate::pipeline::builder_dropped(self.pipeline as This) {
             return false;
         }
         const DRAW: u32 = 0;

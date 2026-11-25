@@ -62,10 +62,6 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
-    /// Whether it is a program of the ray-tracing structure builder
-    /// ([`spills_user_data`]), found on its first dispatch.
-    #[cfg(windows)]
-    builder: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -96,8 +92,6 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
-            #[cfg(windows)]
-            builder: OnceLock::new(),
         }
     }
 }
@@ -259,104 +253,6 @@ pub(crate) fn making() -> u64 {
 #[cfg(windows)]
 pub(crate) fn take_waited_ms() -> f64 {
     make::take_waited_ms()
-}
-
-/// Whether `programs` hold a compute program of the console's ray-tracing
-/// structure builder (`XboxBvhBuilder.dll`): one whose root signature does
-/// not fit its user SGPRs. User data 0-1 then hold the address of a table in
-/// memory, and the parameters from user data 16 on are read from there
-/// (`victory_shader::resource` follows those loads). In Grand Theft Auto VI
-/// exactly the builder's compute programs are of this kind (the fxceless
-/// fork's measurement).
-fn spills_user_data(programs: &[victory_shader::NativeProgram]) -> bool {
-    use victory_shader::{HwStage, native::StageIo};
-    programs.iter().any(|p| {
-        let StageIo::Cs(cs) = &p.io else {
-            return false;
-        };
-        let registers = cs.user_sgprs();
-        let first = p
-            .layout
-            .iter()
-            .filter(|e| e.sgprs > 0 && e.user_data >= registers)
-            .map(|e| e.user_data)
-            .min();
-        p.stage == HwStage::Cs && registers >= 2 && first == Some(16)
-    })
-}
-
-#[cfg(windows)]
-impl Shader {
-    /// Whether this is a program of the ray-tracing structure builder
-    /// ([`spills_user_data`]).
-    fn of_builder(&self) -> bool {
-        use victory_shader::{Container, FourCC};
-        *self.builder.get_or_init(|| {
-            self.stage == "compute"
-                && Container::parse(&self.container)
-                    .ok()
-                    .and_then(|c| {
-                        c.part(FourCC::DXIL)
-                            .and_then(|p| victory_shader::native_programs(p.data).ok())
-                    })
-                    .is_some_and(|programs| spills_user_data(&programs))
-        })
-    }
-}
-
-/// Dispatches of the ray-tracing structure builder dropped so far.
-#[cfg(windows)]
-static BUILDER_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Whether a dispatch with the title pipeline `this` is dropped because it
-/// is one of the ray-tracing structure builder's. The builder runs only with
-/// `VICTORY_BVH_BUILDER=1`. Its stages feed each other through memory, and
-/// not all of them translate: a stage that runs on what a dropped stage
-/// never wrote builds structures from garbage, and the title's traversals
-/// then walk them for seconds (a device removal on an RTX 5070 in
-/// `CS_IrradianceCache_ShadowTrace_WithFar`). Without the builder the
-/// structures stay as allocated, zero, as does memory no host copy holds.
-/// A traversal of zero nodes ends at once: a zero box misses unless the ray
-/// meets the origin, its children are then zero-area triangles, and those
-/// miss. The traversals themselves still run. The idea comes from the
-/// fxceless fork (ztrx), which drops the builder the same way.
-#[cfg(windows)]
-pub(crate) fn builder_dropped(this: This) -> bool {
-    static RUNS: OnceLock<bool> = OnceLock::new();
-    if this.is_null()
-        || *RUNS.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
-    {
-        return false;
-    }
-    let [shader] = &pipeline(this).shaders[..] else {
-        return false;
-    };
-    if !shader.of_builder() {
-        return false;
-    }
-    BUILDER_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(feature = "diagnostics")]
-    note_why(
-        "a dispatch of the ray-tracing structure builder (VICTORY_BVH_BUILDER=1 runs it)"
-            .to_owned(),
-    );
-    true
-}
-
-/// Logs once, after the first dropped one, how many dispatches of the
-/// ray-tracing structure builder were dropped ([`builder_dropped`]).
-#[cfg(windows)]
-pub(crate) fn report_builder_dropped() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    let dispatches = BUILDER_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
-    if dispatches > 0 {
-        ONCE.call_once(|| {
-            tracing::info!(
-                dispatches,
-                "dispatches of the ray-tracing structure builder dropped so far (VICTORY_BVH_BUILDER=1 runs them)"
-            )
-        });
-    }
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -809,63 +705,6 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
-    }
-
-    /// A compute program with `user_sgprs` user SGPRs and root parameters
-    /// at `user_data` (first dword, dwords).
-    fn compute(user_sgprs: u32, params: &[(u8, u32)]) -> victory_shader::NativeProgram {
-        use victory_shader::{
-            RootParam, RootType,
-            native::{ComputeIo, StageIo},
-        };
-        victory_shader::NativeProgram {
-            stage: victory_shader::HwStage::Cs,
-            wave64: false,
-            vgprs: 4,
-            layout: params
-                .iter()
-                .enumerate()
-                .map(|(slot, &(user_data, sgprs))| RootParam {
-                    root: RootType::Descriptor,
-                    table_offset_dwords: 0,
-                    sgprs,
-                    base_register: 0,
-                    user_data,
-                    slot: slot as u8,
-                })
-                .collect(),
-            used: Vec::new(),
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: user_sgprs << 1,
-                threads: [64, 1, 1],
-            }),
-            code: Vec::new(),
-        }
-    }
-
-    /// The builder's programs are the ones that read parameters from a
-    /// table at user data 16, its address in user data 0-1.
-    #[test]
-    fn builder_programs_spill_their_user_data() {
-        let spills =
-            |user_sgprs, params: &[(u8, u32)]| spills_user_data(&[compute(user_sgprs, params)]);
-        // Parameters past the 16 user SGPRs, from index 16 on.
-        assert!(spills(16, &[(2, 2), (16, 2), (18, 1)]));
-        assert!(spills(2, &[(16, 4)]));
-        // All parameters in registers.
-        assert!(!spills(16, &[(0, 2), (2, 2), (14, 2)]));
-        // A parameter past the registers that is not the table's first.
-        assert!(!spills(8, &[(9, 2)]));
-        assert!(!spills(16, &[(18, 2)]));
-        // No registers for the table's address.
-        assert!(!spills(1, &[(16, 2)]));
-        // An entry with no dwords does not count.
-        assert!(!spills(16, &[(16, 0)]));
-        // Not a compute program.
-        let mut pixel = compute(16, &[(16, 2)]);
-        pixel.stage = victory_shader::HwStage::Ps;
-        assert!(!spills_user_data(&[pixel]));
-        assert!(!spills_user_data(&[]));
     }
 
     #[test]
