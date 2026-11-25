@@ -237,6 +237,7 @@ fn execute_indirect_preserves_two_384_lane_reference_cases() {
         // SAFETY: the buffer has space for all output lanes.
         unsafe { mapped.write_bytes(0, LANES * 4) };
         bind_output(host, &list, buffer, LANES);
+        state.heaps_bound_by_caller();
         assert!(state.execute_indirect(&list, (2, 16, 2), address + 16, Some(address + 4)));
     }
     // A writer later in the same list exercises restoration of UAV state.
@@ -295,6 +296,7 @@ fn execute_indirect_runs_both_counted_records() {
         bind_output(host, &list, &buffer, LANES);
         let mut state = State::default();
         state.reset(pipeline);
+        state.heaps_bound_by_caller();
         assert!(state.execute_indirect(&list, (2, 16, 3), arguments.address, Some(count.address)));
         list.close();
         host.execute_checked(&list);

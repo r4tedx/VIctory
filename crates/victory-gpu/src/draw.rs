@@ -908,6 +908,14 @@ impl State {
         [views, sampler]
     }
 
+    /// Tests that bind descriptor heaps of their own: the state takes them
+    /// for the ones it would bind for a title that binds none, so it does
+    /// not replace them with its fallback sampler heap.
+    #[cfg(test)]
+    pub(crate) fn heaps_bound_by_caller(&mut self) {
+        self.host_heaps = Self::wanted(self.heaps, false);
+    }
+
     /// Gives the host list the title's heaps if it has others.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = Self::wanted(self.heaps, memory_heap);
