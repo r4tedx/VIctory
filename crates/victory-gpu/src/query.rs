@@ -570,8 +570,9 @@ mod tests {
         let host_list = crate::list::host_list(list).unwrap();
         shadow.refresh(host_list, address, 64);
         shadow.gpu_writes(host_list, address, 16, false);
-        assert!(crate::indirect::bound(host_list, &shadow.buffer, shadow.gpu(address), (0, 16, 1)));
-        crate::indirect::done(host_list, &shadow.buffer);
+        let clamped = crate::indirect::bound(host_list, &shadow.buffer, None, shadow.gpu(address), (0, 16, 1));
+        let clamped = clamped.expect("the clamp runs");
+        crate::indirect::done(host_list, &shadow.buffer, None, clamped);
 
         slot::<Mark>(list, BEGIN)(list, occlusion, OCCLUSION, 0);
         triangle.draw(list, true);
