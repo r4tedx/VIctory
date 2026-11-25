@@ -438,6 +438,14 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                if self
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|t| t.was_remapped((start + at) / PAGE))
+                {
+                    at += n;
+                    continue;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -1656,5 +1664,83 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Remapping or freeing a title memory range while a submission's
+    /// declared copy-back is pending must not overwrite the new mapping with
+    /// stale GPU bytes, and must leave the remapped page dirty for the next
+    /// refresh.
+    #[test]
+    fn remapping_while_copy_back_is_pending_keeps_new_title_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: our pool.
+        unsafe {
+            (p as *mut u8).write_volatile(0x11);
+            ((p + PAGE) as *mut u8).write_volatile(0x33);
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        copy.writing(p, len, false);
+        copy.write_host(p as u64, &[0xaa]);
+        copy.write_host((p + PAGE) as u64, &[0xbb]);
+        // Title remaps page 0 while the submission is pending and writes 0x22.
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        assert_eq!(copy.copy_back(p, len), PAGE, "only unremapped page 1 writes back");
+        // SAFETY: our pool.
+        let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        assert_eq!(title(p), 0x22, "remapped page keeps the new mapping's bytes");
+        assert_eq!(title(p + PAGE), 0xbb, "other page keeps the GPU write");
+        assert!(!copy.clean(), "remapped page remains changed for next update");
+        // Subsequent submission sees the new bytes after update and copies back.
+        copy.update(p, PAGE);
+        assert_eq!(copy.read_host(p as u64, 1)[0] & 0xff, 0x22);
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xcc]);
+        assert_eq!(copy.copy_back(p, PAGE), PAGE);
+        assert_eq!(title(p), 0xcc);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A title write before remapping saves pre-write bytes on an armed page;
+    /// remapping discards them so `copy_back_marked` does not overwrite the new
+    /// mapping with stale GPU writes.
+    #[test]
+    fn remapping_after_title_write_discards_saved_bytes_for_marked_copy_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        // Title writes first (populating Saved::bytes), GPU writes, then title remaps.
+        // SAFETY: our pool.
+        unsafe { ((p + 40) as *mut u8).write_volatile(0x11) };
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: mapped bitmap dword.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { ((p + 10) as *mut u8).write_volatile(0x22) };
+        copy_back_marks(&[], false);
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        // SAFETY: our pool.
+        let byte10 = unsafe { ((p + 10) as *const u8).read_volatile() };
+        assert_eq!(byte10, 0x22, "remapped page is not overwritten by marked write");
+        assert!(!copy.clean(), "remapped page stays changed");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 }

@@ -113,6 +113,9 @@ struct Saved {
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    /// Pages unmapped or remapped since a copy took them or ended a
+    /// submission: pending copy-backs must not write stale bytes back there.
+    remapped: BTreeSet<usize>,
 }
 
 impl Saved {
@@ -152,7 +155,18 @@ impl Saved {
 impl Changed {
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.bytes.remove(&page);
+        saved.remapped.remove(&page);
+    }
+
+    /// Page `page` was unmapped or remapped: drop any armed/saved pre-write
+    /// snapshot and record it so pending declared copy-backs skip it.
+    fn remapped(&self, page: usize) {
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.armed.remove(&page);
+        saved.bytes.remove(&page);
+        saved.remapped.insert(page);
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -607,6 +621,18 @@ impl Tracked {
         saved.armed.clear();
         saved.unarmed.clear();
         saved.bytes.clear();
+        saved.remapped.clear();
+    }
+
+    /// Whether `page` (a page number) was unmapped or remapped since it was
+    /// taken or the previous submission finished.
+    pub(crate) fn was_remapped(&self, page: usize) -> bool {
+        self.changed
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remapped
+            .contains(&page)
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -815,6 +841,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders {
+            c.remapped(page);
+        }
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1445,5 +1476,27 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Remapping clears any armed/saved pre-write snapshot and records the
+    /// page until taken or disarmed.
+    #[test]
+    fn remapping_clears_saved_bytes_and_marks_page_remapped() {
+        let p = pool(1);
+        let t = track_copy(p, PAGE, true).expect("pool memory is tracked");
+        let page = p / PAGE;
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        t.arm(p, p + PAGE);
+        // SAFETY: committed page of ours, guarded: triggers save() before write.
+        unsafe { (p as *mut u8).write_volatile(0x55) };
+        title_memory_remapped(p, PAGE);
+        assert!(t.was_remapped(page));
+        assert!(t.saved(page).is_none(), "pre-remap saved bytes discarded");
+        assert!(t.changed(page));
+        t.disarm();
+        assert!(!t.was_remapped(page));
+        assert!(t.changed(page), "disarm does not clear changed");
+        drop(t);
+        free(p);
     }
 }
