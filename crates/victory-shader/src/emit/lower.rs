@@ -184,9 +184,9 @@ pub(super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_branch: bool) 
     let p = crate::ir::build(&native.code, false, 1).expect("ir");
     let st = crate::structure::structure(&p).expect("st");
     let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
-    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark };
+    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, target: super::Target::ANY, console_cf: false, per_lane_only: false, view_marks: view_mark, rays_miss: false };
     let bad = HashMap::new();
-    let mut l = Lower::new(&parts, &bad);
+    let mut l = Lower::new(&parts, &bad, false);
     l.cur = l.s.entry;
     let (z, iu) = (l.s.m.i32(0), l.s.m.undef(l.s.t.i32));
     let at = in_branch.then(|| {

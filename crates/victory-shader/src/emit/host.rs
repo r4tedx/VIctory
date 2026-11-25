@@ -987,6 +987,7 @@ pub fn position_vs() -> HostShader {
         root_uavs: Vec::new(),
         memory: false,
         memory_writes: false,
+        heap_usage: false,
         view_addresses: false,
         heap: false,
         heap_writes: false,
