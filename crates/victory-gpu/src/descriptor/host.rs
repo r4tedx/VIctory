@@ -202,6 +202,12 @@ impl HostHeap {
                 }
             }
         };
+        // Draws read the heap's tables every frame. Not the heap itself: a
+        // priority on a shader-visible descriptor heap removed the device at
+        // the next submission (RTX 5070 Ti, driver 621.24).
+        for (buffer, _) in strides.iter().chain(&marks) {
+            crate::host::keep_resident(buffer, crate::host::Residency::Frame);
+        }
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -686,6 +692,7 @@ impl HostHeap {
             // buffer, or a GPU fault).
             let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
+            crate::host::keep_resident(&buffer, crate::host::Residency::Frame);
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
@@ -2346,6 +2353,21 @@ mod tests {
         let mut format = DXGI_FORMAT_D32_FLOAT;
         assert!(fits(&texture, &[], Some(&mut format), false));
         assert_eq!(format, DXGI_FORMAT_R32_FLOAT);
+    }
+
+    /// The tables beside view heaps, which draws read every frame, are
+    /// kept resident; the heap itself gets no priority (one removed the
+    /// device).
+    #[test]
+    fn view_heap_tables_are_kept_resident() {
+        use crate::host::{Residency, kept};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU here
+        };
+        assert_eq!(kept(&heap.heap), None);
+        for (buffer, _) in heap.strides.iter().chain(&heap.marks) {
+            assert_eq!(kept(buffer), Some(Residency::Frame));
+        }
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

@@ -564,6 +564,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
             }
+        } else {
+            // The pages from copies in video memory, into their mirrors.
+            let pulled: Vec<_> = writes
+                .iter()
+                .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
+                .collect();
+            crate::shadow::pull(&pulled);
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
