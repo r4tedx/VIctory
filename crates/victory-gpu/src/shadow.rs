@@ -92,17 +92,34 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 2 << 30;
 
 /// The runs `[start, end)` of bytes where the copy differs from title
-/// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
-/// GPU wrote byte `i`: what a copy-back puts into title memory.
+/// memory (`host`, `title`: the same bytes of each) and the GPU wrote them,
+/// that is, where the copy also differs from `before` (its bytes before the
+/// submission), or every differing byte without `before`: what a copy-back
+/// puts into title memory.
 ///
 /// Equal stretches (most of a page) are skipped a block at a time, then a
 /// line at a time inside a block that differs: one comparison per 8 bytes
 /// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages.
-fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+/// Inside a line that differs, the bytes are tested 8 at a time: a byte a
+/// time there cost ~1 ns a byte, and the GPU rewrites most bytes of many
+/// pages it marks.
+fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, usize)> {
     const BLOCK: usize = 1 << 10;
     const LINE: usize = 32;
-    let n = host.len().min(title.len());
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    let n = host.len().min(title.len()).min(before.map_or(usize::MAX, <[u8]>::len));
+    let word = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().expect("8 bytes"));
+    // Bit 0 of each byte of the result: whether that byte of `x` is not 0.
+    let nonzero = |x: u64| {
+        let x = x | x >> 4;
+        let x = x | x >> 2;
+        (x | x >> 1) & LOW
+    };
     let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |start: usize, end: usize| match runs.last_mut() {
+        Some((_, last)) if *last == start => *last = end,
+        _ => runs.push((start, end)),
+    };
     let mut block = 0;
     while block < n {
         let block_end = (block + BLOCK).min(n);
@@ -111,12 +128,27 @@ fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usi
             while line < block_end {
                 let line_end = (line + LINE).min(block_end);
                 if host[line..line_end] != title[line..line_end] {
-                    for i in line..line_end {
-                        if host[i] != title[i] && gpu(i) {
-                            match runs.last_mut() {
-                                Some((_, end)) if *end == i => *end = i + 1,
-                                _ => runs.push((i, i + 1)),
+                    let mut i = line;
+                    while i + 8 <= line_end {
+                        let h = word(host, i);
+                        let mut m = nonzero(h ^ word(title, i));
+                        if let Some(b) = before {
+                            m &= nonzero(h ^ word(b, i));
+                        }
+                        if m == LOW {
+                            push(i, i + 8);
+                        } else {
+                            for k in 0..8 {
+                                if m >> (8 * k) & 1 != 0 {
+                                    push(i + k, i + k + 1);
+                                }
                             }
+                        }
+                        i += 8;
+                    }
+                    for i in i..line_end {
+                        if host[i] != title[i] && before.is_none_or(|b| host[i] != b[i]) {
+                            push(i, i + 1);
                         }
                     }
                 }
@@ -323,10 +355,10 @@ impl Shadow {
             return false;
         }
         let runs = match &saved {
-            None => differing(host, &title, |_| true),
+            None => differing(host, &title, None),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                differing(host, &title, |i| host[i] != before[i])
+                differing(host, &title, Some(before))
             }
         };
         // The copy takes the title's other bytes, and holds what goes back.
@@ -529,7 +561,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // The GPU's bytes go into title memory, and no others:
                     // the title writes the piece meanwhile.
-                    let runs = differing(host, title, |i| host[i] != old[i]);
+                    let runs = differing(host, title, Some(old));
                     // The copy takes the title's bytes in turn.
                     take_others(host, title, &runs);
                     if write_runs(start + at, host, &runs) {
@@ -1709,17 +1741,85 @@ void main(uint3 id : SV_DispatchThreadID) {
                 *last = 1;
             }
             let gpu = |i: usize| !i.is_multiple_of(5);
+            // The copy's bytes before: different where the GPU wrote.
+            let before: Vec<u8> =
+                host.iter().enumerate().map(|(i, &h)| if gpu(i) { h ^ 0x80 } else { h }).collect();
             assert_eq!(
-                differing(&host, &title, gpu),
+                differing(&host, &title, Some(&before)),
                 naive(&host, &title, &gpu),
                 "length {len}"
             );
             assert_eq!(
-                differing(&host, &title, |_| true),
+                differing(&host, &title, None),
                 naive(&host, &title, &|_| true),
                 "length {len}"
             );
         }
+        // A page the GPU rewrote almost whole, with every pattern of equal
+        // and written bytes inside a word: words of eight, words of none,
+        // words of some, and bytes that differ only in their top or bottom
+        // bit.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let title: Vec<u8> = (0..PAGE).map(|_| next() as u8).collect();
+        let mut host = title.clone();
+        let mut before = title.clone();
+        for i in 0..PAGE {
+            match next() % 8 {
+                0 => {}
+                1 => host[i] ^= 0x80,
+                2 => host[i] ^= 0x01,
+                3 => {
+                    // Title changed it, the GPU did not.
+                    host[i] ^= 0x10;
+                    before[i] = host[i];
+                }
+                _ => host[i] = next() as u8,
+            }
+        }
+        let gpu = |i: usize| host[i] != before[i];
+        assert_eq!(differing(&host, &title, Some(&before)), naive(&host, &title, &gpu));
+        assert_eq!(differing(&host, &title, None), naive(&host, &title, &|_| true));
+    }
+
+    /// The comparison of a page the GPU rewrote whole, a byte at a time
+    /// and as `differing` does it (WARP or any host; prints the times).
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn differing_times_a_rewritten_page() {
+        let title = vec![0x11u8; PAGE];
+        let host: Vec<u8> = (0..PAGE).map(|i| (i * 7 + 3) as u8 | 0x80).collect();
+        let before = title.clone();
+        let rounds = 2000;
+        let naive = |host: &[u8], title: &[u8], before: &[u8]| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for i in 0..host.len() {
+                if host[i] != title[i] && host[i] != before[i] {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == i => *end = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+            runs
+        };
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(naive(&host, &title, &before));
+        }
+        let bytes = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(differing(&host, &title, Some(&before)));
+        }
+        let words = t.elapsed() / rounds;
+        assert_eq!(naive(&host, &title, &before), differing(&host, &title, Some(&before)));
+        eprintln!("64 KiB page rewritten whole: a byte at a time {bytes:?}, differing {words:?}");
     }
 
     /// Mark bits are handed out in runs and come back joined.
