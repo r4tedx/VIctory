@@ -285,17 +285,38 @@ pub fn run(
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
+    // A check nobody asked for has no result: not a zero, which a reader
+    // of a pasted report takes for "none passed".
+    let checks = |validated: usize, made: usize| {
+        let validated = if validate {
+            format!("{validated} validated")
+        } else {
+            "validation not checked".to_owned()
+        };
+        let made = if pipelines {
+            format!("{made} pipelines")
+        } else {
+            "pipelines not made".to_owned()
+        };
+        format!("{validated}, {made}")
+    };
     println!(
-        "DXIL         {} emitted of {} vertex, geometry and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
+        "DXIL         {} emitted of {} vertex, geometry and pixel programs; {}",
+        t.emitted,
+        t.emit_programs,
+        checks(t.validated, t.pipelines)
     );
     println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+        "             {} emitted of {} compute programs; {}",
+        t.cs_emitted,
+        t.cs_programs,
+        checks(t.cs_validated, t.cs_pipelines)
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {}",
+        t.ms_emitted,
+        t.ms_programs,
+        checks(t.ms_validated, t.ms_pipelines)
     );
     if count {
         print_counts(&t.counted);
