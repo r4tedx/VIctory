@@ -265,6 +265,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The title pipeline set.
+    pub(crate) fn pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     /// Fixed-function state, straight onto the host list (and kept for the
     /// list's next segment).
     pub(crate) fn viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
