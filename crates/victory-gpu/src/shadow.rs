@@ -98,7 +98,7 @@ fn give_back(v: Vec<u8>) {
 }
 
 /// Snapshot memory kept for reuse.
-pub(crate) const POOL_BYTES: usize = 2 << 30;
+pub(crate) const POOL_BYTES: usize = 512 << 20;
 
 /// The runs `[start, end)` of bytes where the copy differs from title
 /// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
