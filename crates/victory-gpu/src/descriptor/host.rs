@@ -898,14 +898,32 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// Writes slot `index`'s view address into the view addresses at `data`
 /// (the caller keeps `index` below [`HostHeap::address_slots`]):
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// a buffer view's title address, or a ray tracing acceleration
+/// structure's (dword 0 low, dword 1 bits 0-15 high); zeros for anything
+/// else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+    let address = view.map_or(0, view_address);
     let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
     // SAFETY: the mapped view addresses hold 8 bytes per title and dynamic
     // slot (below `address_slots`).
     unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+}
+
+/// The title address a program reads as a view's address (dwords 0 and 1
+/// of its descriptor). A ray tracing acceleration structure's shader view
+/// has no resource: its description holds the structure's address
+/// (`Location`, dwords 4 and 5), the BVH the program walks with
+/// `image_bvh64_intersect_ray` from that address. Any other view: its
+/// buffer's first byte, or 0.
+fn view_address(view: &View) -> u64 {
+    match view {
+        View::Shader(_, Some(desc))
+            if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>
+        {
+            u64::from(desc[4]) | u64::from(desc[5]) << 32
+        }
+        _ => buffer_range(view).map_or(0, |(address, _)| address),
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1674,6 +1692,34 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// The world's ray traced pass (`f607780aa8e502d0`, #1968) takes its
+    /// BVH's address from an acceleration structure's view, which has no
+    /// resource: the view address is the description's location, not 0. A
+    /// buffer view placed in memory keeps its own address.
+    #[test]
+    fn an_acceleration_structures_view_address_is_its_location() {
+        // Words as the title wrote them: format 0, dimension 11, the
+        // default component mapping, then the location 0xd_5f1c_0000.
+        let mut words = [0u32; 10];
+        (words[1], words[2], words[4], words[5]) = (11, 0x1688, 0x5f1c_0000, 0xd);
+        let mut table = [u32::MAX; 4];
+        write_address(table.as_mut_ptr() as usize, 1, Some(&View::Shader(0, Some(words))));
+        assert_eq!(table, [u32::MAX, u32::MAX, 0x5f1c_0000, 0xd]);
+
+        // A placed buffer view: dimension 1, 64 elements from element 0,
+        // its memory at 0x1_2345_6700 (description dwords 10 and 11).
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[10], desc[11]) = (1, 0x1688, 64, 0x2345_6700, 1);
+        write_address(table.as_mut_ptr() as usize, 0, Some(&View::Placed(false, resource, desc)));
+        assert_eq!(table, [0x2345_6700, 1, 0x5f1c_0000, 0xd]);
+
+        // No view: zeros.
+        write_address(table.as_mut_ptr() as usize, 1, None);
+        assert_eq!(table, [0x2345_6700, 1, 0, 0]);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
