@@ -214,6 +214,31 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// Evaluates the constant clamp feeding a heap handle in emission tests.
+    #[cfg(test)]
+    pub(crate) fn heap_handle_index(&self) -> u32 {
+        fn eval(m: &Module, v: V) -> u32 {
+            if let Some(n) = m.int_value(v) {
+                return n as u32;
+            }
+            let V::Inst(i) = v else { panic!("expected a constant clamp") };
+            match m.insts[i as usize].op {
+                Op::Cmp(pred::IUGT, a, b) => u32::from(eval(m, a) > eval(m, b)),
+                Op::Select(c, t, f) => eval(m, if eval(m, c) != 0 { t } else { f }),
+                _ => panic!("expected a constant clamp"),
+            }
+        }
+        self.insts
+            .iter()
+            .find_map(|i| match &i.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.createHandleFromHeap" => {
+                    Some(eval(self, args[1]))
+                }
+                _ => None,
+            })
+            .expect("a heap handle")
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
