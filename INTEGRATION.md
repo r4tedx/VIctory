@@ -39,6 +39,14 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 | #1989 | BastienRodz | `0f11320` | a vertex (or mesh, geometry) program writing through views declares the UAV flags the validator requires |
 | #1763 | n-romanovich | `50d91b1` | typed UAVs in formats the adapter does not support are refused whatever their family or castability, and the supported ones are pinned by tests (on NVIDIA, `main` removes the device at boot) |
 | #1751 | JurajSimicevic | `4521591` | view heaps capped by the host (1,000,000 slots on NVIDIA) keep the full dynamic descriptor range |
+| #1133 | rivaldodev | `cae16e6` | translated shaders clamp view indices to the host's cap (1,000,000 on NVIDIA), whose last slot stays null |
+
+#1133 conflicts with #1751 in text only, resolved as integration/play
+resolved it (`4dc038b8`; each file the merge touches is the same as
+play's): `descriptor/host.rs` keeps #1751's middle branch (a host that
+takes `PORTABLE_VIEWS` but not `HEAP_VIEWS`) with #1133's guard slot, and
+the dynamic-slot test asserts both #1133's heap size and #1751's dynamic
+range; `host.rs` keeps the depth-bounds query with #1133's cap probe.
 
 Left out for now: #2150 (one instruction per value on the finished
 module). It rewrites every emitted shader for a module-size gain; it has
@@ -72,13 +80,14 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 
 - `cargo build --release -p victory`, the test builds and
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- Checked at `a97c92b` (the #1751 merge). The later commits for this file
+- Checked at `62d46c3` (the #1133 merge). The later commits for this file
   change only text.
 - `victory-gpu` tests on WARP (diagnostics build, `VICTORY_D3D12_WARP=1`,
-  one test per process): 170 passed, 0 failed (#1763 adds two tests and
-  #1751 updates the view-heap test).
-- `victory-shader` tests with `VICTORY_WARP=1`, one test per process: 268
-  passed, 2 failed. The two failures are hardware-only checks that
+  one test per process): 171 passed, 0 failed (#1763 adds two tests,
+  #1751 updates the view-heap test, #1133 adds one, whose capped-heap
+  checks run only on a host that caps view heaps).
+- `victory-shader` tests with `VICTORY_WARP=1`, one test per process: 269
+  passed, 2 failed (#1133 adds one). The two failures are hardware-only checks that
   `VICTORY_WARP=1` sends to WARP (`gathers_at_a_level_match_the_hardware`,
   and `permutes_read_the_lane_named_and_zero_from_lanes_left_out`, which
   needs a device that accepts a wave of 32); they fail the same way on
@@ -102,6 +111,7 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
   was run on the RTX 5070, and **the title was not run** with this branch.
   It makes no claim about results in the game.
 - #1751 held in game on the RTX 5070 as part of integration/play's set (layer-1 run L1b, 10 minutes, lit world, 0 events); not run alone.
+- #1133 held in game on the RTX 5070 as part of integration/play's set (layer-1 run L1b, 10 minutes, lit world, 0 events); not run alone.
 
 ## What a useful report from the title contains
 
