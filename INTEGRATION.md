@@ -40,6 +40,7 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 | #1763 | n-romanovich | `50d91b1` | typed UAVs in formats the adapter does not support are refused whatever their family or castability, and the supported ones are pinned by tests (on NVIDIA, `main` removes the device at boot) |
 | #1751 | JurajSimicevic | `4521591` | view heaps capped by the host (1,000,000 slots on NVIDIA) keep the full dynamic descriptor range |
 | #1133 | rivaldodev | `cae16e6` | translated shaders clamp view indices to the host's cap (1,000,000 on NVIDIA), whose last slot stays null |
+| #2180 | n-romanovich | `e1bf670` | host textures shed unsupported UAV/RT flags, and updating only the early list skips writing the pipeline library |
 
 #1133 conflicts with #1751 in text only, resolved as integration/play
 resolved it (`4dc038b8`; each file the merge touches is the same as
@@ -47,6 +48,9 @@ play's): `descriptor/host.rs` keeps #1751's middle branch (a host that
 takes `PORTABLE_VIEWS` but not `HEAP_VIEWS`) with #1133's guard slot, and
 the dynamic-slot test asserts both #1133's heap size and #1751's dynamic
 range; `host.rs` keeps the depth-bounds query with #1133's cap probe.
+
+#2180 merged cleanly. Both changed files match integration/play's merge
+(`1a232a8b`).
 
 Left out for now: #2150 (one instruction per value on the finished
 module). It rewrites every emitted shader for a module-size gain; it has
@@ -61,12 +65,9 @@ programs on this branch as on `main`.
 
 ## Known risks on NVIDIA (crash safety)
 
-- **Heap indices past a capped heap.** Translated shaders clamp
-  descriptor-heap indices below 2^21, but NVIDIA caps a shader-visible
-  view heap at 1,000,000, so an index between the two still passes the
-  heap's end. Upstream #1777 aims at this but is not taken yet: it opens
-  the default hardware adapter in every process that translates, and has
-  a slot-overlap case at one heap size (both reported on #1777).
+- **Heap indices past a capped heap.** #1133 clamps translated view
+  indices past the host's heap cap to its last slot, which holds a null
+  descriptor. NVIDIA's shader-visible view heap has 1,000,000 slots.
 - **Driver-level shader error reporting** (the Nsight Aftermath Monitor
   set to Global) turned every world load into a device hang for a tester
   on upstream #71. Check it is off before a run.
@@ -80,12 +81,13 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 
 - `cargo build --release -p victory`, the test builds and
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- Checked at `62d46c3` (the #1133 merge). The later commits for this file
-  change only text.
+- Checked at `7190fe91` (the #2180 merge). The later commit for this file
+  changes only text.
 - `victory-gpu` tests on WARP (diagnostics build, `VICTORY_D3D12_WARP=1`,
-  one test per process): 171 passed, 0 failed (#1763 adds two tests,
-  #1751 updates the view-heap test, #1133 adds one, whose capped-heap
-  checks run only on a host that caps view heaps).
+  one test per process): 172 passed, 0 failed (#1763 adds two tests,
+  #1751 updates the view-heap test, and #1133 adds one, whose capped-heap
+  checks run only on a host that caps view heaps). #2180 adds one test
+  for unsupported UAV and render-target format flags.
 - `victory-shader` tests with `VICTORY_WARP=1`, one test per process: 269
   passed, 2 failed (#1133 adds one). The two failures are hardware-only checks that
   `VICTORY_WARP=1` sends to WARP (`gathers_at_a_level_match_the_hardware`,
@@ -93,14 +95,16 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
   needs a device that accepts a wave of 32); they fail the same way on
   `main` under `VICTORY_WARP=1`, and no PR here touches them.
 - **Local title-data diagnostic:** `victory translate shaders.rpf --validate
-  --list --jobs 6` on this PC's copy of the title (offline, CPU only, counts
+  --list --jobs 4` on this PC's copy of the title (offline, CPU only, counts
   and refusal reasons only), program by program against the same count of
   `main`: **1,842 programs gained, 0 lost**: all 867 vertex programs
   `main` emits but the validator refuses (#1989), all 195 geometry
   programs (#1315), and 780 compute programs (#1883 and #2027 together:
   735 that `main` emits but the validator refuses, 40 ray-intersection
   programs and 5 more). Every program of that archive that does not validate on this
-  branch does not validate on `main` either.
+  branch does not validate on `main` either. The #1133 round (`62d46c3c`,
+  same code as `623a98fd`) and #2180 both validated 25,760 of 25,889
+  unique programs, with **0 gained, 0 lost** between rounds.
 - The speed numbers of #2136 and #2111 in their PRs come from synthetic
   benchmarks, not from the game; times from the title are what they need.
 - In-game check by us (local title data, RTX 5070, driver 616.92,
