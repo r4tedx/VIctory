@@ -11578,12 +11578,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
-        if let Ok(mut v) = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut l.dxil.clone())
-                .expect("DXIL validation failed");
-        }
+        validate(&l);
     }
 
     #[test]
@@ -11631,12 +11626,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
-        if let Ok(mut v) = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut l.dxil.clone())
-                .expect("DXIL validation failed");
-        }
+        validate(&l);
     }
 
     #[test]
@@ -11681,12 +11671,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
-        if let Ok(mut v) = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut l.dxil.clone())
-                .expect("DXIL validation failed");
-        }
+        validate(&l);
     }
 
     #[test]
@@ -12207,5 +12192,21 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+    }
+
+    /// Validates `l`'s DXIL with `dxil.dll`. Where tests run in CI (`CI`
+    /// set, as GitHub's runners set it) the validator must load, so a green
+    /// run means the DXIL was validated; elsewhere a missing one skips it.
+    fn validate(l: &Lowered) {
+        #[cfg(windows)]
+        match super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            Ok(mut v) => v.validate(&mut l.dxil.clone()).expect("DXIL validation"),
+            Err(e) if std::env::var_os("CI").is_some() => panic!("no DXIL validator in CI: {e}"),
+            Err(_) => {}
+        }
+        #[cfg(not(windows))]
+        let _ = l;
     }
 }
