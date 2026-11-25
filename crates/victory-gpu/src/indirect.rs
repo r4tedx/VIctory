@@ -19,7 +19,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -176,53 +176,161 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+/// Result of [`bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Clamped {
+    /// Zero records: nothing was recorded on the list and `buffer` stayed in
+    /// its previous state (no pipeline rebind or [`done`] transition needed).
+    Empty,
+    /// The clamp ran and `buffer` is now in `INDIRECT_ARGUMENT`: rebind the
+    /// compute root signature and pipeline, and call [`done`] after execution.
+    Ready,
+}
+
+impl Clamped {
+    /// Whether [`bound`] dispatched the clamp and transitioned `buffer` to
+    /// `INDIRECT_ARGUMENT`.
+    pub(crate) fn transitioned(self) -> bool {
+        self == Self::Ready
+    }
+}
+
+/// Which host buffer a scoped indirect UAV barrier targets (never a wildcard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Args,
+    Count,
+    Budget,
+}
+
+/// The barriers and transition planned for one [`bound`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Plan {
+    /// Scoped UAV barriers emitted before the clamp dispatch.
+    pre_uav: [Target; 3],
+    pre_uav_len: usize,
+    /// Whether the clamp dispatches and emits the single post-clamp
+    /// `UAV -> INDIRECT_ARGUMENT` transition (and therefore requires [`done`]).
+    transition: bool,
+}
+
+impl Plan {
+    /// Plans barriers for `records` indirect records. `count_ptr` is the raw
+    /// resource pointer of the count buffer, if any (deduplicated against
+    /// `args_ptr`). `budget_written` is true when an earlier clamp on this
+    /// list already wrote the budget buffer.
+    fn for_call(
+        records: u32,
+        args_ptr: usize,
+        count_ptr: Option<usize>,
+        budget_written: bool,
+    ) -> Self {
+        if records == 0 {
+            return Self {
+                pre_uav: [Target::Args; 3],
+                pre_uav_len: 0,
+                transition: false,
+            };
+        }
+        let mut pre_uav = [Target::Args; 3];
+        let mut len = 1;
+        if count_ptr.is_some_and(|c| c != args_ptr) {
+            pre_uav[len] = Target::Count;
+            len += 1;
+        }
+        if budget_written {
+            pre_uav[len] = Target::Budget;
+            len += 1;
+        }
+        Self {
+            pre_uav,
+            pre_uav_len: len,
+            transition: true,
+        }
+    }
+
+    fn pre_uav(&self) -> &[Target] {
+        &self.pre_uav[..self.pre_uav_len]
+    }
+}
+
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// `buffer`, and leaves the buffer ready to be read as arguments. `count`
+/// is the indirect count buffer, if the call gives one (synchronized before
+/// execution when it is a different host buffer than `buffer`, without
+/// changing its state). Replaces the list's compute root signature and
+/// pipeline when returning [`Clamped::Ready`] (callers bind theirs after).
+/// `None` if the clamp is not available or the arguments are unaligned.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+) -> Option<Clamped> {
+    if records == 0 {
+        return Some(Clamped::Empty);
     }
+    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let (c, (budget_res, budget, budget_written)) = (clamp()?, list.budget()?);
+    let plan = Plan::for_call(
+        records,
+        buffer.as_raw() as usize,
+        count.map(|r| r.as_raw() as usize),
+        budget_written,
+    );
+    if !plan.transition {
+        return Some(Clamped::Empty);
+    }
+    let barrier_for = |target: Target| match target {
+        Target::Args => uav_barrier_for(buffer),
+        Target::Count => uav_barrier_for(count.expect("count buffer planned")),
+        Target::Budget => uav_barrier_for(budget_res),
+    };
     let l = &list.list;
     let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    // SAFETY: an open list; our root signature, pipeline and live buffers
+    // the caller and list hold.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        // Earlier shader writes (the title's argument/count passes, and any
+        // prior clamp's budget write in this list) first, scoped to their
+        // buffers so unrelated UAV waves keep running.
+        match plan.pre_uav() {
+            [a] => l.ResourceBarrier(&[barrier_for(*a)]),
+            [a, b] => l.ResourceBarrier(&[barrier_for(*a), barrier_for(*b)]),
+            [a, b, d] => l.ResourceBarrier(&[barrier_for(*a), barrier_for(*b), barrier_for(*d)]),
+            _ => unreachable!(),
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.Dispatch(1, 1, 1);
+        // Transitioning UAV -> INDIRECT_ARGUMENT already synchronizes the
+        // clamp's UAV writes to `buffer`; `budget` is synchronized before the
+        // next clamp on this list.
+        l.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
-    true
+    Some(Clamped::Ready)
 }
 
 /// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
+/// title's passes keep using it. No-op when `clamped` is [`Clamped::Empty`]
+/// (the buffer was never transitioned).
+pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, clamped: Clamped) {
+    if !clamped.transitioned() {
+        return;
+    }
+    // SAFETY: an open list and a live buffer in INDIRECT_ARGUMENT.
     unsafe {
         list.list.ResourceBarrier(&[transition(
             buffer,
@@ -232,18 +340,91 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+/// A UAV barrier scoped to `resource` (non-null `pResource`).
+fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{Clamped, Plan, Target};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// Zero records skips pre-clamp barriers, clamp dispatch, transition, and
+    /// restore even when a count buffer and dirty budget are present.
+    #[test]
+    fn zero_records_skips_clamp_and_barriers() {
+        let empty = Plan::for_call(0, 0x1000, None, false);
+        assert!(empty.pre_uav().is_empty());
+        assert!(!empty.transition);
+
+        let with_count_and_budget = Plan::for_call(0, 0x1000, Some(0x2000), true);
+        assert!(with_count_and_budget.pre_uav().is_empty());
+        assert!(!with_count_and_budget.transition);
+        assert!(!Clamped::Empty.transitioned());
+        assert!(Clamped::Ready.transitioned());
+    }
+
+    /// Non-zero records plan only scoped pre-clamp UAV barriers (deduplicating
+    /// aliased count buffers, adding the budget only after an earlier clamp)
+    /// and a single post-clamp transition with no redundant UAV barrier.
+    #[test]
+    fn barrier_plan_scopes_pre_uav_targets() {
+        let first = Plan::for_call(4, 0x1000, None, false);
+        assert_eq!(first.pre_uav(), &[Target::Args]);
+        assert!(first.transition);
+
+        let second = Plan::for_call(4, 0x1000, None, true);
+        assert_eq!(second.pre_uav(), &[Target::Args, Target::Budget]);
+        assert!(second.transition);
+
+        let distinct_count = Plan::for_call(8, 0x1000, Some(0x2000), false);
+        assert_eq!(distinct_count.pre_uav(), &[Target::Args, Target::Count]);
+        assert!(distinct_count.transition);
+
+        let distinct_count_and_budget = Plan::for_call(8, 0x1000, Some(0x2000), true);
+        assert_eq!(
+            distinct_count_and_budget.pre_uav(),
+            &[Target::Args, Target::Count, Target::Budget]
+        );
+        assert!(distinct_count_and_budget.transition);
+
+        let same_count_first = Plan::for_call(8, 0x1000, Some(0x1000), false);
+        assert_eq!(same_count_first.pre_uav(), &[Target::Args]);
+
+        let same_count_second = Plan::for_call(8, 0x1000, Some(0x1000), true);
+        assert_eq!(same_count_second.pre_uav(), &[Target::Args, Target::Budget]);
+    }
+
+    /// `uav_barrier_for` constructs a scoped UAV barrier with a non-null
+    /// `pResource` pointing at the exact resource (never a global wildcard).
+    #[test]
+    fn scoped_uav_barrier_sets_non_null_resource() {
+        let mut dummy = 0u64;
+        let raw = (&raw mut dummy).cast::<core::ffi::c_void>();
+        // SAFETY: wrapped in ManuallyDrop so `Release` is never called, and
+        // never dereferenced — only the pointer value is copied and compared.
+        let fake = std::mem::ManuallyDrop::new(unsafe { ID3D12Resource::from_raw(raw) });
+        let barrier = super::uav_barrier_for(&fake);
+        assert_eq!(barrier.Type, D3D12_RESOURCE_BARRIER_TYPE_UAV);
+        assert_eq!(barrier.Flags, D3D12_RESOURCE_BARRIER_FLAG_NONE);
+        // SAFETY: `barrier.Type` is `D3D12_RESOURCE_BARRIER_TYPE_UAV`.
+        let scoped = unsafe { &barrier.Anonymous.UAV.pResource }
+            .as_ref()
+            .expect("scoped UAV barrier must set pResource");
+        assert_eq!(scoped.as_raw(), raw);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -278,8 +459,9 @@ mod tests {
             }
             let gpu = buffer.GetGPUVirtualAddress();
             for _ in 0..calls {
-                assert!(super::bound(&list, &buffer, gpu, spec));
-                super::done(&list, &buffer);
+                let state = super::bound(&list, &buffer, None, gpu, spec).unwrap();
+                assert_eq!(state, if records == 0 { Clamped::Empty } else { Clamped::Ready });
+                super::done(&list, &buffer, state);
             }
             list.close();
             host.execute(&[&list]);
@@ -289,6 +471,16 @@ mod tests {
             let first = |i: usize| data.add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
         }
+    }
+
+    /// Zero-record calls leave buffer bytes untouched and do not emit a
+    /// mismatched restore transition.
+    #[test]
+    fn zero_records_leaves_buffer_untouched() {
+        let Some(empty) = clamped(0, &[u32::MAX], 0, 2) else {
+            return; // no host GPU here
+        };
+        assert!(empty.is_empty());
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26

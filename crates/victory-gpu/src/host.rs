@@ -1735,17 +1735,20 @@ impl HostList {
         Some(result)
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
+    /// The list's indirect-work budget buffer, its host GPU address, and
+    /// whether an earlier clamp in this list already wrote it; zeroed at each
     /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    pub(crate) fn budget(&self) -> Option<(&ID3D12Resource, u64, bool)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
+                name(&b, || "indirect budget".into());
                 Some((b, d as usize))
             })
             .as_ref()?;
         let mut deferred = self.deferred();
+        let written = deferred.budget_zeroed;
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
@@ -1755,7 +1758,7 @@ impl HostList {
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }, written))
     }
 
     /// Keeps `object` alive until the list is reset.
