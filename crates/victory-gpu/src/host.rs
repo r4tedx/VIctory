@@ -571,6 +571,26 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
+/// Whether a submission is left running when [`Host::execute`] returns
+/// (`VICTORY_ASYNC_SUBMIT=1`): it is then finished (copied back, its
+/// bottom-of-pipe writes and the title's fence signals behind it done) by
+/// the completion thread, or by whichever thread first needs it. Off, the
+/// default, each submission is waited for and finished on the submitting
+/// thread before `execute` returns, as before submissions had a timeline:
+/// the title's thread then never runs while what its GPU work wrote goes
+/// back. Tests take the asynchronous path, which is the one with ordering
+/// to check.
+pub(crate) fn async_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = cfg!(test) || crate::switch::on("VICTORY_ASYNC_SUBMIT");
+        if on {
+            tracing::info!("host submissions run asynchronously (VICTORY_ASYNC_SUBMIT)");
+        }
+        on
+    })
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -1149,13 +1169,22 @@ impl Host {
     }
 
     /// Runs closed lists. Their submission joins the timeline, finished
-    /// once the GPU has run it.
+    /// once the GPU has run it: before this returns unless submissions run
+    /// asynchronously ([`async_submit`]).
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         self.execute_inner(
             runs,
             #[cfg(test)]
             None,
+            !async_submit(),
         );
+    }
+
+    /// Test helper: [`Host::execute`] as with `VICTORY_ASYNC_SUBMIT` off
+    /// (tests otherwise take the asynchronous path).
+    #[cfg(test)]
+    fn execute_waited(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, None, true);
     }
 
     /// Test helper: arms `gate` on the host queue atomically inside the
@@ -1163,21 +1192,32 @@ impl Host {
     /// tests cannot deadlock behind `gate` while holding `submitted`.
     #[cfg(test)]
     fn execute_gated(&self, runs: &[&HostList], gate: &ID3D12Fence) {
-        self.execute_inner(runs, Some(gate));
+        self.execute_inner(runs, Some(gate), false);
     }
 
-    fn execute_inner(&self, runs: &[&HostList], #[cfg(test)] gate: Option<&ID3D12Fence>) {
+    /// With `wait`, the submission is finished before this returns, on this
+    /// thread and under the submission lock.
+    fn execute_inner(
+        &self,
+        runs: &[&HostList],
+        #[cfg(test)] gate: Option<&ID3D12Fence>,
+        wait: bool,
+    ) {
         if runs.is_empty() {
             return;
         }
-        self.finisher.call_once(|| {
-            let spawned = std::thread::Builder::new()
-                .name("victory-gpu-finisher".into())
-                .spawn(|| made().into_iter().for_each(Host::finish_loop));
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no completion thread; submissions finish when needed");
-            }
-        });
+        // Waited for, every submission is finished by its own thread: no
+        // completion thread runs (none is needed to move a fence on).
+        if async_submit() {
+            self.finisher.call_once(|| {
+                let spawned = std::thread::Builder::new()
+                    .name("victory-gpu-finisher".into())
+                    .spawn(|| made().into_iter().for_each(Host::finish_loop));
+                if let Err(e) = spawned {
+                    tracing::warn!(error = %e, "no completion thread; submissions finish when needed");
+                }
+            });
+        }
         // One submission at a time from preparation to submission: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1410,6 +1450,12 @@ impl Host {
             std::mem::take(&mut *RETIRED_SHADOWS.lock().unwrap_or_else(|e| e.into_inner()));
         pending.retired_marks = crate::shadow::take_retired_marks();
         self.timeline.push(*submitted, touches, pending);
+        if wait {
+            // As before submissions had a timeline: what its shaders wrote
+            // is back, its bottom-of-pipe writes and the title's signals
+            // behind it are done, before the title's thread runs on.
+            self.settle(*submitted);
+        }
         #[cfg(feature = "diagnostics")]
         if timed {
             self.settle(*submitted);
@@ -4184,6 +4230,31 @@ mod submissions {
         fn drop(&mut self) {
             self.release();
         }
+    }
+
+    /// With `VICTORY_ASYNC_SUBMIT` off (the default): when `execute`
+    /// returns, the submission has run and is finished, its bottom-of-pipe
+    /// write done and a signal queued behind it set, with no drain.
+    #[test]
+    fn a_waited_submission_is_finished_when_execute_returns() {
+        let Some(host) = super::host() else { return }; // no host GPU here
+        // A gated test's submission would hold this one (and the
+        // submission lock) until its gate opens.
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let list = host.new_list().unwrap();
+        let word = Box::new(0u64);
+        list.defer_write((&raw const *word).cast_mut().cast(), Written::Value(5), 8);
+        list.close();
+        host.execute_waited(&[&list]);
+        assert!(!list.running(), "finished before execute returned");
+        // SAFETY: our word; its submission is finished.
+        assert_eq!(unsafe { std::ptr::read_volatile(&*word) }, 5);
+        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = signalled.clone();
+        host.after(move || set.store(true, std::sync::atomic::Ordering::Release));
+        // Other tests' submissions may be in flight: the signal follows them.
+        host.drain();
+        assert!(signalled.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
