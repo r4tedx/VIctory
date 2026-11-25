@@ -473,13 +473,12 @@ pub(crate) fn read_indirect(
         l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
         if let Some((c, at)) = count {
             let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
             if !same {
-                l.ResourceBarrier(&[transition(c, state, copy)]);
+                l.ResourceBarrier(&[transition(c, arg_state, copy)]);
             }
             l.CopyBufferRegion(&buffer, len, c, at, 4);
             if !same {
-                l.ResourceBarrier(&[transition(c, copy, state)]);
+                l.ResourceBarrier(&[transition(c, copy, arg_state)]);
             }
         }
         l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);

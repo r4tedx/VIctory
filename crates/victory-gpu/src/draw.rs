@@ -1573,6 +1573,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Zero records cannot run any work: skip shadow refreshes, clamp
+        // dispatch, barriers, transitions, and pipeline/root invalidation.
+        if max == 0 && matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
+            return true;
+        }
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -1632,12 +1637,35 @@ impl State {
             })
             .flatten();
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if batched.is_none()
-            && !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max))
-        {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        }
+        let clamped = match batched {
+            Some(_) => None,
+            None => {
+                let Some(clamped) = crate::indirect::bound(
+                    list,
+                    &args.buffer,
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at))),
+                    args.gpu(arguments),
+                    (kind, stride, max),
+                ) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                if !clamped.transitioned() {
+                    return true;
+                }
+                Some(clamped)
+            }
+        };
+        let done = |list: &HostList| {
+            if let Some(clamped) = clamped {
+                crate::indirect::done(
+                    list,
+                    &args.buffer,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    clamped,
+                );
+            }
+        };
         if batched.as_ref().is_none_or(|b| b.opened) {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
@@ -1657,9 +1685,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if batched.is_none() {
-                crate::indirect::done(list, &args.buffer);
-            }
+            done(list);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1706,9 +1732,8 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, records, count, (kind, stride, max), name);
         }
-        if batched.is_none() {
-            crate::indirect::done(list, &args.buffer);
-        } else if kind == DISPATCH || self.may_write() {
+        done(list);
+        if batched.is_some() && (kind == DISPATCH || self.may_write()) {
             // It may write later executions' records: they clamp after it.
             crate::indirect::end(list);
         }
