@@ -992,11 +992,60 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// Host `D3D12_FEATURE_DATA_FORMAT_SUPPORT::Support1` bits for `format`,
+/// cached per format (`None` before the host device is created).
+#[cfg(windows)]
+fn format_support1(format: u32) -> Option<u32> {
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    static KNOWN: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, support1)) = known.iter().find(|(f, _)| *f == format) {
+        return Some(support1);
+    }
+    let host = crate::host::host()?;
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok();
+    let support1 = if ok { support.Support1.0 as u32 } else { 0 };
+    known.push((format, support1));
+    Some(support1)
+}
+
+#[cfg(windows)]
+fn is_typeless(format: u32) -> bool {
+    family(format) == format && family(format + 1) == format
+}
+
+#[cfg(windows)]
+fn family_supports(format: u32, bit: u32) -> bool {
+    let fam = family(format);
+    (1..=115).any(|f| family(f) == fam && !is_typeless(f) && format_support1(f).is_some_and(|s| s & bit != 0))
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
 fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
+    const RENDER_TARGET: u32 = 1;
     if desc.dimension == BUFFER {
         return None;
     }
@@ -1022,6 +1071,34 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // Strip or widen host-unsupported flags: D3D12 rejects GetResourceAllocationInfo
+    // and CreateCommittedResource when ALLOW_UNORDERED_ACCESS or ALLOW_RENDER_TARGET
+    // is set on a format (like B5G5R5A1_UNORM or B4G4R4A4_UNORM) that cannot use
+    // or cast to one that supports it.
+    if d.flags & UNORDERED != 0 && !is_typeless(d.format) {
+        let bit = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32;
+        if let Some(s1) = format_support1(d.format)
+            && s1 & bit == 0
+        {
+            if family(d.format) != d.format && family_supports(d.format, bit) {
+                d.format = family(d.format);
+            } else {
+                d.flags &= !UNORDERED;
+            }
+        }
+    }
+    if d.flags & RENDER_TARGET != 0 && !is_typeless(d.format) {
+        let bit = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32;
+        if let Some(s1) = format_support1(d.format)
+            && s1 & bit == 0
+        {
+            if family(d.format) != d.format && family_supports(d.format, bit) {
+                d.format = family(d.format);
+            } else {
+                d.flags &= !RENDER_TARGET;
+            }
+        }
     }
     Some(d)
 }
@@ -2440,5 +2517,48 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_desc_strips_unsupported_uav_and_rt_flags() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let b5g5r5a1_uav = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 86, // B5G5R5A1_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: UNORDERED,
+        };
+        let d = host_desc(&b5g5r5a1_uav).expect("texture desc");
+        let uav_bit = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32;
+        if format_support1(86).is_some_and(|s| s & uav_bit == 0) {
+            assert_eq!(d.flags & UNORDERED, 0);
+            assert!(make_texture(&d, 0, std::ptr::null()).is_some());
+        }
+
+        let b4g4r4a4_rt = ResourceDesc {
+            format: 115, // B4G4R4A4_UNORM
+            flags: 1,    // RENDER_TARGET
+            ..b5g5r5a1_uav
+        };
+        let d = host_desc(&b4g4r4a4_rt).expect("texture desc");
+        let rt_bit = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32;
+        if format_support1(115).is_some_and(|s| s & rt_bit == 0) {
+            assert_eq!(d.flags & 1, 0);
+            assert!(make_texture(&d, 0, std::ptr::null()).is_some());
+        }
     }
 }

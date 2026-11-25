@@ -304,32 +304,44 @@ pub(crate) fn save(now: bool) {
     }
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !l.prebuilt_changed {
+            if !used_changed {
                 return;
+            }
+            // Only the early list changed: avoid re-serialising and writing a
+            // 1+ GiB NVIDIA pipeline library blob during gameplay.
+            (None, None)
+        } else {
+            // SAFETY: a buffer of the size the library asks for.
+            let bytes = unsafe {
+                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                l.library.Serialize(&mut bytes).map(|()| bytes)
+            };
+            match bytes {
+                Ok(bytes) => {
+                    l.added = 0;
+                    l.prebuilt_changed = false;
+                    // Kept beside the bytes it holds for (also when a run adds
+                    // pipelines).
+                    let prebuilt =
+                        (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                    (Some(bytes), prebuilt)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    return;
+                }
             }
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    let bytes_len = blob.as_ref().map_or(0, Vec::len);
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| match &blob {
+            Some(blob) => write_atomically(&dir.join(LIBRARY_FILE), blob),
+            None => Ok(()),
+        })
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -339,7 +351,7 @@ pub(crate) fn save(now: bool) {
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes = bytes_len,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
