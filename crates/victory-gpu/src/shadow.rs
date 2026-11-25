@@ -672,8 +672,19 @@ impl Shadow {
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut copied = 0;
         for (a, b) in runs {
+            let (ra, rb) = (a - start, b - start);
+            // A snapshot over the run takes the copied bytes at once; with
+            // none there (marked ranges keep none) the copy may be queued.
+            if !before
+                .0
+                .iter()
+                .any(|(at, bytes)| *at < rb && ra < *at + bytes.len())
+            {
+                copied += self.copy_queued(a, b);
+                continue;
+            }
             copied += self.copy(a, b);
-            let (a, b) = (a - start, b - start);
+            let (a, b) = (ra, rb);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
                 if s < e {
@@ -697,7 +708,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy_queued(a, b)).sum();
             for (a, b) in unmapped {
                 // SAFETY: inside the mapping (`take_split` cuts to the buffer).
                 unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
@@ -708,7 +719,7 @@ impl Shadow {
             for (a, b) in t.untracked(from, to) {
                 #[cfg(feature = "diagnostics")]
                 let started = std::time::Instant::now();
-                copied += self.copy(a, b);
+                copied += self.copy_queued(a, b);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -727,13 +738,25 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy_queued(from, to);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::WholeBytes, (to - from) as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
+        to - from
+    }
+
+    /// As [`Shadow::copy`], queued where the caller collects a
+    /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
+    /// nothing reads back before they are made.
+    fn copy_queued(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        crate::copy_pool::copy(at, from as *const u8, to - from);
         to - from
     }
 
