@@ -34,15 +34,35 @@ That tree was based on `ffe310e`, before the maintainer's large drop of
 | #2147 | r4tedx | `f869790` | ranges shaders may write are armed as runs of pages, not page by page |
 | #2134 | r4tedx | `efb35b5` | a benchmark of a world frame's preparing at the published volumes (tests only) |
 | #2115 | r4tedx | `4d34d76` | `translate --count`: the instructions of the emitted shaders, to compare builds |
+| #1428 | fuzeofficlal | `0e3796e` | `OMSetRenderTargets` reads no handle for zero targets, and bounds the count |
+| #2043 | Deilach | `7686b6f` | a pixel discard in a loop whose exit depends on it kills its lanes, as the console does |
+| #1989 | BastienRodz | `0f11320` | a vertex (or mesh, geometry) program writing through views declares the UAV flags the validator requires |
 
 Left out for now: #2150 (one instruction per value on the finished
-module). It rewrites every emitted shader and has not run on a hardware
-GPU; it goes in after such a run or a review.
+module). It rewrites every emitted shader for a module-size gain; it has
+had one hardware run by a tester since. It is kept out so that the first
+supervised game run uses shader output as close to `main` as possible.
 
-Not in it yet, because their owners have not named a head based on `main`:
-the wave64 stack (#223, #233, #320, #439: compute programs written for
-64-lane waves, on NVIDIA's 32-lane waves). Without it an NVIDIA card still
-refuses those programs on this branch as on `main`.
+Not in it yet: the wave64 stack (#223, #233, #320, #439: compute programs
+written for 64-lane waves, on NVIDIA's 32-lane waves). Its head on `main`
+is `5a11cf4`, with its implicit-sample and recursion guards; it goes in
+with the next check round. Until then an NVIDIA card refuses those
+programs on this branch as on `main`.
+
+## Known risks on NVIDIA (crash safety)
+
+- **Heap indices past a capped heap.** Translated shaders clamp
+  descriptor-heap indices below 2^21, but NVIDIA caps a shader-visible
+  view heap at 1,000,000, so an index between the two still passes the
+  heap's end. Upstream #1777 aims at this but is not taken yet: it opens
+  the default hardware adapter in every process that translates, and has
+  a slot-overlap case at one heap size (both reported on #1777).
+- **Driver-level shader error reporting** (the Nsight Aftermath Monitor
+  set to Global) turned every world load into a device hang for a tester
+  on upstream #71. Check it is off before a run.
+- Running out of per-draw descriptor slots does not bind unwritten slots:
+  `main` drops that draw or dispatch (logged as `a draw or dispatch
+  dropped: no dynamic slots for its tables`).
 
 ## How it was checked
 
@@ -51,9 +71,9 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 - `cargo build --release -p victory`, the test builds and
   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `victory-gpu` tests on WARP (diagnostics build, `VICTORY_D3D12_WARP=1`,
-  one thread): 164 passed, 0 failed, 3 ignored.
-- `victory-shader` tests with `VICTORY_WARP=1`, one thread: 263 passed,
-  2 failed, 3 ignored. The two failures are hardware-only checks that
+  one test per process): 168 passed, 0 failed.
+- `victory-shader` tests with `VICTORY_WARP=1`, one test per process: 268
+  passed, 2 failed. The two failures are hardware-only checks that
   `VICTORY_WARP=1` sends to WARP (`gathers_at_a_level_match_the_hardware`,
   and `permutes_read_the_lane_named_and_zero_from_lanes_left_out`, which
   needs a device that accepts a wave of 32); they fail the same way on
@@ -61,13 +81,11 @@ On one Windows 11 PC (NVIDIA RTX 5070, AMD Radeon integrated GPU, WARP):
 - **Local title-data diagnostic:** `victory translate shaders.rpf --validate
   --list --jobs 6` on this PC's copy of the title (offline, CPU only, counts
   and refusal reasons only), program by program against the same count of
-  `main`: **975 programs gained, 0 lost**. (Counted on the head before #2147
-  and #2115's last commit; those two change no translation code, and the
-  summary lines of a count on this head were the same before an unrelated
-  power loss cut its file.) They are all 195 geometry
-  programs (#1315) and 780 compute programs (#1883 and #2027 together: 735
-  that `main` emits but the validator refuses, 40 ray-intersection programs
-  and 5 more). Every program of that archive that does not validate on this
+  `main`: **1,842 programs gained, 0 lost**: all 867 vertex programs
+  `main` emits but the validator refuses (#1989), all 195 geometry
+  programs (#1315), and 780 compute programs (#1883 and #2027 together:
+  735 that `main` emits but the validator refuses, 40 ray-intersection
+  programs and 5 more). Every program of that archive that does not validate on this
   branch does not validate on `main` either.
 - The speed numbers of #2136 and #2111 in their PRs come from synthetic
   benchmarks, not from the game; times from the title are what they need.
