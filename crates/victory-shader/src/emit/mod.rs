@@ -357,6 +357,11 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Diagnostics: every `image_bvh*_intersect_ray` returns a miss without
+    /// reading its node, so the title's traversals end at once whatever
+    /// the structures hold. Not a correct image; it tells whether a dark
+    /// or slow pass comes from what the traversals find.
+    pub rays_miss: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -481,6 +486,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        rays_miss: options.rays_miss,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

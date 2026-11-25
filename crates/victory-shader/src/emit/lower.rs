@@ -77,6 +77,8 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Every BVH intersection is a miss ([`super::Options::rays_miss`]).
+    pub rays_miss: bool,
 }
 
 enum Stop {
@@ -9946,6 +9948,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            rays_miss: false,
         })
         .map(|_| ())
     }
@@ -9997,6 +10000,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            rays_miss: false,
         })
     }
 
@@ -10187,6 +10191,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            rays_miss: false,
         })
         .unwrap();
 
