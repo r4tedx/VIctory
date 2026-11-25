@@ -237,3 +237,14 @@ query into `sampler::aniso_point_mip` and leaves the result as it was.
 build --locked --profile diag -p victory --features diagnostics` at
 `3797434`: `diag\victory.exe`, sha256
 `f159c53db4397226259cfeb2303dd09ec95fbee8b999085f0ad37465df97d95f`.
+
+### Unit tests (WARP, through heavy-run)
+
+- `victory-formats` (#2163's crate): 39 passed, 0 failed, 5 ignored.
+- `victory-gpu`: the lib tests do not compile, and the cause is already in
+  layer 1 (`2fde53b`), not in this layer. #159's test in `query.rs`
+  (lines 573-574) calls `indirect::bound` and `indirect::done` with the
+  arguments they had before #2168 (`cd29144`) added `count` and
+  `clamped`. Layer 2 changes neither file. The production code is fine
+  (`cargo check` and the diag build pass). Fixing that test means
+  bringing #159 up to #2168's API.
