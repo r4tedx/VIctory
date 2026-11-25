@@ -93,31 +93,43 @@ const POOL_BYTES: usize = 2 << 30;
 /// GPU wrote byte `i`: what a copy-back puts into title memory.
 ///
 /// Equal stretches (most of a page) are skipped a block at a time, then a
-/// line at a time inside a block that differs: one comparison per 8 bytes
-/// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages.
+/// word at a time inside a block that differs: one comparison per 8 bytes
+/// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages. A
+/// comparison per 32-byte line inside a differing block cost more than it
+/// skipped where shaders change scattered words (every block differs).
+/// Every caller (`put_back`, `copy_back_or_not`) keeps the block skip.
+///
+/// The runs are the same, run for run, as a walk over every byte
+/// (`differing_matches_a_byte_wise_comparison`): only how equal bytes are
+/// skipped changes.
 fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
     const BLOCK: usize = 1 << 10;
-    const LINE: usize = 32;
     let n = host.len().min(title.len());
+    let word = |s: &[u8], i: usize| u64::from_ne_bytes(s[i..i + 8].try_into().expect("8 bytes"));
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut block = 0;
     while block < n {
         let block_end = (block + BLOCK).min(n);
         if host[block..block_end] != title[block..block_end] {
-            let mut line = block;
-            while line < block_end {
-                let line_end = (line + LINE).min(block_end);
-                if host[line..line_end] != title[line..line_end] {
-                    for i in line..line_end {
-                        if host[i] != title[i] && gpu(i) {
-                            match runs.last_mut() {
-                                Some((_, end)) if *end == i => *end = i + 1,
-                                _ => runs.push((i, i + 1)),
-                            }
+            // Inside a block that differs, a word at a time: a comparison
+            // call per 32-byte line cost more than it skipped where shaders
+            // change scattered words.
+            let mut i = block;
+            while i < block_end {
+                if i + 8 <= block_end && word(host, i) == word(title, i) {
+                    i += 8;
+                    continue;
+                }
+                let word_end = (i + 8).min(block_end);
+                for i in i..word_end {
+                    if host[i] != title[i] && gpu(i) {
+                        match runs.last_mut() {
+                            Some((_, end)) if *end == i => *end = i + 1,
+                            _ => runs.push((i, i + 1)),
                         }
                     }
                 }
-                line = line_end;
+                i = word_end;
             }
         }
         block = block_end;
@@ -129,6 +141,12 @@ fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usi
 /// with title memory's bytes between them as the copy-back read them: a
 /// kernel copy per run cost over 1 ms per page in the world, where shaders
 /// change many scattered words of a page.
+///
+/// The cost of that merge: a title write that lands in a merged gap after
+/// the copy-back read the page is undone by the write-back. Writing exact
+/// runs (no gap) closes that, but with one kernel copy per run it cost
+/// ~509 us per 64 KiB page at one changed word per 64 B (~49 us with the
+/// gap) and ~15.8 ms at every other byte (synthetic, WARP).
 const SPAN_GAP: usize = 256;
 
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
