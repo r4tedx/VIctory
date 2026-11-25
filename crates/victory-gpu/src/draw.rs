@@ -639,7 +639,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if is_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
@@ -1825,6 +1825,12 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
+/// A user-data entry that takes where a root view's address lies in the
+/// copy its view shows (not a dword of a root constants parameter).
+fn is_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
@@ -1867,6 +1873,16 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
+
+    /// The fifth dword of a root constants parameter is a constant, not the
+    /// offset of a root view.
+    #[test]
+    fn only_a_root_view_has_a_view_offset() {
+        let entry = |root, dword| victory_shader::emit::UserData { index: 0, slot: 0, root, dword };
+        assert!(is_view_offset(&entry(RootType::Descriptor, victory_shader::emit::ROOT_VIEW_OFFSET)));
+        assert!(!is_view_offset(&entry(RootType::Constants, victory_shader::emit::ROOT_VIEW_OFFSET)));
+        assert!(!is_view_offset(&entry(RootType::Descriptor, 0)));
+    }
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
