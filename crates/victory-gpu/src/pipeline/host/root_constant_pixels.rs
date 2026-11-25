@@ -122,8 +122,10 @@ fn pipeline(dword: u32, fixtures: &Fixtures) -> crate::object::This {
         heap_writes: false,
         view_marks: false,
     };
-    let mut graphics = GraphicsState::default();
-    graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    let mut graphics = GraphicsState {
+        topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        ..Default::default()
+    };
     graphics.targets.NumRenderTargets = 1;
     graphics.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     graphics.depth.DepthEnable = false.into();
@@ -196,6 +198,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
         ..Default::default()
     };
     crate::draw::viewports(&list, &[viewport]);
+    // SAFETY: an open list and a live target, held through the synchronous submission.
     unsafe {
         list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.list
@@ -222,6 +225,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
     let drops = crate::draw::take_dropped();
     let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
+    // SAFETY: one output footprint for the live target's description.
     unsafe {
         host.device.GetCopyableFootprints(
             &desc,
@@ -235,6 +239,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
         )
     };
     let (back, data) = host.shared_buffer(total).unwrap();
+    // SAFETY: an open list; the target and the readback buffer outlive the submission.
     unsafe {
         list.list.ResourceBarrier(&[crate::host::transition(
             &target,
@@ -263,6 +268,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
     let mut mismatches = 0;
     for y in 0..SIZE as usize {
         for x in 0..SIZE as usize {
+            // SAFETY: the completed copy fills SIZE x SIZE texels at the device's row pitch.
             let pixel = unsafe {
                 data.add(y * fp.Footprint.RowPitch as usize + x * 4)
                     .cast::<[u8; 4]>()
@@ -294,6 +300,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
 #[ignore = "submits actual D3D12 draws and reads every pixel"]
 fn root_constants_draw_two_colors() {
     let host = host().expect("D3D12 device required");
+    // SAFETY: plain DXGI queries on the host's adapter, and a handle query of an already loaded module.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
         let adapter: IDXGIAdapter1 = factory
