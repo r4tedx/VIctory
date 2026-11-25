@@ -150,9 +150,15 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make((count + DYNAMIC).max(PORTABLE_VIEWS)) {
+            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA,
+            // at `PORTABLE_VIEWS`) faults on an index past them, as before
+            // the clamp. It still takes every title slot, the larger dynamic
+            // range (the smaller one runs out in the world, #59) and, past
+            // them, room for host copies' view pairs (`crate::memory`).
+            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
+            // A host that takes neither: the smaller range, then the cap.
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
@@ -2167,10 +2173,27 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`), where the host takes a heap that
+        // large; a host that caps its heaps (NVIDIA) still gets the larger
+        // dynamic range.
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let views = heap.heap.GetDesc().NumDescriptors;
+            let takes_all = host()
+                .unwrap()
+                .device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: victory_shader::emit::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .is_ok();
+            assert!(
+                !takes_all || views >= victory_shader::emit::HEAP_VIEWS,
+                "{views} views"
+            );
+            assert_eq!(heap.dynamic, DYNAMIC);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
