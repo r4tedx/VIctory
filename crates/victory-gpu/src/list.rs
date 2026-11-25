@@ -1109,16 +1109,19 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way), counted by
+/// `VICTORY_DISPATCH_FLAGS_LOG` ([`crate::threads`]).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    count_dispatch();
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    with_state(this, |list, s| {
+        let shader = crate::pipeline::compute_shader(s.pipeline());
+        crate::threads::note_direct(shader, flags, [x, y, z]);
+        s.dispatch(list, x, y, z)
+    });
     #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
+    let _ = (this, x, y, z, flags);
 }
 
 /// `BeginQuery(heap, type, index)`: recorded into the host list, in order
@@ -1731,9 +1734,13 @@ extern "system" fn execute_indirect(
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let argument = args[0];
+        let kind = if *kind == crate::threads::DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
+            if kind == DISPATCH {
+                let shader = crate::pipeline::compute_shader(s.pipeline());
+                crate::threads::note_indirect(shader, argument, max);
+            }
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {

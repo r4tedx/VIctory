@@ -3687,6 +3687,7 @@ impl Meter {
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
             crate::tiles::status();
+            crate::threads::log();
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

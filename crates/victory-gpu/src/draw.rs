@@ -415,6 +415,11 @@ impl State {
         }
     }
 
+    /// The title pipeline set.
+    pub(crate) fn pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     /// Others recorded into the host list (`crate::external`): its heaps,
     /// root signatures and pipeline are set again before the next draw or
     /// dispatch.
