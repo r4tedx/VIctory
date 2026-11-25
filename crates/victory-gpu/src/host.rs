@@ -201,6 +201,10 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        if let Some(cap) = crate::descriptor::host::view_heap_cap(&device) {
+            victory_shader::emit::set_view_heap_limit(cap);
+            tracing::info!(cap, "host view heaps capped: translated shaders keep their view indices below the cap");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
