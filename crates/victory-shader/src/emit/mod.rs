@@ -553,16 +553,40 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
-        }
-        l => l?,
+    // Discarded lanes run on as live lanes in the helper form (`st`). In a
+    // loop they can leave only by being killed (the console's "no live lane
+    // is left" exit), the loop limit is then their only way out, and every
+    // such lane reaches it where the host's `discard` demotes (as
+    // vkd3d-proton's does): a light-volume box of the title's world took
+    // 0.4 s a draw. Such a program kills them as the console does, the
+    // helper form where the killing form cannot be made.
+    let trapped = traps_discarded(p, st);
+    let kill_st;
+    let kill_res;
+    let mut killed = None;
+    if trapped
+        && let Ok(s) = structure::killing(p)
+        && let Ok(r) = resource::track(p, &native.layout, native.stage, Some(&s))
+    {
+        kill_st = s;
+        kill_res = r;
+        killed = lower::lower(&parts(&kill_st, &kill_res)).ok();
+    }
+    let kill_st2;
+    let kill_res2;
+    let l = match killed {
+        Some(l) => l,
+        None => match lower::lower(&parts(st, res)) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such
+            // a program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() && !trapped => {
+                kill_st2 = structure::killing(p)?;
+                kill_res2 = resource::track(p, &native.layout, native.stage, Some(&kill_st2))?;
+                lower::lower(&parts(&kill_st2, &kill_res2))?
+            }
+            l => l?,
+        },
     };
     Ok(HostShader {
         stage: native.stage,
@@ -591,6 +615,61 @@ pub fn emit_with(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     })
+}
+
+/// Whether a discard leaves lanes in a loop they cannot leave in the
+/// per-lane form `st` (where discarded lanes stay live): no edge out of the
+/// loop through the discard's block is one a lane may take.
+fn traps_discarded(p: &ir::Program, st: &structure::Structured) -> bool {
+    st.discards.keys().any(|&(b, _)| {
+        let inside = loop_through(p, b);
+        inside.contains(&true)
+            && !(0..inside.len()).any(|n| inside[n] && leaves(&st.exits[n], &inside))
+    })
+}
+
+/// The blocks of `p` on a cycle through block `b`: reached from it and
+/// reaching it (none when `b` is in no loop).
+fn loop_through(p: &ir::Program, b: usize) -> Vec<bool> {
+    let n = p.blocks.len();
+    let walk = |from: Vec<usize>, next: &dyn Fn(usize) -> Vec<usize>| {
+        let mut seen = vec![false; n];
+        let mut stack = from;
+        while let Some(x) = stack.pop() {
+            if x < n && !std::mem::replace(&mut seen[x], true) {
+                stack.extend(next(x));
+            }
+        }
+        seen
+    };
+    let mut preds = vec![Vec::new(); n];
+    for (from, block) in p.blocks.iter().enumerate() {
+        for to in block.exit.successors() {
+            if to < n {
+                preds[to].push(from);
+            }
+        }
+    }
+    let after = walk(p.blocks[b].exit.successors(), &|x| {
+        p.blocks[x].exit.successors()
+    });
+    let before = walk(preds[b].clone(), &|x| preds[x].clone());
+    (0..n).map(|x| after[x] && before[x]).collect()
+}
+
+/// Whether a lane may take an edge of `exit` to a block outside `inside`.
+fn leaves(exit: &structure::LaneExit, inside: &[bool]) -> bool {
+    use structure::{Bool, LaneExit};
+    let out = |t: usize| !inside.get(t).copied().unwrap_or(false);
+    match *exit {
+        LaneExit::Jump(t) => out(t),
+        LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } => (out(taken) && when != Bool::FALSE) || (out(not_taken) && when != Bool::TRUE),
+        LaneExit::End | LaneExit::Indirect => true,
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1397,6 +1476,61 @@ mod tests {
         program(&[]).unwrap();
         let e = program(&[0xBEFE_0300]).unwrap_err(); // s_mov_b32 exec_lo, s0
         assert!(e.to_string().contains("a conditional export"), "{e}");
+    }
+
+    /// A loop its lanes leave only by being killed (`s_andn2 live, live,
+    /// exec`, then "no live lane is left": the exit) traps discarded lanes
+    /// kept on as helpers, so the program is made in the killing form. A
+    /// loop around the same discard with an exit of its own (four passes),
+    /// and a quad read after it (a derivative), keeps the helper form.
+    #[test]
+    fn a_loop_left_only_by_killing_is_made_in_the_killing_form() {
+        let structured = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 8).unwrap();
+            let st = structure::structure(&p).unwrap();
+            (traps_discarded(&p, &st), st.discards.len())
+        };
+        let kill_only = [
+            0xBE80_037E, // s_mov_b32 s0, exec_lo
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x4A02_0281, // 8: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0300, // v_cmpx_lt_u32 exec_lo, v0, v1
+            0x8A00_7E00, // s_andn2_b32 s0, s0, exec_lo
+            0xBF84_0002, // s_cbranch_scc0 -> 32
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF82_FFFA, // s_branch -> 8
+            0xF800_1890,
+            0x0000_0000, // 32: exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(structured(&kill_only), (true, 1));
+        let bounded = [
+            0xBE80_037E, // s_mov_b32 s0, exec_lo
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x4A02_0281, // 12: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0300, // v_cmpx_lt_u32 exec_lo, v0, v1
+            0x8A00_7E00, // s_andn2_b32 s0, s0, exec_lo
+            0xBF84_0009, // s_cbranch_scc0 -> 64
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0x8001_8101, // s_add_u32 s1, s1, 1
+            0xBF0A_8401, // s_cmp_lt_u32 s1, 4
+            0xBF85_FFF8, // s_cbranch_scc1 -> 12
+            0x7E04_02FA,
+            0xFF00_B100, // v_mov_b32_dpp v2, v0 quad_perm:[1,0,3,2]
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+            0xF800_1890,
+            0x0000_0000, // 64: exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(structured(&bounded), (false, 1));
+        let isg1 = rows(&[("SV_Position", 3, false)], true);
+        emit_pixel(&kill_only, vec![], 1 << 8, &isg1, &rows(&[], false)).unwrap();
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        emit_pixel(&bounded, vec![], 1 << 8, &isg1, &osg1).unwrap();
     }
 
     /// The compiler reuses the j register (`v_mov` under a kill's EXEC) and
