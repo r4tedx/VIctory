@@ -283,6 +283,8 @@ extern "system" fn present(
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
+        #[cfg(windows)]
+        crate::pipeline::report_builder_dropped();
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
