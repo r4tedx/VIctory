@@ -296,6 +296,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The title pipeline set.
+    pub(crate) fn pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     /// Others recorded into the host list (`crate::external`): its heaps,
     /// root signatures and pipeline are set again before the next draw or
     /// dispatch.
@@ -1943,7 +1948,9 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. Dispatch records are thread counts in groups of the
+    /// size `threads` packs ([`crate::threads::packed`]) unless it is 0.
+    /// False if it cannot run on the host.
     /// If an indirect dispatch does not run, the stand-ins
     /// `VICTORY_STAND_IN` names for its program take its place
     /// ([`Self::instead`]).
@@ -1953,9 +1960,10 @@ impl State {
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        threads: u32,
     ) -> bool {
         const DISPATCH: u32 = 2;
-        let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        let ran = self.run_indirect(list, (kind, stride, max), arguments, count, threads);
         if !ran && kind == DISPATCH {
             self.instead(list);
         }
@@ -1969,6 +1977,7 @@ impl State {
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        threads: u32,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
@@ -2034,9 +2043,26 @@ impl State {
         let compute = || crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
         let dispatch = (kind == DISPATCH).then(compute).flatten();
         let waves = dispatch.map_or(1, group_waves);
-        let rewrite = waves > 1;
+        // Thread counts (`VICTORY_DISPATCH_THREADS`) are divided into whole
+        // groups where records are copied into a list-owned buffer (the
+        // rewrite): the clamp works in place in the title buffer's copy,
+        // where it would divide them again at every execution. Not with
+        // batched clamps (`VICTORY_BATCH_CLAMPS`): the rewrite would end
+        // their window at every such dispatch.
+        let threads = if dispatch.is_none() {
+            0
+        } else if threads != 0 && crate::indirect::batching() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("VICTORY_DISPATCH_THREADS: indirect thread counts not applied with batched clamps");
+            });
+            0
+        } else {
+            threads
+        };
+        let rewrite = waves > 1 || threads != 0;
         let host_stride = if rewrite { 12 } else { stride };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+        let Some(mut signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, host_stride))
             .flatten()
         else {
@@ -2055,16 +2081,33 @@ impl State {
         // (`crate::indirect::batching`), or on their own here.
         let rewritten = if rewrite {
             crate::indirect::end(list);
-            let Some(buffer) = crate::indirect::dispatch(
+            match crate::indirect::dispatch(
                 list,
                 args.gpu(arguments),
                 counter.as_ref().map(|(s, at)| s.gpu(*at)),
                 (stride, max, waves),
-            ) else {
-                why("dispatch arguments could not be rewritten");
-                return false;
-            };
-            Some(buffer)
+                threads,
+            ) {
+                Some(buffer) => Some(buffer),
+                // Single-wave records the rewrite does not take (a stride
+                // under 12, too many records) run clamped, as group counts.
+                None if waves == 1 => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(stride, max, "VICTORY_DISPATCH_THREADS: indirect thread counts not applied (records the rewrite does not take)");
+                    });
+                    let Some(own) = host_signature(kind, stride) else {
+                        why("no host signature");
+                        return false;
+                    };
+                    signature = own;
+                    None
+                }
+                None => {
+                    why("dispatch arguments could not be rewritten");
+                    return false;
+                }
+            }
         } else {
             None
         };
@@ -2631,6 +2674,87 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let pso = host.device.CreateComputePipelineState(&desc).unwrap();
             (root, pso)
+        }
+    }
+
+    /// Dispatches with the console flags `flags` of `counts` (direct, or
+    /// one record of an indirect dispatch whose signature argument carries
+    /// the flags) to a program of 64-thread groups, with the conversion on:
+    /// the groups that ran and the lanes that ran.
+    fn marked_groups(indirect: bool, flags: u32, counts: [u32; 3]) -> Option<[u32; 2]> {
+        const MARKS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer marks : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint ignored;
+    if (lane == 0) {
+        marks.InterlockedAdd(0, 1, ignored);
+    }
+    marks.InterlockedAdd(4, 1, ignored);
+}
+"#;
+        let host = crate::host::host()?;
+        let (root, pso) = compile_cs(MARKS);
+        let size = Some([64, 1, 1]);
+        let (marks, data) = host.shared_buffer(256).unwrap();
+        let (args, words) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffers, written before the list runs and
+        // read after it has; an open list with everything set.
+        unsafe {
+            data.cast::<[u32; 2]>().write_volatile([0, 0]);
+            words.cast::<[u32; 3]>().write_volatile(counts);
+            let clamped = indirect.then(|| {
+                let argument = [crate::threads::DISPATCH_SINGLE, flags, 0, 0];
+                let threads = crate::threads::indirect_thread_dims(argument).then_some(size).flatten();
+                let threads = crate::threads::packed(threads);
+                // Layer 4 clamps single-wave records in place: thread
+                // counts go through the rewrite into a list-owned buffer.
+                if threads == 0 {
+                    let at = args.GetGPUVirtualAddress();
+                    let state = crate::indirect::bound(&list, &args, None, at, (2, 12, 1)).unwrap();
+                    (args.clone(), state)
+                } else {
+                    let out = crate::indirect::dispatch(&list, args.GetGPUVirtualAddress(), None, (12, 1, 1), threads)
+                        .unwrap();
+                    (out, crate::indirect::Clamped::Ready)
+                }
+            });
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+            match &clamped {
+                Some((buffer, state)) => {
+                    let signature = host_signature(2, 12).unwrap();
+                    list.list.ExecuteIndirect(&signature, 1, buffer, 0, None, 0);
+                    crate::indirect::done(&list, buffer, None, *state);
+                }
+                None => {
+                    let [x, y, z] = crate::threads::as_groups(true, size, flags, counts);
+                    list.list.Dispatch(x, y, z);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            Some(data.cast::<[u32; 2]>().read_volatile())
+        }
+    }
+
+    /// With `USE_THREAD_DIMENSIONS` (0x20), 1000 threads in groups of 64
+    /// launch 16 groups, directly and through indirect execution; the last
+    /// group runs whole (1024 lanes, the shortcut in `crate::threads`).
+    /// Without the flag the counts stay group counts.
+    #[test]
+    fn thread_dimensions_launch_whole_groups() {
+        for indirect in [false, true] {
+            let Some(flagged) = marked_groups(indirect, 0x20, [1000, 1, 1]) else {
+                return; // no host GPU here
+            };
+            assert_eq!(flagged, [16, 1024], "indirect {indirect}");
+            let plain = marked_groups(indirect, 0, [1000, 1, 1]).unwrap();
+            assert_eq!(plain, [1000, 64_000], "indirect {indirect}");
         }
     }
 
@@ -3294,10 +3418,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.dispatch(&list, 1, 1, 1);
         assert_eq!(crate::ambient::filled() - filled, 2, "both views of the direct program's rules");
         state.set_pipeline(indirect);
-        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None), "the indirect dispatch does not run");
+        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None, 0), "the indirect dispatch does not run");
         assert_eq!(crate::ambient::filled() - filled, 3, "the view of the indirect program's rule");
         state.set_pipeline(direct);
-        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None));
+        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None, 0));
         state.set_pipeline(unnamed);
         state.dispatch(&list, 1, 1, 1);
         assert_eq!(crate::ambient::filled() - filled, 3, "nothing for an indirect draw or a program no rule names");

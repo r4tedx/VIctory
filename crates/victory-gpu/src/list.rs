@@ -471,7 +471,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::host_written(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -567,7 +567,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written(list, dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -649,9 +649,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        // Before the states: it may record an upload into `dst` first.
+        crate::texture::host_written(list, dst);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -809,16 +810,21 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way), counted by
+/// `VICTORY_DISPATCH_FLAGS_LOG`; thread counts become whole groups with
+/// `VICTORY_DISPATCH_THREADS` ([`crate::threads`]).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    count_dispatch();
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    with_state(this, |list, s| {
+        let shader = crate::pipeline::compute_shader(s.pipeline());
+        crate::threads::note_direct(shader, flags, [x, y, z]);
+        let [x, y, z] = crate::threads::direct_groups(shader, flags, [x, y, z]);
+        s.dispatch(list, x, y, z)
+    });
     #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
+    let _ = (this, x, y, z, flags);
 }
 
 /// `BeginQuery(heap, type, index)`: recorded into the host list, in order
@@ -1430,10 +1436,16 @@ extern "system" fn execute_indirect(
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let argument = args[0];
+        let kind = if *kind == crate::threads::DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            let mut threads = 0;
+            if kind == DISPATCH {
+                let shader = crate::pipeline::compute_shader(s.pipeline());
+                crate::threads::note_indirect(shader, argument, max);
+                threads = crate::threads::packed(crate::threads::indirect_size(shader, argument));
+            }
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, threads);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]

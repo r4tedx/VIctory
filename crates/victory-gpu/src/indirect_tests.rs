@@ -238,7 +238,7 @@ fn execute_indirect_preserves_two_384_lane_reference_cases() {
         unsafe { mapped.write_bytes(0, LANES * 4) };
         bind_output(host, &list, buffer, LANES);
         state.heaps_bound_by_caller();
-        assert!(state.execute_indirect(&list, (2, 16, 2), address + 16, Some(address + 4)));
+        assert!(state.execute_indirect(&list, (2, 16, 2), address + 16, Some(address + 4), 0));
     }
     // A writer later in the same list exercises restoration of UAV state.
     add_one(&list, &worker, shadow.gpu(address + 16));
@@ -297,7 +297,7 @@ fn execute_indirect_runs_both_counted_records() {
         let mut state = State::default();
         state.reset(pipeline);
         state.heaps_bound_by_caller();
-        assert!(state.execute_indirect(&list, (2, 16, 3), arguments.address, Some(count.address)));
+        assert!(state.execute_indirect(&list, (2, 16, 3), arguments.address, Some(count.address), 0));
         list.close();
         host.execute_checked(&list);
         release_pipeline(pipeline);
@@ -340,7 +340,7 @@ fn drops_a_dispatch_without_a_pipeline_before_the_clamp() {
     let list = host.new_list().unwrap();
     #[cfg(feature = "diagnostics")]
     drop(crate::pipeline::take_drops());
-    assert!(!State::default().execute_indirect(&list, (2, 12, 1), arguments.address, None));
+    assert!(!State::default().execute_indirect(&list, (2, 12, 1), arguments.address, None, 0));
     #[cfg(feature = "diagnostics")]
     assert!(
         crate::pipeline::take_drops()
@@ -396,7 +396,7 @@ fn reads_arguments_written_earlier_in_the_list_at_k1_and_k2() {
             (source.clone(), 32)
         } else {
             (
-                dispatch(&list, source_gpu, Some(source_gpu + 32), (16, 2, waves)).unwrap(),
+                dispatch(&list, source_gpu, Some(source_gpu + 32), (16, 2, waves), 0).unwrap(),
                 24,
             )
         };
@@ -472,7 +472,7 @@ fn dispatch_limits_charge_only_scaled_host_groups() {
             assert_eq!(clamped, Some(Clamped::Ready));
             done(&list, &draws, None, Clamped::Ready);
         }
-        let packed = dispatch(&list, address + at, count, (16, records, 2)).unwrap();
+        let packed = dispatch(&list, address + at, count, (16, records, 2), 0).unwrap();
         let bytes = u64::from(records) * 12;
         // SAFETY: the scratch buffer is in INDIRECT_ARGUMENT after the
         // rewrite and the nonoverlapping readbacks fit in the mapped buffer.
@@ -562,7 +562,7 @@ fn rewrite_many_records_once() {
                 0
             };
         let count_at = count_index.map(|i| count_gpu + i as u64 * 4);
-        let packed = dispatch(&list, source_at, count_at, (STRIDE, records, WAVES)).unwrap();
+        let packed = dispatch(&list, source_at, count_at, (STRIDE, records, WAVES), 0).unwrap();
         // SAFETY: packed is in INDIRECT_ARGUMENT and readback ranges are disjoint.
         unsafe {
             let address = packed.GetGPUVirtualAddress();

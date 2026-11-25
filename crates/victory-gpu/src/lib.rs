@@ -20,6 +20,8 @@
 mod ambient;
 #[cfg(windows)]
 mod bindless;
+#[cfg(windows)]
+mod budget;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -62,9 +64,13 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod threads;
+#[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod tiles;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
