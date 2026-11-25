@@ -10909,6 +10909,18 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether translated shaders mark the heap slots they read
+/// (`VICTORY_HEAP_USAGE`, on unless 0).
+pub fn heap_usage_marks() -> bool {
+    // shortcut: off in unit tests, whose hardware harness binds only the
+    // root parameters each test names (the bitmap would be unbound).
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
@@ -11843,16 +11855,4 @@ mod select_tests {
             }
         }
     }
-}
-
-/// Whether translated shaders mark the heap slots they read
-/// (`VICTORY_HEAP_USAGE`, on unless 0).
-pub fn heap_usage_marks() -> bool {
-    // shortcut: off in unit tests, whose hardware harness binds only the
-    // root parameters each test names (the bitmap would be unbound).
-    if cfg!(test) {
-        return false;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
 }
