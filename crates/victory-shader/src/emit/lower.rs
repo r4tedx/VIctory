@@ -539,6 +539,9 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        if let StageIo::Gs(gs) = &x.native.io {
+            s.gs = Some(gs.max_vertices);
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1448,6 +1451,7 @@ impl<'a> Lower<'a> {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
+                    None if self.s.gs.is_some() => Val::Missing("a geometry VGPR input"),
                     None => Val::I32(self.s.m.i32(0)),
                 },
             };
@@ -1568,6 +1572,10 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        self.load_vertex_input(id, col, None)
+    }
+
+    fn load_vertex_input(&mut self, id: usize, col: u8, vertex: Option<u8>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -1586,11 +1594,15 @@ impl<'a> Lower<'a> {
             ".f32"
         };
         let entry = self.s.entry;
+        let index = match vertex {
+            Some(n) => self.s.m.i32(u32::from(n)),
+            None => self.s.m.undef(self.s.t.i32),
+        };
         let args = [
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
+            index,
         ];
         let v = self.s.op(
             entry,
@@ -3341,6 +3353,42 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        if let Some(gs) = self.x.io.geometry.as_deref() {
+            if gs.address_steps.contains(&offset) {
+                for &(_, value) in &inst.writes {
+                    self.vals.insert(
+                        value,
+                        Val::Missing("a geometry ring address used as shader data"),
+                    );
+                }
+                return Ok(());
+            }
+            if let Some(reads) = gs.reads.get(&offset) {
+                for &(v, index, word) in reads {
+                    let row = u8::try_from(word / 4)
+                        .map_err(|_| unsupported(offset, "a geometry input row"))?;
+                    let (id, col) = self.find_input(row, (word % 4) as u8).ok_or(unsupported(
+                        offset,
+                        "a geometry input missing from the signature",
+                    ))?;
+                    if self.s.inputs[id].half || index >= 3 {
+                        return Err(unsupported(offset, "a geometry input format or vertex"));
+                    }
+                    let input = self.load_vertex_input(id, col, Some(index));
+                    self.vals.insert(v, input);
+                }
+                return Ok(());
+            }
+            if let Some(message) = gs.messages.get(&offset) {
+                self.geometry_message(message)
+                    .map_err(|why| unsupported(offset, why))?;
+                return Ok(());
+            }
+            if inst.name() == "ds_write2_b32" {
+                // Raising captured each stored SSA value at its emit site.
+                return Ok(());
+            }
+        }
         let name = inst.name();
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
@@ -3400,6 +3448,98 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
         }
+    }
+
+    fn geometry_message(&mut self, message: &crate::geometry::StreamOp) -> Result<(), Why> {
+        use crate::geometry::{Component, StreamOp};
+        let (name, opcode) = match message {
+            StreamOp::Cut => ("cutStream", 98),
+            StreamOp::Emit(exports) => {
+                let StageIo::Gs(gs) = &self.x.native.io else {
+                    return Err("geometry stage data");
+                };
+                let StageIo::Vs { outputs, .. } = &gs.copy.io else {
+                    return Err("geometry copy outputs");
+                };
+                let mut written = vec![0u8; self.s.outputs.len()];
+                for export in exports {
+                    let row = match export.target {
+                        12 => self
+                            .s
+                            .outputs
+                            .iter()
+                            .find(|e| e.kind == 3)
+                            .and_then(|e| e.row),
+                        t @ 32..=63 => {
+                            let o = outputs
+                                .iter()
+                                .find(|o| o.param == t - 32)
+                                .ok_or("a geometry output parameter")?;
+                            if o.fp16 || o.pack2 {
+                                return Err("a packed geometry output");
+                            }
+                            Some(u32::from(o.row))
+                        }
+                        _ => return Err("a geometry copy export target"),
+                    }
+                    .ok_or("a geometry output signature row")?;
+                    for (channel, source) in export.channels.iter().enumerate() {
+                        let Some(src) = source else {
+                            continue;
+                        };
+                        let ch = channel as u8;
+                        let Some(id) = self.s.outputs.iter().position(|e| {
+                            e.row == Some(row) && (e.col..e.col + e.cols).contains(&ch)
+                        }) else {
+                            continue;
+                        };
+                        if self.s.outputs[id].half {
+                            return Err("a 16-bit geometry output");
+                        }
+                        let col = ch - self.s.outputs[id].col;
+                        let bits = match *src {
+                            Component::Value(v) => self.i32_of(v)?,
+                            Component::Constant(n) => self.s.m.i32(n),
+                        };
+                        let (op, x) = if self.s.outputs[id].comp == 9 {
+                            ("storeOutput.f32", self.as_float(bits))
+                        } else {
+                            ("storeOutput.i32", bits)
+                        };
+                        written[id] |= 1 << col;
+                        self.s.outputs[id].usage |= 1 << col;
+                        let args = [
+                            self.s.m.i32(id as u32),
+                            self.s.m.i32(0),
+                            self.s.m.i8(col),
+                            x,
+                        ];
+                        self.s
+                            .op(self.cur, op, Attr::NoUnwind, self.s.t.void, 5, &args);
+                    }
+                }
+                if self
+                    .s
+                    .outputs
+                    .iter()
+                    .zip(written)
+                    .any(|(e, w)| w != (1 << e.cols) - 1)
+                {
+                    return Err("a geometry output missing from the copy exports");
+                }
+                ("emitStream", 97)
+            }
+        };
+        let stream = self.s.m.i8(0);
+        self.s.op(
+            self.cur,
+            name,
+            Attr::NoUnwind,
+            self.s.t.void,
+            opcode,
+            &[stream],
+        );
+        Ok(())
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {

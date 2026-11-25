@@ -348,14 +348,18 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "geometry" | "mesh"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry");
+        if mesh.is_some() && geometry.is_some() {
+            return refuse("geometry and mesh stages in one pipeline", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -366,6 +370,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -640,11 +645,23 @@ impl HostPipeline {
             });
         }
 
-        // Rectangle lists: a geometry shader made for the vertex shader adds
-        // each rectangle's fourth corner (else rectangles are expanded on
-        // the CPU from vertex inputs, see `draw`).
-        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
-            (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+        let pixel = stages
+            .iter()
+            .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_PIXEL)
+            .map_or_else(Default::default, code);
+        // A translated geometry stage; or, for rectangle lists, a geometry
+        // shader made for the vertex shader that adds each rectangle's
+        // fourth corner (else rectangles are expanded on the CPU from
+        // vertex inputs, see `draw`).
+        let gs = match (geometry, g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+            (Some(gs), RECTANGLES, _) => {
+                let _ = gs;
+                return refuse("a geometry stage drawing rectangle lists", shaders);
+            }
+            (Some(gs), _, _) => gs
+                .translated()
+                .map_or_else(Vec::new, |s| s.host.dxil.clone()),
+            (None, RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
@@ -657,7 +674,7 @@ impl HostPipeline {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
+            PS: pixel,
             GS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
@@ -681,7 +698,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
+            &[&code_bytes(&code(0)), &code_bytes(&pixel), &gs],
             &state,
         );
         let started = std::time::Instant::now();

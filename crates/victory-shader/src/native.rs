@@ -9,6 +9,7 @@
 //! ```text
 //! +0x18 "XDAT"  u32 entry count, u32 (0x24 seen), then per entry:
 //!               u32 kind, u32 offset, u32 size
+//! kind 0x0c     uncompressed FSSM
 //! kind 0x0d     "XBCH" u32 version (3), u64 packed size, u64 unpacked size,
 //!               zlib stream
 //! unpacked      "FSSM" u32 version (0x101), u64 payload size, payload
@@ -61,7 +62,11 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! A GS keeps its copy VS record at E+0x34. Its code and resource tables
+//! are payload-relative like a top-level record. The copy VS reads each
+//! emitted vertex out of LDS and exports it using its own output table.
+//! E+0x27c is the per-invocation output size in dwords, E+0x284 the
+//! maximum vertices, and E+0x28c the per-vertex size in dwords.
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -73,6 +78,7 @@ use crate::dxbc::{u16_at, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
+const KIND_NATIVE_RAW: u32 = 0x0c;
 const KIND_NATIVE: u32 = 0x0d;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
@@ -192,6 +198,16 @@ impl NativeProgram {
         }
         code
     }
+
+    /// The code translation builds its program from: [`Self::patched_code`],
+    /// or for a geometry program the code one host GS invocation runs (one
+    /// active console invocation).
+    pub fn translation_code(&self) -> Result<Vec<u8>, ShaderError> {
+        if self.stage == HwStage::Gs {
+            return crate::geometry::invocation_code(self);
+        }
+        Ok(self.patched_code())
+    }
 }
 
 /// What a semantic is, as the stage data names it.
@@ -280,6 +296,19 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// The GS writes vertices into LDS. A separate VS reads them back and
+/// maps their components to position and parameter exports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    pub invocation_dwords: u32,
+    pub vertex_dwords: u32,
+    pub max_vertices: u32,
+    /// Native stream/instance configuration following the ring size.
+    pub stream_config: [u32; 2],
+    pub copy: Box<NativeProgram>,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -437,11 +466,24 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if !matches!(kind, KIND_NATIVE_RAW | KIND_NATIVE) {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
+        if kind == KIND_NATIVE_RAW {
+            // Uncompressed entries were skipped before they were read: one
+            // that is not a valid FSSM is skipped still, and does not cost
+            // the container its other entries.
+            if size <= MAX_UNPACKED
+                && let Some(blob) = bytes(part, offset, size)
+                && let Ok(found) = programs(blob)
+            {
+                out.extend(found);
+            }
+            continue;
+        }
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
         out.extend(programs(&unpack(blob)?)?);
     }
@@ -607,83 +649,104 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         if start == ABSENT {
             continue;
         }
-        let record =
-            bytes(payload, start, RECORD_SIZE).ok_or(Malformed("FSSM record out of bounds"))?;
-        let code = bytes(payload, u64_at(record, 0)?, u64_at(record, 8)?)
-            .ok_or(Malformed("native code out of bounds"))?;
-        let vgprs = (u32_at(record, RECORD_REGS)? & 0x3FF) as u16;
-        if vgprs > 256 {
-            return Err(Malformed("implausible VGPR count"));
-        }
-        let table = |at: usize, count_at: usize| -> Result<&[u8], ShaderError> {
-            let len = ENTRY_SIZE * u64::from(u32_at(record, count_at)?);
-            if len == 0 {
-                return Ok(&[]);
-            }
-            bytes(payload, u64_at(record, at)?, len)
-                .ok_or(Malformed("FSSM root table out of bounds"))
-        };
-        let layout = table(RECORD_LAYOUT, RECORD_COUNTS)?
-            .as_chunks::<{ ENTRY_SIZE as usize }>()
-            .0
-            .iter()
-            .map(|e| RootParam {
-                root: RootType::from_raw(le32(e, 0)),
-                table_offset_dwords: le32(e, 4),
-                sgprs: le32(e, 8),
-                base_register: le32(e, 12),
-                user_data: e[16],
-                slot: e[17],
-            })
-            .collect();
-        let used = table(RECORD_USED, RECORD_COUNTS + 4)?
-            .as_chunks::<{ ENTRY_SIZE as usize }>()
-            .0
-            .iter()
-            .map(|e| UsedResource {
-                kind: match e[0] {
-                    0 => ResourceType::Srv,
-                    1 => ResourceType::Sampler,
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Uav,
-                    n => ResourceType::Other(n),
-                },
-                root: RootType::from_raw(e[1].into()),
-                table_offset_dwords: le32(e, 4),
-                lower_bound: le32(e, 8),
-                stride: le32(e, 12),
-                dwords: e[16],
-                user_data: e[17],
-                slot: e[18],
-            })
-            .collect();
-        // The record is in bounds, so its end is too.
-        let stage_data = &payload[(start + RECORD_SIZE) as usize..];
-        let io = match stage {
-            HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_io(stage_data)?,
-            HwStage::Cs => StageIo::Cs(ComputeIo {
-                rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: [
-                    u32_at(stage_data, CS_THREADS)?,
-                    u32_at(stage_data, CS_THREADS + 4)?,
-                    u32_at(stage_data, CS_THREADS + 8)?,
-                ],
-            }),
-            HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
-            _ => StageIo::None,
-        };
-        out.push(NativeProgram {
-            stage,
-            wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
-            vgprs,
-            layout,
-            used,
-            io,
-            code: code.to_vec(),
-        });
+        out.push(read_program(payload, start, stage)?);
     }
     Ok(out)
+}
+
+fn read_program(payload: &[u8], start: u64, stage: HwStage) -> Result<NativeProgram, ShaderError> {
+    let record =
+        bytes(payload, start, RECORD_SIZE).ok_or(Malformed("FSSM record out of bounds"))?;
+    let code = bytes(payload, u64_at(record, 0)?, u64_at(record, 8)?)
+        .ok_or(Malformed("native code out of bounds"))?;
+    let vgprs = (u32_at(record, RECORD_REGS)? & 0x3FF) as u16;
+    if vgprs > 256 {
+        return Err(Malformed("implausible VGPR count"));
+    }
+    let table = |at: usize, count_at: usize| -> Result<&[u8], ShaderError> {
+        let len = ENTRY_SIZE * u64::from(u32_at(record, count_at)?);
+        if len == 0 {
+            return Ok(&[]);
+        }
+        bytes(payload, u64_at(record, at)?, len)
+            .ok_or(Malformed("FSSM root table out of bounds"))
+    };
+    let layout = table(RECORD_LAYOUT, RECORD_COUNTS)?
+        .as_chunks::<{ ENTRY_SIZE as usize }>()
+        .0
+        .iter()
+        .map(|e| RootParam {
+            root: RootType::from_raw(le32(e, 0)),
+            table_offset_dwords: le32(e, 4),
+            sgprs: le32(e, 8),
+            base_register: le32(e, 12),
+            user_data: e[16],
+            slot: e[17],
+        })
+        .collect();
+    let used = table(RECORD_USED, RECORD_COUNTS + 4)?
+        .as_chunks::<{ ENTRY_SIZE as usize }>()
+        .0
+        .iter()
+        .map(|e| UsedResource {
+            kind: match e[0] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root: RootType::from_raw(e[1].into()),
+            table_offset_dwords: le32(e, 4),
+            lower_bound: le32(e, 8),
+            stride: le32(e, 12),
+            dwords: e[16],
+            user_data: e[17],
+            slot: e[18],
+        })
+        .collect();
+    // The record is in bounds, so its end is too.
+    let stage_data = &payload[(start + RECORD_SIZE) as usize..];
+    let io = match stage {
+        HwStage::Ps => ps_io(stage_data, code.len())?,
+        HwStage::Vs => vs_io(stage_data)?,
+        HwStage::Cs => StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(stage_data, CS_RSRC2)?,
+            threads: [
+                u32_at(stage_data, CS_THREADS)?,
+                u32_at(stage_data, CS_THREADS + 4)?,
+                u32_at(stage_data, CS_THREADS + 8)?,
+            ],
+        }),
+        // A geometry record whose copy program or stage data does not
+        // parse keeps no stage I/O, as every geometry record did before:
+        // translation refuses it, and the container's other programs stay.
+        HwStage::Gs => gs_io(payload, start, stage_data).unwrap_or(StageIo::None),
+        HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+        _ => StageIo::None,
+    };
+    Ok(NativeProgram {
+        stage,
+        wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
+        vgprs,
+        layout,
+        used,
+        io,
+        code: code.to_vec(),
+    })
+}
+
+/// A geometry program's stage I/O: its copy VS (the record after its own)
+/// and the GS-to-VS ring layout in its stage data.
+fn gs_io(payload: &[u8], start: u64, stage_data: &[u8]) -> Result<StageIo, ShaderError> {
+    let copy = read_program(payload, start + RECORD_SIZE + 0x34, HwStage::Vs)?;
+    Ok(StageIo::Gs(GeometryIo {
+        invocation_dwords: u32_at(stage_data, 0x27c)?,
+        max_vertices: u32_at(stage_data, 0x284)?,
+        stream_config: [u32_at(stage_data, 0x280)?, u32_at(stage_data, 0x288)?],
+        vertex_dwords: u32_at(stage_data, 0x28c)?,
+        copy: Box::new(copy),
+    }))
 }
 
 /// The entries of `size` bytes from `at`, with their count at `count_at`.
@@ -892,6 +955,47 @@ pub(crate) mod tests {
         out
     }
 
+    /// Synthetic geometry record with the embedded copy VS following its
+    /// graphics header, `vertex_dwords` ring dwords per vertex (three
+    /// vertices) and the copy VS's output table (`usage, row, param, _, _,
+    /// flags` per entry).
+    pub(crate) fn geometry_part_sized(
+        code: &[u8],
+        copy: &[u8],
+        vertex_dwords: u32,
+        outputs: &[[u8; 6]],
+    ) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::Gs, code)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        blob[e..e + STAGE_DATA].fill(0);
+        let record = e + 0x34;
+        let start = (blob.len() - FSSM_HEADER) as u64;
+        blob[record..record + 8].copy_from_slice(&start.to_le_bytes());
+        blob[record + 8..record + 16].copy_from_slice(&(copy.len() as u64).to_le_bytes());
+        for (offset, value) in [
+            (0x27c, 3 * vertex_dwords),
+            (0x280, 1),
+            (0x284, 3),
+            (0x28c, vertex_dwords),
+        ] {
+            blob[e + offset..e + offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // The copy VS's own stage data follows its record.
+        let copy_data = record + RECORD_SIZE as usize;
+        for (k, o) in outputs.iter().enumerate() {
+            let at = copy_data + VS_OUTPUTS + 6 * k;
+            blob[at..at + 6].copy_from_slice(o);
+        }
+        let count = copy_data + VS_OUTPUT_COUNT;
+        blob[count..count + 4].copy_from_slice(&(outputs.len() as u32).to_le_bytes());
+        blob.extend(copy);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        let mut result = part(&[(KIND_NATIVE_RAW, &blob)]);
+        result[..4].copy_from_slice(&0x00020066u32.to_le_bytes());
+        result
+    }
+
     #[test]
     fn finds_graphics_programs() {
         let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]));
@@ -928,6 +1032,32 @@ pub(crate) mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_fssm_uses_the_same_program_and_io_layout_as_packed_fssm() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let raw = part(&[(KIND_NATIVE_RAW, &blob)]);
+        let packed = part(&[(KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(native_programs(&raw).unwrap(), native_programs(&packed).unwrap());
+        // An uncompressed entry that is no FSSM is skipped, as all were
+        // before they were read, and keeps the container's other entries.
+        assert_eq!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..16])])).unwrap(), []);
+        let beside = part(&[(KIND_NATIVE_RAW, &blob[..16]), (KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(native_programs(&beside).unwrap(), native_programs(&packed).unwrap());
+    }
+
+    #[test]
+    fn a_geometry_record_without_a_copy_program_keeps_no_stage_io() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        blob[e..e + STAGE_DATA].fill(0);
+        // The copy VS's record points past the payload.
+        blob[e + 0x34..e + 0x3c].copy_from_slice(&u64::MAX.to_le_bytes());
+        let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].stage, HwStage::Gs);
+        assert_eq!(found[0].io, StageIo::None);
     }
 
     #[test]
