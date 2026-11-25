@@ -248,3 +248,81 @@ build --locked --profile diag -p victory --features diagnostics` at
   `clamped`. Layer 2 changes neither file. The production code is fine
   (`cargo check` and the diag build pass). Fixing that test means
   bringing #159 up to #2168's API.
+
+## Layer 4 (`gpu-run/layer4`)
+
+Base: `gpu-run/bis-no2242` at `e9159245`. That is layer 2 (`533217b7`)
+with #2280 and #2242 reverted. Each piece is one `git merge --no-ff` and
+keeps its authorship. After each merge, `cargo check --locked -p victory
+--features diagnostics` passed through `heavy-run --light`, with
+`CARGO_TARGET_DIR=C:\Users\PC\.t3\targets\layer4` seeded from
+`targets\bis-no2242`.
+
+| # | Piece | Source SHA | Merge | Conflicts |
+|---|-------|-----------|-------|-----------|
+| 1 | rect.rs edge-triangle fix (upstream PR #2366) | `a54e0c84` | `0dfa952d` | none |
+| 2 | pixel quad reads reach helper lanes | `360b8557` | `f5ceef7b` | `emit/lower.rs`, see below |
+| 3 | #1962 rebased, with test fixes | `36871fe7` | `6d30bb90` | none |
+| 4 | #1962 marks fix (`fix/1962-marks-once-per-wave`) | `288cbd38` | not merged | held, see below |
+| 5 | upstream #2311: BVH-walking pipelines wait until the builder has run whole | `481a9aec` | `ebb682dc` | none |
+| 6 | upstream #2167: memory_dirty atomic skipped when the bit is already set | `6ab9c988` | `c0d7654b` | none (#2175 was already in the base) |
+| 7 | fork `gpu/batched-clamps-on-2168`: opt-in `VICTORY_BATCH_CLAMPS=1` | `31047d78` | `39e8c797` | `victory-gpu/src/host.rs`, see below |
+| 8 | upstream #2085: early depth test for pixel shaders that write buffers | `3c76d58d` | `5a2082cb` | none |
+| 9 | upstream #2143: smaller constant tables | `a68ae559` | `552e410a` | none |
+| 10 | upstream #2245: mesh primitive indices written once | `2e26c46a` | `2cbd1d59` | none |
+
+After the merges: `d3caa2d1` "Tests: layer 4's shader tests compile
+again". This commit changes test code only.
+
+### Skipped
+
+- Piece 4, `288cbd38` (#1962 marks: once per wave, test before OR). Held
+  because of a translator panic, and a fix is pending. On trees with the
+  wave64 stack, which includes this base, it makes the translator panic
+  with "forward reference outside a phi".
+
+### Conflict resolutions
+
+- Piece 2, `crates/victory-shader/src/emit/lower.rs`: the base's
+  `console_read_lane` (console flow) and 360b8557's new `helpers_read`
+  doc comment were added at the same place. Both are kept: first
+  `console_read_lane` as the base has it, then 360b8557's comment and its
+  `helpers_read` (`quad && self.s.pixel`, without the discard condition).
+- Piece 7, `crates/victory-gpu/src/host.rs` `HostList::close`: the base's
+  query ends and deferred read-back copies, and the batched clamps'
+  `crate::indirect::end(self)`. Both are kept: first the base's query
+  ends and read-back copies, then the clamp window end. They touch
+  different buffers. `indirect::end` only writes the window's counts
+  table and moves its records back to unordered access.
+- `d3caa2d1` (test-compile fix): #2167's `synthetic_mark_dxil` and
+  #2085's early-depth tests build `Parts` and `HostShader` the way main
+  has them. On this tree `Parts` also takes `target`, `console_cf`,
+  `per_lane_only` and `rays_miss`, `Lower::new` takes `numeric_selects`,
+  and `HostShader` takes `heap_usage` (#1962). The fix fills these in with
+  their defaults (`Target::ANY`, `false`, `l.heap_usage`). After it,
+  `cargo check --locked -p victory-shader -p victory-gpu --tests` passes.
+
+### Shader translator
+
+`git diff --stat e9159245 <layer 4 head> -- crates/victory-shader`: 13
+files, 1271 insertions, 146 deletions (`emit/bitcode.rs`, `host.rs`,
+`lower.rs`, `memory_tests.rs`, `mod.rs`, `rect.rs`, `shader.rs`,
+`synthetic_tests.rs`, and one or two lines in each of `bvh_tests.rs`,
+`semantics_tests.rs`, `stride_tests.rs`, `valu_tests.rs`,
+`waterfall_tests.rs`). The translator changes (pieces 1, 2, 3, 6, 8, 9,
+10), so the shader cache needs a new pass for this layer.
+
+### Build
+
+`cargo build --locked --profile diag -p victory --features diagnostics`
+at `d3caa2d1`, through `heavy-run --light`, into `targets\layer4`:
+`diag\victory.exe`, sha256
+`2118b3f5864bdc573f79366d396052b142ab6abaf9549eecc4c69e9b4a8a9fc2`.
+This file only changes docs, so the binary matches this layer's head.
+
+### Tests
+
+No unit tests were run for this layer. Only test compilation was
+checked (above). #2085's new synthetic tests loop over `("hardware",
+false), ("warp", true)`. Run them only with hardware turned off, or not
+at all, while the hardware hold is in place.
