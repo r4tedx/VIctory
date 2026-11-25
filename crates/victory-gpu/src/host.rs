@@ -1142,6 +1142,9 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Copies' counts: a new submission, folded after a present.
+        #[cfg(feature = "diagnostics")]
+        crate::copy_use::submission();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
@@ -2323,6 +2326,7 @@ impl HostList {
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
+                        shadow.used.bound(*len);
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -2344,6 +2348,8 @@ impl HostList {
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
                         batch.flush();
+                        #[cfg(feature = "diagnostics")]
+                        shadow.used.wrote(crate::copy_use::N::Declared, *len as u64);
                     }
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -2834,6 +2840,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
+        crate::copy_use::presented();
+        #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
         }
@@ -2917,6 +2925,7 @@ impl Meter {
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
                 crate::vram::log(copy_frames);
+                crate::copy_use::log();
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(

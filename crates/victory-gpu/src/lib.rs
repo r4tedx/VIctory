@@ -22,6 +22,8 @@ mod bindless;
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod copy_use;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;

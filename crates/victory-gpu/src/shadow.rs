@@ -56,6 +56,9 @@ pub(crate) struct Shadow {
     /// side, which the CPU reads and writes (and which is always current
     /// where the CPU reads it).
     vram: Option<Vram>,
+    /// What it costs and would save in video memory ([`crate::copy_use`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) used: crate::copy_use::Use,
 }
 
 /// The video memory side of a host copy. Every CPU write into the system
@@ -152,8 +155,8 @@ impl Shadow {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
     }
 
-    /// Where its GPU side is (tests).
-    #[cfg(test)]
+    /// Where its GPU side is (tests, diagnostics).
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn class(&self) -> crate::vram::Class {
         self.vram
             .as_ref()
@@ -256,14 +259,18 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
+        #[cfg(feature = "diagnostics")]
+        self.used.add(crate::copy_use::N::ReadBack, n as u64);
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
         }
         {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::writing_back(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
+        #[cfg(feature = "diagnostics")]
+        self.counted_back(n);
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
@@ -313,6 +320,8 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             vram,
+            #[cfg(feature = "diagnostics")]
+            used: crate::copy_use::Use::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -471,7 +480,10 @@ impl Shadow {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                {
+                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                    self.used.add(crate::copy_use::N::ReadBack, n as u64);
+                }
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
@@ -484,9 +496,11 @@ impl Shadow {
                         *h = *t;
                     }
                     if changed {
-                        let _writing = crate::watch::writing(start + at, n);
+                        let _writing = crate::watch::writing_back(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
+                        #[cfg(feature = "diagnostics")]
+                        self.counted_back(n);
                     }
                     synced.push((start + at) / PAGE);
                     pieces.push((start + at, n));
@@ -559,6 +573,8 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        #[cfg(feature = "diagnostics")]
+        self.used.add(crate::copy_use::N::ReadBack, n as u64);
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
@@ -581,8 +597,10 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::writing_back(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            #[cfg(feature = "diagnostics")]
+            self.counted_back(n);
         }
         #[cfg(test)]
         tests::before_taken();
@@ -669,6 +687,8 @@ impl Shadow {
         if runs.is_empty() {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        self.used.add(crate::copy_use::N::Taken, pages_in(&runs));
         let start = self.start as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut copied = 0;
@@ -696,7 +716,12 @@ impl Shadow {
             let started = std::time::Instant::now();
             let (runs, unmapped) = t.take_split(from, to);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+            {
+                let us = started.elapsed().as_micros() as u64;
+                crate::copystat::add(crate::copystat::C::WatchUs, us);
+                let taken = pages_in(&runs) + pages_in(&unmapped);
+                self.used.add(crate::copy_use::N::Taken, taken);
+            }
             // Cut to the range: next to it shaders may be writing the copy.
             let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
             for (a, b) in unmapped {
@@ -748,12 +773,52 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // Every refresh writes video memory too, where the copy has it.
         self.put(from - start, to - from);
+        #[cfg(feature = "diagnostics")]
+        self.used.add(crate::copy_use::N::Refreshed, (to - from) as u64);
         to - from
+    }
+
+    /// A page or piece of `n` bytes went back into title memory.
+    #[cfg(feature = "diagnostics")]
+    fn counted_back(&self, n: usize) {
+        self.used.add(crate::copy_use::N::BackPages, 1);
+        self.used.add(crate::copy_use::N::BackBytes, n as u64);
+    }
+
+    /// Pages its tracker found the title wrote since the last call.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn title_wrote(&self) -> u64 {
+        self.tracked.as_ref().map_or(0, crate::watch::Tracked::take_wrote)
+    }
+}
+
+/// The 64 KiB pages byte runs (one per page at most) touch.
+#[cfg(feature = "diagnostics")]
+fn pages_in(runs: &[(usize, usize)]) -> u64 {
+    runs.iter().map(|&(a, b)| ((b - 1) / PAGE - a / PAGE + 1) as u64).sum()
+}
+
+/// Every host copy of a title buffer (`false`) and of a window outside
+/// buffers (`true`), under the registries' locks: the copies the
+/// `placement:` line counts (diagnostics; not those of single views).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn each_counted(mut f: impl FnMut(&Shadow, bool)) {
+    for copy in buffers().values().filter_map(|e| e.shadow.as_deref()) {
+        f(copy, false);
+    }
+    for copy in LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        f(copy, true);
     }
 }
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // What it counted stays in the line (copies of single views are not
+        // in it).
+        #[cfg(feature = "diagnostics")]
+        if self.slice.is_none() {
+            self.used.gone(self.class(), self.title_wrote());
+        }
         if self.vram.is_some() {
             IN_VRAM.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -990,7 +1055,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (_copy, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            #[cfg(feature = "diagnostics")]
+            _copy.used.wrote(crate::copy_use::N::Marked, 1);
             crate::memory::drop_withheld(page, PAGE);
         }
     }
@@ -1002,6 +1069,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     for (copy, page) in pages {
+        #[cfg(feature = "diagnostics")]
+        copy.used.wrote(crate::copy_use::N::Marked, 1);
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
@@ -1119,6 +1188,8 @@ fn bring_back(runs: &[(Arc<Shadow>, usize, usize)]) {
         .filter_map(|&(i, from, to)| {
             let copy = &runs[i].0;
             let v = copy.vram.as_ref()?;
+            #[cfg(feature = "diagnostics")]
+            copy.used.add(crate::copy_use::N::Pulled, (to - from) as u64);
             Some((
                 &v.home,
                 from as u64,
@@ -2135,5 +2206,229 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// The placement counters of a hand-made copy (`crate::copy_use`): a
+    /// draw's bound range and its refresh, the title's writes and the pages
+    /// taken after them, a marked page and a declared range shaders write,
+    /// and what goes back of each. In a process of its own: other tests'
+    /// page tables name every copy, this one too.
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn a_copys_counters_count_reads_writes_and_copy_backs() {
+        use crate::copy_use::tests::{count, folded};
+        use crate::copy_use::{COUNTS, N};
+        if !in_child(
+            "shadow::tests::a_copys_counters_count_reads_writes_and_copy_backs",
+            "0",
+        ) {
+            return;
+        }
+        count(true);
+        let len = 4 * PAGE;
+        let p = crate::watch::tests::pool(4);
+        register(p, p as u64, len as u64);
+        let (Some(host), Some(copy)) = (host(), find(p as u64, len as u64)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let got = |c: &[u64; COUNTS], n: &[N]| n.iter().map(|&n| c[n as usize]).collect::<Vec<_>>();
+        // A draw binds the first two pages, brought up to date at submission.
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, 2 * PAGE as u64);
+        list.close();
+        host.execute(&[&list]);
+        let c = folded(&copy);
+        let read = [N::Binds, N::Bound, N::Uses, N::Taken, N::Refreshed];
+        assert_eq!(got(&c, &read), [1, 2 * PAGE as u64, 1, 2, 2 * PAGE as u64]);
+        // The title writes page 1 (taken, so guarded) and page 3 (never
+        // taken): one page written since taken; a refresh takes three.
+        write_title(p + PAGE + 8, 1);
+        write_title(p + 3 * PAGE + 8, 2);
+        copy.update(p, len);
+        let c = folded(&copy);
+        let wrote = [N::TitleWrote, N::Taken, N::Refreshed, N::Binds];
+        assert_eq!(got(&c, &wrote), [1, 3, 3 * PAGE as u64, 0]);
+        // Shaders mark page 0 and write a byte in it.
+        let list = host.new_list().unwrap();
+        copy.gpu_writes(&list, p as u64, len as u64, true);
+        let c2 = copy.clone();
+        list.defer_host(move || {
+            c2.write_host(p as u64 + 10, &[0xaa]);
+            mark(&c2, p as u64);
+        });
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(title(p + 10), 0xaa);
+        let c = folded(&copy);
+        let marked = [
+            N::Marked,
+            N::Writes,
+            N::Declared,
+            N::ReadBack,
+            N::BackPages,
+            N::BackBytes,
+        ];
+        let page = PAGE as u64;
+        assert_eq!(got(&c, &marked), [1, 1, 0, page, 1, page]);
+        assert_eq!(
+            got(&c, &[N::TitleWrote]),
+            [0],
+            "the copy-back is not the title's write"
+        );
+        // Shaders write a byte in a 100-byte range declared with no marks.
+        let list = host.new_list().unwrap();
+        let q = p + 2 * PAGE;
+        copy.gpu_writes(&list, q as u64, 100, false);
+        let c2 = copy.clone();
+        list.defer_host(move || c2.write_host(q as u64 + 5, &[9]));
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(title(q + 5), 9);
+        let c = folded(&copy);
+        assert_eq!(got(&c, &marked), [0, 1, 100, 100, 1, 100]);
+        assert_eq!(got(&c, &[N::Pulled]), [0], "a copy in system memory");
+        unregister(p, p as u64);
+    }
+
+    /// A copy in video memory counts the bytes a GPU copy brought back
+    /// from video memory, and nothing is counted while the switch is off.
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn counters_of_a_copy_in_video_memory_count_what_came_back() {
+        use crate::copy_use::N;
+        use crate::copy_use::tests::{count, folded};
+        if !in_child(
+            "shadow::tests::counters_of_a_copy_in_video_memory_count_what_came_back",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 2 * PAGE;
+        let p = crate::watch::tests::pool(2);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(copy.class(), Class::VramWritten);
+        count(false);
+        copy.update(p, len);
+        assert_eq!(
+            folded(&copy),
+            [0; crate::copy_use::COUNTS],
+            "the switch is off"
+        );
+        count(true);
+        let list = host.new_list().unwrap();
+        copy.gpu_writes(&list, p as u64, PAGE as u64, true);
+        let c2 = copy.clone();
+        list.defer_host(move || {
+            c2.write_host(p as u64 + 10, &[0xaa]);
+            mark(&c2, p as u64);
+        });
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(title(p + 10), 0xaa);
+        let c = folded(&copy);
+        let page = PAGE as u64;
+        let back = [N::Marked, N::Pulled, N::ReadBack, N::BackBytes];
+        assert_eq!(back.map(|n| c[n as usize]), [1, page, page, page]);
+        unregister(p, p as u64);
+    }
+
+    /// The counters' cost: a world-like submission's counts over 4,096
+    /// copies (30 lists using a heap, 500 binds, 200 refreshes, 50 marked
+    /// pages), with counting on and off, caches flushed before each; a fold
+    /// of the copies; and the fold spreading heap reach over 12,288 ranges.
+    /// A measurement, run by hand: `cargo test --release -p victory-gpu
+    /// --features diagnostics --lib counters_cost -- --ignored --nocapture`.
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    #[ignore = "a measurement"]
+    fn counters_cost() {
+        use crate::copy_use::N;
+        use crate::copy_use::tests::{count, fold_all};
+        const COPIES: usize = 4096;
+        let p = crate::watch::tests::pool(COPIES);
+        let start = |i: usize| p + i * PAGE;
+        for i in 0..COPIES {
+            register(start(i), start(i) as u64, PAGE as u64);
+        }
+        let Some(copies) = (0..COPIES)
+            .map(|i| find(start(i) as u64, PAGE as u64))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return; // no host GPU here
+        };
+        // Copies in a scattered order (an LCG), as lists and heaps name them.
+        let mut x = 1u64;
+        let mut next = || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as usize % COPIES
+        };
+        let ranges: Vec<usize> = (0..3 * COPIES).map(|_| next()).collect();
+        let binds: Vec<usize> = (0..500).map(|_| next()).collect();
+        let refreshes: Vec<usize> = (0..200).map(|_| next()).collect();
+        let marked: Vec<usize> = (0..50).map(|_| next()).collect();
+        let heap = crate::bindless::Viewed::default();
+        let mut flush = vec![0u8; 64 << 20];
+        let submission = || {
+            for _ in 0..30 {
+                crate::bindless::refresh(&heap, |_, _, _| {});
+            }
+            for &i in &binds {
+                copies[i].used.bound(256);
+            }
+            for &i in &refreshes {
+                copies[i].used.add(N::Refreshed, 4096);
+                copies[i].used.add(N::Taken, 1);
+            }
+            for &i in &marked {
+                copies[i].used.wrote(N::Marked, 1);
+                copies[i].used.add(N::ReadBack, PAGE as u64);
+            }
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut timed = |on: bool, f: &dyn Fn()| {
+            count(on);
+            let mut us = Vec::new();
+            for round in 0..41 {
+                flush
+                    .iter_mut()
+                    .step_by(64)
+                    .for_each(|b| *b = b.wrapping_add(round as u8));
+                let t = std::time::Instant::now();
+                f();
+                us.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            median(us)
+        };
+        let off = timed(false, &submission);
+        let on = timed(true, &submission);
+        let fold = timed(true, &fold_all);
+        let spread = timed(true, &|| {
+            for &i in &ranges {
+                copies[i].used.reached(4096);
+            }
+        });
+        let counts = 30 + 500 + 2 * 200 + 2 * 50;
+        eprintln!(
+            "placement counters, {COPIES} copies, {counts} counts per submission: \
+             off {off:.1} us, on {on:.1} us ({:.1} us more, {:.2} ns a count); \
+             a fold of every copy {fold:.1} us, spreading heap reach {spread:.1} us",
+            on - off,
+            (on - off) * 1e3 / counts as f64
+        );
+        count(false);
+        for i in 0..COPIES {
+            unregister(start(i), start(i) as u64);
+        }
+        drop(copies);
+        crate::watch::tests::free(p);
     }
 }

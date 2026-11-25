@@ -44,9 +44,16 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, what it saves of
-/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
-/// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty),
+/// whether it is a host buffer copy's (the only trackers [`retake`] marks),
+/// and the pages marked changed since [`Tracked::take_wrote`].
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool, Wrote);
+
+/// Pages a tracker found the title wrote (diagnostics: `crate::copy_use`).
+#[cfg(feature = "diagnostics")]
+type Wrote = AtomicU64;
+#[cfg(not(feature = "diagnostics"))]
+type Wrote = ();
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -299,7 +306,14 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unit_arg))]
+    let changed = Arc::new(Changed(
+        Mutex::new(pages.iter().copied().collect()),
+        Mutex::default(),
+        bit,
+        copy,
+        <Wrote>::default(),
+    ));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -547,6 +561,14 @@ impl Tracked {
         saved.bytes.clear();
     }
 
+    /// Pages marked changed since the last call by the title's writes
+    /// (faults, the runtime's reports, aliases), not by copy-backs
+    /// ([`writing_back`]) (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn take_wrote(&self) -> u64 {
+        self.changed.4.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed).
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
@@ -658,6 +680,10 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
             if first_write && save {
                 c.save(page);
             }
+            #[cfg(feature = "diagnostics")]
+            if first_write && !OURS.get() {
+                c.4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
@@ -710,6 +736,23 @@ pub fn writing(at: usize, len: usize) -> Writing {
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
     Writing { first, last }
+}
+
+/// [`writing`] of a host copy's bytes going back into title memory: the
+/// pages it marks changed are not counted as the title's writes.
+pub(crate) fn writing_back(at: usize, len: usize) -> Writing {
+    #[cfg(feature = "diagnostics")]
+    OURS.set(true);
+    let w = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    OURS.set(false);
+    w
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// In [`writing_back`].
+    static OURS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it

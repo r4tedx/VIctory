@@ -40,6 +40,10 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 #[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    /// Lists whose heap-indexing shaders used it since the last fold
+    /// (diagnostics: `crate::copy_use`).
+    #[cfg(feature = "diagnostics")]
+    reached: AtomicU64,
 }
 
 type Range = (usize, u64, u64, bool);
@@ -315,6 +319,10 @@ impl Uploads {
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    if crate::copy_use::on() {
+        viewed.reached.fetch_add(1, Relaxed);
+    }
     for (shadow, address, len, _, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
             add(shadow, *address as usize, *len as usize);
@@ -334,6 +342,25 @@ pub(crate) fn note_draw(writes: bool) {
     HEAP_DRAWS[0].fetch_add(1, Relaxed);
     if writes {
         HEAP_DRAWS[1].fetch_add(1, Relaxed);
+    }
+}
+
+/// At a fold of the copies' counts (diagnostics: `crate::copy_use`): each
+/// heap's ranges, as they are now, count as reached once per list that
+/// used the heap since the last fold. Counted per range at each list, the
+/// copies' counters cost ~0.1 ms per world submission.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fold_reach() {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
+        let lists = viewed.reached.swap(0, Relaxed);
+        if lists == 0 {
+            continue;
+        }
+        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (shadow, _, len, _, _) in inner.hulls.values() {
+            shadow.used.reached(len * lists);
+        }
     }
 }
 

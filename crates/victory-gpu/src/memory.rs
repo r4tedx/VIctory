@@ -519,6 +519,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 .iter()
                 .map(|&(k, at)| (&copies[k], at as usize, 1 << 16)),
         );
+        #[cfg(feature = "diagnostics")]
+        for &(k, _) in &writes {
+            copies[k].used.wrote(crate::copy_use::N::Marked, 1);
+        }
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
             for &(_, at) in &writes {
