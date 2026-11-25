@@ -32,7 +32,8 @@
 //!
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
-//! and allocated again while a tracker holds it is not seen.
+//! and allocated again while a tracker holds it is not seen, unless the
+//! runtime allocates it (`XMemVirtualAlloc` reports it as remapped).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,7 +101,9 @@ impl Drop for Changed {
 /// written after it took them, and those bytes: while shaders may be
 /// writing its copy of them, what it held before (`crate::shadow`'s
 /// copy-back of marked pages), with what the copy took of the page since
-/// laid over them ([`Tracked::refreshed`]).
+/// laid over them ([`Tracked::refreshed`]). For a host buffer copy's
+/// tracker, also the [`remap_epoch`] at which the runtime last mapped or
+/// unmapped each of its pages ([`Tracked::remapped_since`]).
 #[derive(Default)]
 struct Saved {
     /// The armed pages as runs `[first, last)`, sorted, apart and not
@@ -113,6 +116,7 @@ struct Saved {
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    remapped: BTreeMap<usize, u64>,
 }
 
 impl Saved {
@@ -636,6 +640,36 @@ impl Tracked {
             }
         }
     }
+
+    /// Whether the runtime mapped or unmapped one of pages `[first, last)`
+    /// (page numbers) after remap epoch `since` (host buffer copies' trackers
+    /// only; [`track_copy`]). A copy-back of a submission that began at
+    /// `since` leaves such a page alone: title memory there is not what the
+    /// shaders read, and the GPU's bytes would land in memory the title now
+    /// uses for something else. Counted (`remap_skips`).
+    // shortcut: a remap between this answer and the caller's write is not
+    // seen, and the runtime reports a new view only after mapping it: a
+    // copy-back racing the mapping itself can still land in the new view.
+    pub(crate) fn remapped_since(&self, first: usize, last: usize, since: u64) -> bool {
+        let saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((&page, _)) = saved
+            .remapped
+            .range(first..last)
+            .find(|&(_, &at)| at > since)
+        else {
+            return false;
+        };
+        drop(saved);
+        REMAP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                page = format_args!("{:#x}", page * PAGE),
+                "a page of title memory the runtime remapped while shaders wrote its copy keeps the new memory's bytes (logged once)"
+            )
+        });
+        true
+    }
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those
@@ -808,11 +842,45 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Moves at each mapping or unmapping the runtime reports
+/// ([`title_memory_remapped`]), once the trackers holding the memory count
+/// it as changed: a submission that reads the epoch first refreshes what it
+/// shows now; a copy-back of one that read it earlier leaves the memory
+/// alone ([`Tracked::remapped_since`]).
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Copy-back pages left alone because the runtime remapped them while
+/// shaders wrote their copy, in all.
+static REMAP_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// The remap epoch now: a submission reads it before it refreshes anything,
+/// and its copy-backs skip pages remapped after it.
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// Copy-back pages left alone for a remap so far ([`Tracked::remapped_since`]).
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn remap_skips() -> u64 {
+    REMAP_SKIPS.load(Ordering::Relaxed)
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new, and read-write.
+/// shows is new, and read-write. Copy-backs of submissions that began before
+/// leave it alone.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    // One report at a time (the guard lock): the epoch this one moves to.
+    let epoch = REMAP_EPOCH.load(Ordering::Relaxed) + 1;
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders.iter().filter(|c| c.3) {
+            c.1.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remapped
+                .insert(page, epoch);
+        }
+    }
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
@@ -827,6 +895,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    // After the marks: a submission seeing the new epoch takes the pages
+    // again.
+    REMAP_EPOCH.store(epoch, Ordering::Release);
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
@@ -1435,6 +1506,100 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// A copy's tracker tells the pages the runtime remapped after an epoch
+    /// from the others, and from pages remapped before it; a remap of the
+    /// whole range moves every page.
+    #[test]
+    fn copy_trackers_tell_pages_remapped_since_an_epoch() {
+        let p = pool(3);
+        let t = track_copy(p, 3 * PAGE, true).expect("pool memory is tracked");
+        let page = p / PAGE;
+        title_memory_remapped(p, PAGE);
+        let since = remap_epoch();
+        assert!(
+            !t.remapped_since(page, page + 3, since),
+            "remapped before the epoch"
+        );
+        title_memory_remapped(p + PAGE + 100, 8);
+        assert!(t.remapped_since(page + 1, page + 2, since));
+        assert!(
+            !t.remapped_since(page, page + 1, since)
+                && !t.remapped_since(page + 2, page + 3, since)
+        );
+        assert!(t.remapped_since(page, page + 3, since));
+        assert!(
+            !t.remapped_since(page, page + 3, remap_epoch()),
+            "nothing since now"
+        );
+        title_memory_remapped(p, 3 * PAGE);
+        assert!(t.remapped_since(page + 2, page + 3, since));
+        drop(t);
+        free(p);
+    }
+
+    /// Memory freed while a tracker holds it and allocated again at the same
+    /// address (the title's `VirtualFree`, which we do not see, then
+    /// `XMemVirtualAlloc`, which reports what it allocates as remapped): the
+    /// new memory has no guard, so a write there does not fault. Reported, it
+    /// is taken again and guarded again, so a later write counts; unreported,
+    /// the write is missed.
+    #[test]
+    fn memory_allocated_again_is_taken_again_once_reported() {
+        for report in [false, true] {
+            // Another test may allocate at the address between the free and
+            // the new allocation: then tried again elsewhere.
+            let (p, t) = (0..8)
+                .find_map(|_| {
+                    let p = pool(1);
+                    let t = track_copy(p, PAGE, true).expect("pool memory is tracked");
+                    assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+                    free(p);
+                    // SAFETY: a fresh allocation where ours was, freed below.
+                    let again = unsafe {
+                        VirtualAlloc(
+                            p as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    } as usize;
+                    if again == p {
+                        return Some((p, t));
+                    }
+                    if again != 0 {
+                        free(again);
+                    }
+                    None
+                })
+                .expect("an address allocated again");
+            if report {
+                title_memory_remapped(p, PAGE);
+            }
+            // SAFETY: our new allocation, read-write: no fault.
+            unsafe { ((p + 8) as *mut u8).write_volatile(7) };
+            if !report {
+                assert!(
+                    t.take(p, p + PAGE).is_empty(),
+                    "unreported, the write is missed"
+                );
+                drop(t);
+                free(p);
+                continue;
+            }
+            assert_eq!(
+                t.take(p, p + PAGE),
+                [(p, p + PAGE)],
+                "the new memory is taken"
+            );
+            assert!(t.clean());
+            // SAFETY: as above, guarded again by the take: the handler opens it.
+            unsafe { ((p + 9) as *mut u8).write_volatile(8) };
+            assert!(t.changed(p / PAGE), "a later write counts");
+            drop(t);
+            free(p);
+        }
     }
 
     /// A write or mapping that runs past the end of the address space (a
