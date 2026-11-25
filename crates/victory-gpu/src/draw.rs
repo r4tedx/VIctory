@@ -1632,13 +1632,16 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. Dispatch records are thread counts in groups of the
+    /// size `threads` packs ([`crate::threads::packed`]) unless it is 0.
+    /// False if it cannot run on the host.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        threads: u32,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
@@ -1700,7 +1703,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), threads) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
@@ -2023,6 +2026,78 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let pso = host.device.CreateComputePipelineState(&desc).unwrap();
             (root, pso)
+        }
+    }
+
+    /// Dispatches with the console flags `flags` of `counts` (direct, or
+    /// one record of an indirect dispatch whose signature argument carries
+    /// the flags) to a program of 64-thread groups, with the conversion on:
+    /// the groups that ran and the lanes that ran.
+    fn marked_groups(indirect: bool, flags: u32, counts: [u32; 3]) -> Option<[u32; 2]> {
+        const MARKS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer marks : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint ignored;
+    if (lane == 0) {
+        marks.InterlockedAdd(0, 1, ignored);
+    }
+    marks.InterlockedAdd(4, 1, ignored);
+}
+"#;
+        let host = crate::host::host()?;
+        let (root, pso) = compile_cs(MARKS);
+        let size = Some([64, 1, 1]);
+        let (marks, data) = host.shared_buffer(256).unwrap();
+        let (args, words) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffers, written before the list runs and
+        // read after it has; an open list with everything set.
+        unsafe {
+            data.cast::<[u32; 2]>().write_volatile([0, 0]);
+            words.cast::<[u32; 3]>().write_volatile(counts);
+            let clamped = indirect.then(|| {
+                let argument = [crate::threads::DISPATCH_SINGLE, flags, 0, 0];
+                let threads = crate::threads::indirect_thread_dims(argument).then_some(size).flatten();
+                let spec = (2, 12, 1);
+                crate::indirect::bound(&list, args.GetGPUVirtualAddress(), spec, crate::threads::packed(threads))
+                    .unwrap()
+            });
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+            match &clamped {
+                Some(clamped) => {
+                    let signature = host_signature(2, 12).unwrap();
+                    list.list.ExecuteIndirect(&signature, 1, clamped, 0, None, 0);
+                    crate::indirect::done(&list, clamped);
+                }
+                None => {
+                    let [x, y, z] = crate::threads::as_groups(true, size, flags, counts);
+                    list.list.Dispatch(x, y, z);
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            Some(data.cast::<[u32; 2]>().read_volatile())
+        }
+    }
+
+    /// With `USE_THREAD_DIMENSIONS` (0x20), 1000 threads in groups of 64
+    /// launch 16 groups, directly and through indirect execution; the last
+    /// group runs whole (1024 lanes, the shortcut in `crate::threads`).
+    /// Without the flag the counts stay group counts.
+    #[test]
+    fn thread_dimensions_launch_whole_groups() {
+        for indirect in [false, true] {
+            let Some(flagged) = marked_groups(indirect, 0x20, [1000, 1, 1]) else {
+                return; // no host GPU here
+            };
+            assert_eq!(flagged, [16, 1024], "indirect {indirect}");
+            let plain = marked_groups(indirect, 0, [1000, 1, 1]).unwrap();
+            assert_eq!(plain, [1000, 64_000], "indirect {indirect}");
         }
     }
 

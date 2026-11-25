@@ -25,7 +25,9 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+// threads: dispatch records are thread counts in groups of this size
+// (x, y, z in 11, 11 and 10 bits); 0: group counts.
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint threads; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
@@ -52,7 +54,14 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = args.Load3(at);
+        if (threads != 0) {
+            // Whole groups for thread counts (the console's
+            // USE_THREAD_DIMENSIONS).
+            uint3 size = uint3(threads & 0x7ff, threads >> 11 & 0x7ff, threads >> 22);
+            g = g / size + (uint3)(g % size != 0);
+        }
+        g = min(g, uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -192,6 +201,10 @@ fn make() -> windows::core::Result<Clamp> {
 /// execution. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp is not available.
 ///
+/// Dispatch records are thread counts in groups of the size `threads`
+/// packs ([`crate::threads::packed`]; 0: group counts): the clamped
+/// records are whole groups.
+///
 /// Title buffers' copies are never transitioned: they are common between
 /// submissions and every use promotes them (shader and root views, the
 /// input assembler, these reads), with unordered-access barriers for order.
@@ -203,7 +216,12 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    threads: u32,
+) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
@@ -212,7 +230,7 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, threads];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -297,7 +315,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
+                let clamped = super::bound(&list, gpu, spec, 0).unwrap();
                 super::done(&list, &clamped);
                 out = Some(clamped);
             }
@@ -379,7 +397,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    let out = super::bound(l, gpu, (2, 12, 1), 0).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
