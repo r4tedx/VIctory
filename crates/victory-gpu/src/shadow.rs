@@ -1475,7 +1475,7 @@ mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
-        let title = |at: usize| (p + at) as *mut u8;
+        let title = move |at: usize| (p + at) as *mut u8;
         let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
         copy.update(p, len);
         copy.writing(p, len, false);
@@ -1507,7 +1507,7 @@ mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
-        let title = |at: usize| (p + at) as *mut u8;
+        let title = move |at: usize| (p + at) as *mut u8;
         let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
         copy.update(p, len);
         copy.writing(p, len, true);
