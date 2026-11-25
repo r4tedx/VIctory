@@ -1032,6 +1032,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        crate::indirect::end(list);
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1082,6 +1083,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // Indirect executions after it clamp what it writes.
+        crate::indirect::end(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1193,11 +1196,38 @@ impl State {
     }
 
 
+    /// Whether the pipeline bound may write GPU memory: through unordered
+    /// access views (tables, root views, the heap itself), title memory at
+    /// addresses it computes, or marked views.
+    fn may_write(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| {
+            p.marks.is_some()
+                || p.stages.iter().any(|s| {
+                    let t = s.translated();
+                    !s.root_uavs.is_empty()
+                        || t.host.memory_writes
+                        || t.host.heap_writes
+                        || t.host.view_marks
+                        || t.used.iter().any(|r| r.kind == ResourceType::Uav)
+                })
+        })
+    }
+
+    /// Before a draw or mesh dispatch whose pipeline may write: the open
+    /// window of batched indirect clamps ends, so that executions after it
+    /// clamp what it writes.
+    fn end_clamps_if_writing(&self, list: &HostList) {
+        if list.clamps_open.load(Ordering::Relaxed) && self.may_write() {
+            crate::indirect::end(list);
+        }
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        self.end_clamps_if_writing(list);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1560,6 +1590,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        self.end_clamps_if_writing(list);
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1665,6 +1696,7 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        self.end_clamps_if_writing(list);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
             once!("indexed rectangles not drawn");
@@ -1781,18 +1813,41 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // Clamped in the open window of the list's indirect executions
+        // (`crate::indirect::batching`), or on its own here.
+        let batched = (crate::indirect::batching() && max != 0)
+            .then(|| {
+                // Host addresses as a copy's start and the offset in it.
+                let at = |s: &crate::shadow::Shadow, a: u64| (s.gpu(a) - s.offset(a), s.offset(a));
+                let count = counter.as_ref().map(|(s, a)| at(s, *a));
+                crate::indirect::member(list, at(&args, arguments), count, (kind, stride, max))
+            })
+            .flatten();
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(
-            list,
-            (&args.buffer, args.gpu(arguments)),
-            counter.as_ref().map(|(s, _)| &s.buffer),
-            (kind, stride, max),
-        ) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        let clamped = match batched {
+            Some(_) => None,
+            None => {
+                let Some(clamped) = crate::indirect::bound(
+                    list,
+                    (&args.buffer, args.gpu(arguments)),
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    (kind, stride, max),
+                ) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                Some(clamped)
+            }
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        let done = |list: &HostList| {
+            if let Some(clamped) = &clamped {
+                crate::indirect::done(list, clamped);
+            }
+        };
+        if batched.as_ref().is_none_or(|b| b.opened) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1808,7 +1863,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            done(list);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1828,16 +1883,25 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // Batched: the clamped records and count, in the list's memory.
+        // Else the list's own clamped records (`crate::indirect::bound`) and
+        // the title's count.
+        let (records, count) = match (&batched, &clamped) {
+            (Some(b), _) => ((&b.buffer, b.offset), counter.as_ref().map(|_| (&b.buffer, b.count))),
+            (None, Some(clamped)) => ((clamped, 0), counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)))),
+            (None, None) => unreachable!("bounded above"),
+        };
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh) or its own, the signature is
+        // cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &clamped,
-                0,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                records.0,
+                records.1,
+                count.map(|(b, _)| b),
+                count.map_or(0, |(_, at)| at),
             )
         };
         // A listed frame, or any frame for a traced shader: what the records
@@ -1847,12 +1911,15 @@ impl State {
             let always = !crate::host::traced_shaders().is_empty()
                 && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
             if always || crate::capture::dump_on() {
-                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, records, count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        done(list);
+        if batched.is_some() && (kind == DISPATCH || self.may_write()) {
+            // It may write later executions' records: they clamp after it.
+            crate::indirect::end(list);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
