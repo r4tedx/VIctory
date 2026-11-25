@@ -79,7 +79,7 @@ fn pixel(dword: u32, signature: &[u8]) -> HostShader {
     let res =
         victory_shader::resource::track(&ir, &native.layout, native.stage, Some(&st)).unwrap();
     let io = victory_shader::io::raise(&ir, &native).unwrap();
-    let host = victory_shader::emit::emit(&sig, &native, &ir, &st, &io, &res).unwrap();
+    let host = victory_shader::emit::emit(&sig, &native, &ir, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
     assert_eq!(
         host.user_data,
         [UserData {
@@ -121,6 +121,8 @@ fn pipeline(dword: u32, fixtures: &Fixtures) -> crate::object::This {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        heap_usage: false,
+        group_waves: 1,
     };
     let mut graphics = GraphicsState {
         topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -135,6 +137,7 @@ fn pipeline(dword: u32, fixtures: &Fixtures) -> crate::object::This {
         super::super::hand_out(
             vec![stage("vertex", vs), stage("pixel", ps)],
             Some(Box::new(graphics)),
+            &[],
             &super::super::PIPELINE_IIDS[0],
             &mut out
         ),
