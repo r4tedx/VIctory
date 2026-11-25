@@ -62,6 +62,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A compute program's thread-group size, read on first use.
+    #[cfg(windows)]
+    threads: OnceLock<Option<[u32; 3]>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -92,6 +95,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            threads: OnceLock::new(),
         }
     }
 }
@@ -141,6 +146,41 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// A compute program's thread-group size (`numthreads`) as the console
+    /// program declares it, read once from the container (no translation);
+    /// `None` for other stages or a container that does not parse.
+    pub(crate) fn compute_threads(&self) -> Option<[u32; 3]> {
+        *self.threads.get_or_init(|| compute_threads(&self.container))
+    }
+}
+
+/// The thread-group size of the compute program in `container`.
+#[cfg(windows)]
+fn compute_threads(container: &[u8]) -> Option<[u32; 3]> {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC};
+    let c = Container::parse(container).ok()?;
+    let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+    victory_shader::native_programs(part.data)
+        .ok()?
+        .into_iter()
+        .find_map(|p| match p.io {
+            StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+            _ => None,
+        })
+}
+
+/// The compute shader of title pipeline `this`, if it is a compute one.
+#[cfg(windows)]
+pub(crate) fn compute_shader<'a>(this: This) -> Option<&'a Shader> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.iter().find(|s| s.stage == "compute").map(|s| &**s)
 }
 
 /// This thread's processor time so far, user and kernel, in 100 ns units.

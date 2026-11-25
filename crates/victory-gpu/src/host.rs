@@ -3146,6 +3146,7 @@ impl Meter {
                 crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
             );
             crate::tiles::status();
+            crate::threads::log();
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
