@@ -55,7 +55,10 @@ pub(crate) struct HostHeap {
     /// in), the console descriptor's dwords 0-3 as far as the host knows
     /// them (shaders reading a descriptor as data, `crate::memory`;
     /// [`write_address`]): the buffer, its mapping and host address, made on
-    /// first use.
+    /// first use. Shaders clamp the heap index they read it at to
+    /// `HEAP_VIEWS` - 1, so it has 16 bytes for each slot below the larger
+    /// of its slot count and `HEAP_VIEWS`, as the view-stride table has
+    /// a dword (those past its slots read 0).
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -570,8 +573,11 @@ impl HostHeap {
             // every slot a table can lie in, the dynamic ones too (a table
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
-            // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
+            // buffer, or a GPU fault). Shaders clamp the heap index to
+            // `HEAP_VIEWS` - 1, so it also has an entry for each slot below
+            // that.
+            let slots = self.address_slots().max(victory_shader::emit::HEAP_VIEWS);
+            let (buffer, data) = host()?.upload_buffer(u64::from(slots) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -1080,7 +1086,7 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
     };
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
-    // slot (below `address_slots`).
+    // slot (below `address_slots`, and more, up to `HEAP_VIEWS`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
 }
 

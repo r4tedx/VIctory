@@ -544,6 +544,24 @@ impl Module {
         u
     }
 
+    /// Live `icmp` instructions comparing against constant `k` with `pred`.
+    #[cfg(test)]
+    pub fn live_cmps_with_const(&self, pred: u8, k: i64) -> u32 {
+        let live = self.live();
+        self.insts
+            .iter()
+            .enumerate()
+            .filter(|&(i, inst)| {
+                live[i]
+                    && matches!(
+                        inst.op,
+                        Op::Cmp(p, _, V::Const(c))
+                            if p == pred && self.consts[c as usize].1 == Const::Int(k)
+                    )
+            })
+            .count() as u32
+    }
+
     /// Which instructions are written: those [`Module::rooted`], the
     /// branch conditions, and whatever they read, transitively (a phi or a
     /// value nothing reads is dropped: lowering makes size queries for
