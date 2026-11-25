@@ -157,35 +157,23 @@ fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, us
     runs
 }
 
-/// Runs of a copy-back closer than this go into title memory as one span,
-/// with title memory's bytes between them as the copy-back read them: a
-/// copy per run cost over 1 ms per page in the world, where shaders change
-/// many scattered words of a page (a kernel copy each then; plain stores
-/// now, [`crate::watch::store`]).
-const SPAN_GAP: usize = 256;
-
-/// Writes the runs `[start, end)` of `merged` (title memory as read, with
-/// the shaders' bytes in the runs) into title memory at `at`, and nothing
-/// far from them: the title's threads write the same pages while a
-/// copy-back runs, and a byte they wrote after the copy-back read the page
-/// must stay. (Putting back the whole page undid those writes.) True if a
-/// run was written.
-fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
+/// Writes the runs `[start, end)` of `host` (the shaders' bytes) into title
+/// memory at `at`, and no other byte: the title's threads write the same
+/// pages while a copy-back runs, and a byte they wrote after the copy-back
+/// read the page must stay. (Putting back the whole page undid those
+/// writes, and so did joining runs closer than 256 bytes into one span with
+/// the title's bytes between them as read, which saved a kernel copy per
+/// run; runs are plain stores now, [`crate::watch::store`].) True if a run
+/// was written.
+fn write_runs(at: usize, host: &[u8], runs: &[(usize, usize)]) -> bool {
     if runs.is_empty() {
         return false;
     }
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for &(start, end) in runs {
-        match spans.last_mut() {
-            Some((_, last)) if start - *last < SPAN_GAP => *last = end,
-            _ => spans.push((start, end)),
-        }
-    }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::BackSpans, spans.len() as u64);
-    let _writing = crate::watch::writing(at, merged.len());
-    for (start, end) in spans {
-        crate::watch::store((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
+    crate::copystat::add(crate::copystat::C::BackSpans, runs.len() as u64);
+    let _writing = crate::watch::writing(at, host.len());
+    for &(start, end) in runs {
+        crate::watch::store((at + start) as *mut u8, host[start..].as_ptr(), end - start);
     }
     true
 }
@@ -1343,6 +1331,35 @@ mod tests {
             "both bytes, page 1"
         );
         assert_eq!(host(PAGE + 40), 0x88, "the copy reads the title's byte");
+        unregister(p, p as u64);
+    }
+
+    /// The title writes a byte between two the shaders changed 90 bytes
+    /// apart, just after the copy-back read the page: it stays, in title
+    /// memory and in the copy. (Runs closer than 256 bytes went back as one
+    /// span, with the title's bytes between them as read, which undid it.)
+    #[test]
+    fn a_title_write_between_close_runs_stays() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + 100) as u64, &[0xbb]);
+        AFTER_READ.with(|w| *w.borrow_mut() = vec![(p + 50, 0x77)]);
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[]);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(50), read(100)), (0xaa, 0x77, 0xbb));
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        assert_eq!(host(50), 0x77, "the copy reads the title's byte");
         unregister(p, p as u64);
     }
 
