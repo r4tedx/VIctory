@@ -3725,8 +3725,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Clears of one view in one list share one dynamic slot (a stand-in
     /// clears its view at each dispatch of its program): eight clears of a
-    /// view take one, a clear of another view one more, and the views hold
-    /// their last clears; the slots come back when the list is reset.
+    /// view take one from the list's run, a clear of another view one more,
+    /// and the views hold their last clears; the rest of the run comes back
+    /// when the list closes, the two slots when it is reset.
     #[test]
     fn clears_of_one_view_in_a_list_share_a_dynamic_slot() {
         let Some(host) = crate::host::host() else {
@@ -3769,15 +3770,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (free, _) = heap_host.dynamic_free();
         let list = host.new_list().unwrap();
         let mut state = State::default();
+        // Slots taken out of the list's runs ([`State::take_slots`]); the
+        // heap lends the list a whole run of [`LIST_RUN`] at once.
+        let taken = |s: &State| s.dynamic.held().slots.iter().map(|d| d.2).sum::<u32>() - (s.run.2 - s.run.1);
         state.set_heaps(&[heap]);
         for k in 1..=8 {
             assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true), "clear {k}");
         }
-        assert_eq!(heap_host.dynamic_free().0, free - 1, "eight clears of one view, one slot");
+        assert_eq!(taken(&state), 1, "eight clears of one view, one slot");
+        assert_eq!(heap_host.dynamic_free().0, free - LIST_RUN, "the list's run");
         assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 2, "another view, another slot");
+        assert_eq!(taken(&state), 2, "another view, another slot");
         assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 2, "the first view's slot again");
+        assert_eq!(taken(&state), 2, "the first view's slot again");
         for t in &textures {
             let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
             readable(&list, &used(ResourceType::Srv), &srv, false);
@@ -3785,6 +3790,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         run(&list, &slots, &read, 0, Some(&out), (N / 8, N / 8));
         list.close();
         state.close();
+        assert_eq!(heap_host.dynamic_free().0, free - 2, "the run's rest comes back at close");
         host.execute(&[&list]);
         for i in [0usize, 5, 7 * 16 + 9, 255] {
             // SAFETY: inside the mapped output, after the list ran.
@@ -3797,7 +3803,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // A new recording takes a slot afresh.
         state.set_heaps(&[heap]);
         assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 1);
+        assert_eq!(taken(&state), 1);
         list.close();
         host.execute(&[&list]);
         list.reset();
