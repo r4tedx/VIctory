@@ -8845,8 +8845,15 @@ impl<'a> Lower<'a> {
         // module in the per-lane form; in the console flow in halves, with
         // group barriers in its loops and branches, a title run lost its
         // device in two of them. Such a program stops here until the sample
-        // has a valid form.
-        if matches!(op, 60 | 61) && !self.s.pixel && self.console_cf && self.split {
+        // has a valid form. `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1` lets them
+        // through: both samples are then at a level (`sampleLevel`), as in
+        // the per-lane form.
+        if matches!(op, 60 | 61)
+            && !self.s.pixel
+            && self.console_cf
+            && self.split
+            && !(self.s.threads.is_some() && implicit_sample_compute())
+        {
             return Err(IMPLICIT_SAMPLE_IN_HALVES);
         }
         if op == 72 {
@@ -9030,6 +9037,34 @@ impl<'a> Lower<'a> {
                     });
                     self.s
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, opcode, &args)
+                }
+                61 if self.s.threads.is_some() && implicit_sample_compute() => {
+                    // `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`: a compute shader
+                    // has no derivatives (`sample_op`), so its biased sample
+                    // is at the bias as a level: level 0 plus the bias, in
+                    // the range of a sampler's own bias (signed 5.8 fixed
+                    // point, [`BIAS_MAX`]; a NaN takes the low end, as FMax
+                    // gives). `sampleBias` (61) is not a legal operation
+                    // there.
+                    // shortcut: level 0 where the console takes its level
+                    // from the quad's derivatives. Upgrade with quad
+                    // gradients (`sampleGrad`) if these passes blur.
+                    let bias = addr_val(self, 0)?;
+                    let bias = to_float(self, bias);
+                    let low = self.s.m.f32((-16.0f32).to_bits());
+                    let high = self.s.m.f32(BIAS_MAX.to_bits());
+                    let lod = self.binary(35, bias, low);
+                    let lod = self.binary(36, lod, high);
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
@@ -11101,6 +11136,41 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+}
+
+/// The bounds of a console sampler's LOD bias (signed 5.8 fixed point:
+/// -16 to 16 less one step of its 8 fraction bits), which the biased compute
+/// sample's level keeps to.
+const BIAS_MAX: f32 = 16.0 - 1.0 / 256.0;
+
+#[cfg(test)]
+thread_local! {
+    /// [`implicit_sample_compute`] for the tests on this thread.
+    static IMPLICIT_SAMPLE_COMPUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: translations on this thread as with
+/// `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1` (`on`) or without it.
+#[cfg(test)]
+pub(crate) fn set_implicit_sample_compute(on: bool) {
+    IMPLICIT_SAMPLE_COMPUTE.with(|c| c.set(on));
+}
+
+/// Whether compute programs whose samples take implicit derivatives
+/// (`image_sample`, `image_sample_b`) translate in the console flow in
+/// halves, with their biased samples at a level
+/// (`VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`; off otherwise). Opt-in until a
+/// title run shows those programs do not lose the device.
+pub fn implicit_sample_compute() -> bool {
+    #[cfg(test)]
+    {
+        IMPLICIT_SAMPLE_COMPUTE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_IMPLICIT_SAMPLE_COMPUTE").is_ok_and(|v| v == "1"))
     }
 }
 
