@@ -1008,6 +1008,9 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
+/// Typed depth formats with the colour formats shaders read them as.
+const DEPTH_READABLE: [(u32, u32); 4] = [(20, 21), (40, 41), (45, 46), (55, 56)];
+
 fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -1037,7 +1040,17 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     {
         format.0 = linear as i32;
     }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    let mut view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Shaders read a depth texture through its readable format; the host
+    // refuses a typed depth format in a shader resource view.
+    if !unordered
+        && let Some(&(_, readable)) = DEPTH_READABLE.iter().find(|&&(depth, _)| depth == view)
+    {
+        view = readable;
+        if let Some(format) = format.as_deref_mut() {
+            format.0 = readable as i32;
+        }
+    }
     if view == 0 {
         return !typeless;
     }
@@ -1429,6 +1442,34 @@ mod tests {
     use super::*;
 
     /// The world's 16-byte view of 0 elements removed the device.
+    /// A shader resource view of a depth texture the host made typeless,
+    /// described in the typed depth format, is made in the readable one.
+    #[test]
+    fn depth_formats_in_shader_resource_views_are_made_readable() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        let made = unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+        };
+        let (Ok(()), Some(texture)) = (made, texture) else { return };
+        let mut format = DXGI_FORMAT_D32_FLOAT;
+        assert!(fits(&texture, &[], Some(&mut format), false));
+        assert_eq!(format, DXGI_FORMAT_R32_FLOAT);
+    }
+
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
         assert!(within(64, 0, 4, 16));
