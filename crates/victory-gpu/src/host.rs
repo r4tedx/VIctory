@@ -1232,6 +1232,16 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // What the host wrote into lookup tables in video memory since the
+        // last submission (`VICTORY_TABLES_VRAM=copy`), before any list
+        // reads them; held until the submission has run.
+        let table_copies = crate::tables::copies(self);
+        if let Some(c) = &table_copies {
+            lists.insert(0, Some(c.list.clone()));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -3118,6 +3128,8 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // Over the same frames too.
+        let (table_bytes, table_copies) = crate::tables::take_copied();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -3147,6 +3159,13 @@ impl Meter {
                     d.exhausted,
                     d.short_runs,
                     crate::draw::held_by_ran(),
+                );
+            }
+            if table_copies > 0 {
+                tracing::info!(
+                    "host lookup tables copied into video memory: {:.2} MB/frame in {:.0} copies/frame",
+                    table_bytes as f64 / 1e6 / frames,
+                    table_copies as f64 / frames
                 );
             }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

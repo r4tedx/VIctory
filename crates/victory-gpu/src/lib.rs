@@ -64,6 +64,8 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod tables;
+#[cfg(windows)]
 mod threads;
 #[cfg(windows)]
 mod tdr;
