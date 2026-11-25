@@ -2452,6 +2452,23 @@ mod tests {
         assert_eq!(why(emit_for(&implicit_sample(false), RDNA)), None);
     }
 
+    /// The same in a group of two console waves sharing LDS, which runs as
+    /// one host group in the console flow in halves (`lower::groups`).
+    #[test]
+    fn implicit_samples_stop_groups_of_several_console_waves() {
+        let mut p = implicit_sample(true);
+        let crate::native::StageIo::Cs(io) = &mut p.io else {
+            unreachable!()
+        };
+        io.threads = [128, 1, 1];
+        io.rsrc2 |= 1 << 15;
+        assert!(matches!(
+            emit_for(&p, NVIDIA),
+            Err(crate::ShaderError::Unsupported { what, .. })
+                if what == super::lower::IMPLICIT_SAMPLE_IN_HALVES
+        ));
+    }
+
     #[test]
     fn console_lanes_translate_only_for_hosts_with_that_wave_size() {
         let words = [
