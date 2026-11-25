@@ -112,7 +112,8 @@ never read it there. Two opt-in switches act on that:
 | `VICTORY_GPU_UPLOAD_WRITES=1` (with the one above) | buffers shaders may write | a **mirror** in system memory |
 
 Both switches fall back to system memory when the GPU has no GPU upload
-heaps, and past a 2 GiB budget for these copies (`UPLOAD_BUDGET`; a copy's
+heaps, and past these copies' share of the video memory budget
+(`UPLOAD_POOL`, see [below](#video-memory-budget-and-residency); a copy's
 bytes are given back when D3D12 destroys its buffer). Copies
 of loose title memory and of single views (`loose`, `exact`) always stay
 in system memory.
@@ -236,6 +237,72 @@ come back. The snapshot path pays for bringing every declared range back
 before its compare (several GB per frame here): it needs marks to
 benefit.
 
+## Video memory budget and residency
+
+Windows gives each process a **video memory budget**
+(`IDXGIAdapter3::QueryVideoMemoryInfo`), for video memory (the local
+segment group) and for the system memory the GPU reads across the bus
+(non-local). It changes while running, as other processes take and free
+memory. When a process uses more than its budget, the video memory
+manager **demotes** some of its allocations to system memory. Shaders
+then reach them across PCI Express, which is 30 times slower or worse
+(see the tables above). If a render target or depth buffer is demoted,
+every frame waits on the bus, and frames take seconds.
+
+VIctory does two things about it.
+
+**Residency priorities.** The manager demotes allocations with the
+lowest residency priority first (`ID3D12Device1::SetResidencyPriority`).
+`crate::host::keep_resident` sets it where VIctory makes an allocation:
+
+| allocation | priority | why |
+|---|---|---|
+| host textures with the render target, depth stencil or unordered access flag | `HIGH` | the GPU writes them every frame, and they hold the only copy of what it wrote |
+| view heaps' stride, mark and address tables | `HIGH` | every draw reads them |
+| the views' written-pages bitmap | `HIGH` | shaders that mark their writes set it every frame |
+| list scratch chunks | `HIGH` | the list's commands read them |
+| host copies in GPU upload heaps | `HIGH` | shaders read them every frame; they are budgeted (below) |
+| host textures uploaded from title memory (`texture::title_written`) | `NORMAL` | streamed: each is read by some frames only, and sampling one from system memory is slower without stalling the frame |
+
+Descriptor heaps get none: on an RTX 5070 Ti (driver 621.24) a priority
+on a shader-visible descriptor heap removed the device at the next
+submission.
+
+`NORMAL` is what every allocation starts with, so streamed textures and
+everything VIctory does not name go first. `MAXIMUM` is not used: the
+system keeps such allocations even past the budget, at the cost of other
+processes. `LOW` is not used either: it would demote streamed textures
+before allocations that have no priority set (depth twins, upload
+staging), which frames need no more than these.
+
+**Pools sized from the budget.** `crate::budget` reads DXGI at most every
+250 ms, and again as soon as the system signals a budget change
+(`RegisterVideoMemoryBudgetChangeNotificationEvent`), so pools can ask it
+as often as they like. Bytes a pool takes between readings
+(`Budget::charge`) count as used until the next reading includes them.
+A pool asks `Budget::limit` how much it may hold now: a part of what the
+rest of the process leaves of the local budget, up to a ceiling. Its own
+bytes do not shrink the answer, everyone else's do.
+
+The copies in GPU upload heaps (`UPLOAD_POOL`) take half of what the rest
+of the process leaves. The ceiling is 2 GiB (the fixed size of before), or
+a quarter of the budget where that is more. On a host that reports no
+budget, the ceiling applies. A copy that does not fit stays in system
+memory, as before. Examples:
+
+| local budget | used by the rest of the process | copies may hold |
+|---|---|---|
+| 7.5 GB (8 GB card) | 2 GB | 2 GiB (ceiling) |
+| 7.5 GB | 5 GB | 1.25 GB |
+| 7.5 GB | 7.5 GB or more | nothing |
+| 15 GB (16 GB card) | 4 GB | 3.75 GB (a quarter of the budget) |
+
+The first time use passes nine tenths of the local budget, a warning
+names what VIctory knows takes it: host textures (all of them, and those
+lists used), host copies of title memory (all of them, and those in GPU
+upload heaps), and the non-local segment's use and budget. The check runs
+with each frame-rate line, whether or not a pool asks.
+
 ## Measuring a title
 
 The tests show the mechanism. Whether it pays off in a title depends on
@@ -246,8 +313,6 @@ and without the switches, together with the copy counters
 
 ## Further steps
 
-- Size the budget from DXGI's video memory budget instead of a fixed
-  2 GiB.
 - Move copies between pools while running, according to how they are
   used (read-mostly, written by shaders, or read back by the CPU).
 - Give snapshot ranges marks, or compare them on the GPU, so they no

@@ -1258,6 +1258,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
+    crate::host::keep_resident(&texture, crate::host::Residency::of_texture(d.flags));
     let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))
 }
@@ -1963,6 +1964,28 @@ mod tests {
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
+    }
+
+    /// A host texture is kept resident as its use says: render targets
+    /// before textures uploaded from title memory.
+    #[cfg(windows)]
+    #[test]
+    fn host_textures_are_kept_resident_by_use() {
+        use crate::host::{Residency, kept};
+        const RENDER_TARGET: u32 = 0x1;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let desc = texture(64, 64, 28, 1);
+        let target = ResourceDesc {
+            flags: RENDER_TARGET,
+            ..desc
+        };
+        let target = make_texture(&target, 0, std::ptr::null()).expect("a render target");
+        assert_eq!(kept(&target.texture), Some(Residency::Frame));
+        let streamed = make_texture(&desc, 0, std::ptr::null()).expect("a texture");
+        assert_eq!(kept(&streamed.texture), Some(Residency::Streamed));
+        assert!(crate::texture::title_written(&streamed.texture));
     }
 
     #[test]
