@@ -186,6 +186,8 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(all(test, windows))]
+mod cost_tests;
 pub mod counts;
 #[cfg(all(test, windows))]
 mod diff_tests;
