@@ -129,6 +129,16 @@ impl Shadow {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
     }
 
+    /// Marks the page of title address `address` as written through a view
+    /// of the copy, as shaders do (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_written(&self, address: u64) {
+        if let (Some((bit, _)), Some(b)) = (self.mark_entry(address), bitmap()) {
+            // SAFETY: a dword of the mapped bitmap; no submission runs.
+            unsafe { *(b.data as *mut u32).add(bit as usize / 32) |= 1 << (bit % 32) };
+        }
+    }
+
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
     /// which copy it is (diagnostics: what shaders see there).
     #[cfg(feature = "diagnostics")]

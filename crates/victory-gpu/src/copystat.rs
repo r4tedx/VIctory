@@ -112,6 +112,12 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// The counters since they were last taken or logged, by [`C`] (tests).
+#[cfg(test)]
+pub(crate) fn take() -> Vec<u64> {
+    COUNT.iter().map(|a| a.swap(0, Relaxed)).collect()
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
