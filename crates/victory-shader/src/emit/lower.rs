@@ -5210,7 +5210,9 @@ impl<'a> Lower<'a> {
     /// the bit is still clear (as buffer write marks do).
     ///
     /// The bitmap is a root view, which has no bounds, so the other lanes
-    /// branch around the atomic instead of being sent out of bounds.
+    /// branch around the atomic instead of being sent out of bounds. The
+    /// branch is at the end of the current block (`bitcode::Module::branch_at_end`),
+    /// which stays current.
     fn mark_heap_use(&mut self, index: V, _uniform: bool) {
         let bitmap = self.s.heap_used_handle();
         let c = self.cur;
@@ -5233,18 +5235,24 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bool(true);
         let differ = self.s.m.bin(c, Bin::Xor, equal, t);
         let marks = self.s.m.bin(c, Bin::Or, first, differ);
-        let at = self.begin_guarded(Some(marks));
+        // The branch goes at the end of this block, which stays current:
+        // callers keep emitting into the block they started in, and a new
+        // current block broke dominance there ("forward reference outside
+        // a phi").
+        let (then, atomic, tail) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         // Most reads find their slot marked: a load, not an atomic (the
         // bitmap is in system memory, so each atomic crosses the bus).
-        let c = self.cur;
         let zero = k(self, 0);
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        let inner = self.begin_guarded(Some(clear));
-        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
-        self.end_guarded(inner, &[]);
-        self.end_guarded(at, &[]);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let old = self.s.op(then, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[bitmap, word, iu, mask, align]);
+        let old = self.s.m.extract(then, old, 0);
+        let old = self.s.m.cast(then, Cast::Bitcast, old, self.s.t.i32);
+        let set = self.s.m.bin(then, Bin::And, old, bit);
+        let clear = self.s.m.cmp(then, pred::EQ, set, zero);
+        self.s.m.terminate(then, Term::CondBr(clear, atomic, tail));
+        self.s.op(atomic, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.s.m.terminate(atomic, Term::Br(tail));
+        self.s.m.branch_at_end(c, marks, then, tail);
     }
 
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
