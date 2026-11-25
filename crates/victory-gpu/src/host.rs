@@ -674,13 +674,21 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
-/// Whether each list of a submission runs and is timed on its own, slow
-/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// Whether each list of a submission is timed on its own, and slow ones are
+/// logged with their commands (`VICTORY_GPU_TIMING`, diagnostics builds; the
+/// commands are noted with `VICTORY_D3D12_DRED` or the timing on).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// Whether recorded commands are noted at all: with device-removed data (the
+/// markers) or with GPU timing (the per-command timestamps) on.
+#[cfg(feature = "diagnostics")]
+fn noting() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dred_on() || timing())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1263,14 +1271,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                }
+            if timing() {
+                let times = runs[i].timed(self.frequency());
+                report_list(&times, started.elapsed().as_secs_f64() * 1e3);
             }
             // SAFETY: a plain query.
             if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -1427,6 +1430,13 @@ impl Host {
         // The title's clock when the host GPU's read `gpu`.
         let since = (i128::from(now) - i128::from(cpu)) * ticks / i128::from(cpu_frequency.max(1));
         (frequency > 0).then_some(Clock { gpu, at: i128::from(title_now) - since, frequency, now: title_now })
+    }
+
+    /// The queue's timestamp frequency (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1710,10 +1720,10 @@ impl HostList {
             .as_ref()
     }
 
-    /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// The noted commands' GPU time, longest first, as (milliseconds, text)
+    /// (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn timed(&self, frequency: u64) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
             return Vec::new();
@@ -1736,7 +1746,6 @@ impl HostList {
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
         times
     }
 
@@ -1991,8 +2000,10 @@ impl HostList {
 
     /// Notes what the command about to be recorded does, as a marker
     /// command whose text the list keeps (diagnostics, with device-removed
-    /// data on): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// data or GPU timing on): the device-removed report pairs the
+    /// breadcrumbs' marker commands with the texts in order and names the
+    /// commands a fault stopped among, and the timing report adds up the
+    /// commands' GPU time by pipeline.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);
@@ -2007,20 +2018,24 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        // Timed notes are what `VICTORY_GPU_TIMING` reports on; markers are
+        // only what the device-removed report pairs with breadcrumbs.
+        if noting() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
-            traced(&what);
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                traced(&what);
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3159,6 +3174,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
+                costs::log(frames);
             }
         }
         if self.caption.is_none() {
@@ -3771,6 +3787,120 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     }
     let _ = (runs, list);
     String::new()
+}
+
+/// With `VICTORY_GPU_TIMING`: adds one list's noted commands to the cost
+/// table, naming its slowest ones when it took over 50 ms on the GPU
+/// (diagnostics). `wall_ms` is how long the list's submission took.
+#[cfg(feature = "diagnostics")]
+fn report_list(times: &[(f64, String)], wall_ms: f64) {
+    costs::add(times, wall_ms);
+    let total: f64 = times.iter().map(|(ms, _)| ms).sum();
+    if total > 50.0 {
+        tracing::warn!(
+            ms = total,
+            wall_ms,
+            commands = times.len(),
+            "slow host list"
+        );
+        for (ms, op) in times.iter().take(6) {
+            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+        }
+    }
+}
+
+/// What a note runs, for the GPU cost table: the kind of command, its size,
+/// and the pipeline it binds ("draw 36x1 [vs 12ab, ps 34cd]", without the
+/// views and tables that follow). Notes that name resources rather than a
+/// pipeline keep the first words that are not addresses ("copy to",
+/// "texture upload").
+#[cfg(feature = "diagnostics")]
+fn cost_label(text: &str) -> String {
+    let head = text.split(" | ").next().unwrap_or(text);
+    if head.contains('[') {
+        // Addresses differ per draw; drop them so that the same pass adds up.
+        let words: Vec<&str> = head
+            .split(' ')
+            .filter(|w| !w.starts_with("0x") && *w != "at")
+            .collect();
+        return words.join(" ").chars().take(160).collect();
+    }
+    let words: Vec<&str> = head
+        .split(' ')
+        .take_while(|w| w.chars().all(|c| c.is_ascii_alphabetic()))
+        .collect();
+    words.join(" ")
+}
+
+/// With `VICTORY_GPU_TIMING`: the GPU time the noted commands took since the
+/// last report, added up by what they ran, so that a frame's cost can be read
+/// off by pipeline (diagnostics).
+#[cfg(feature = "diagnostics")]
+mod costs {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Commands, their GPU milliseconds, and the lists and wall milliseconds
+    /// they came from, since the last report.
+    #[derive(Default)]
+    struct Tally {
+        by_label: HashMap<String, (u64, f64)>,
+        noted: f64,
+        lists: u64,
+        wall: f64,
+    }
+
+    static TALLY: Mutex<Option<Tally>> = Mutex::new(None);
+
+    /// Adds one list's noted commands, as (GPU milliseconds, note) longest
+    /// first, and how long the list took to run (wall milliseconds).
+    pub(super) fn add(times: &[(f64, String)], wall_ms: f64) {
+        let mut tally = TALLY.lock().unwrap_or_else(|e| e.into_inner());
+        let tally = tally.get_or_insert_with(Tally::default);
+        tally.lists += 1;
+        tally.wall += wall_ms;
+        for (ms, text) in times {
+            let entry = tally.by_label.entry(super::cost_label(text)).or_default();
+            entry.0 += 1;
+            entry.1 += ms;
+            tally.noted += ms;
+        }
+    }
+
+    /// Logs the biggest items per frame since the last call, longest first.
+    pub(super) fn log(frames: f64) {
+        let Some(mut tally) = TALLY.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        if tally.lists == 0 {
+            return;
+        }
+        let mut items: Vec<(String, (u64, f64))> = tally.by_label.drain().collect();
+        items.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        let noted = tally.noted.max(1e-6);
+        let per_frame = |v: f64| v / frames;
+        let commands: u64 = items.iter().map(|(_, (n, _))| *n).sum();
+        let waited = if tally.wall > 0.0 {
+            format!(", {:.1} ms wall/frame", per_frame(tally.wall))
+        } else {
+            String::new()
+        };
+        tracing::info!(
+            "GPU cost by pipeline: {:.1} ms/frame over {:.0} lists ({:.0} commands/frame{waited})",
+            per_frame(tally.noted),
+            per_frame(tally.lists as f64),
+            per_frame(commands as f64)
+        );
+        for (label, (n, ms)) in items.iter().take(16) {
+            tracing::info!(
+                "{:.2} ms/frame ({:.0}% of noted, {:.3} ms each, {:.1}/frame): {label}",
+                per_frame(*ms),
+                100.0 * ms / noted,
+                ms / (*n).max(1) as f64,
+                per_frame(*n as f64)
+            );
+        }
+    }
 }
 
 /// For adapters without device-removed data (the software one): the last

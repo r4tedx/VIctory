@@ -2,8 +2,10 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -542,6 +544,24 @@ pub(crate) fn report<T>(
     eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
+/// With `VICTORY_NAME_SHADERS=<file>`: appends `<hash>\t<source>` for a shader
+/// container, where `<hash>` is the one the runtime logs for it, so a pipeline
+/// named by hash in a runtime log can be named by source.
+fn name_shader(container: &[u8], path: &Path, source: &Source) {
+    static OUT: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let file = std::env::var_os("VICTORY_NAME_SHADERS")?;
+        std::fs::File::create(file).ok().map(Mutex::new)
+    }) else {
+        return;
+    };
+    let hash = blake3::hash(container).to_hex()[..16].to_string();
+    let line = format!("{hash}\t{}{}\n", path.display(), source.label());
+    if let Ok(mut file) = out.lock() {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -554,6 +574,7 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
+    name_shader(&bytes, path, source);
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
