@@ -1258,6 +1258,8 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
+    // Committed: the texture takes its own priority (a placed one would
+    // take its heap's, `keep_resident`).
     crate::host::keep_resident(&texture, crate::host::Residency::of_texture(d.flags));
     let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))

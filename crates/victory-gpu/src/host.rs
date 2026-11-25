@@ -653,10 +653,13 @@ impl Residency {
     }
 }
 
-/// Sets `object`'s (a heap or resource) residency priority as `residency`
-/// says. Called where such objects are made. Not for descriptor heaps: a
-/// priority on a shader-visible one removed the device at the next
-/// submission (RTX 5070 Ti, driver 621.24).
+/// Sets `object`'s (a heap or committed resource) residency priority as
+/// `residency` says. Called where such objects are made. Not for
+/// descriptor heaps: a priority on a shader-visible one removed the device
+/// at the next submission (RTX 5070 Ti, driver 621.24). Not for resources
+/// placed in a heap either: their residency is their heap's, which takes
+/// the priority instead (asked of a placed texture, the call removed the
+/// device at the next submission too).
 pub(crate) fn keep_resident(object: &impl Interface, residency: Residency) {
     #[cfg(test)]
     KEPT.lock()
