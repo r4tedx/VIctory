@@ -7691,15 +7691,25 @@ impl<'a> Lower<'a> {
         }
         // With a16, two 16-bit components per VGPR, low half first, after
         // the offset, bias and compare value, which keep a VGPR each (an f16
-        // bias in its low half).
-        let extra = name
-            .strip_prefix("image_sample")
-            .or_else(|| name.strip_prefix("image_gather4"))
-            .map_or(0, |rest| {
-                rest.split('_')
-                    .filter(|t| matches!(*t, "o" | "b" | "c"))
-                    .count()
-            });
+        // bias in its low half), and after the derivatives, a 32-bit float
+        // each: a16 sizes the coordinates and the level only (GFX10.3; 16-bit
+        // derivatives are the `_g16` opcodes).
+        let derivatives = match (name, kind) {
+            ("image_sample_d" | "image_sample_d_cl", 5) => 4,
+            ("image_sample_d" | "image_sample_d_cl", _) => {
+                2 * (coords - usize::from(kind == 6 || kind == 7))
+            }
+            _ => 0,
+        };
+        let extra = derivatives
+            + name
+                .strip_prefix("image_sample")
+                .or_else(|| name.strip_prefix("image_gather4"))
+                .map_or(0, |rest| {
+                    rest.split('_')
+                        .filter(|t| matches!(*t, "o" | "b" | "c"))
+                        .count()
+                });
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
             let packed = *a16 && k >= extra;
             let r = *regs
@@ -8122,7 +8132,7 @@ impl<'a> Lower<'a> {
                     let mut g = [fu; 4];
                     for (k, x) in g.iter_mut().enumerate() {
                         let v = addr_val(self, first + k)?;
-                        *x = to_float(self, v);
+                        *x = self.as_float(v);
                     }
                     let i32t = self.s.t.i32;
                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -8162,16 +8172,12 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
-                        return Err("16-bit gradients of a 1D or 3D image");
-                    }
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
+                        g[k] = self.as_float(x);
                         let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
