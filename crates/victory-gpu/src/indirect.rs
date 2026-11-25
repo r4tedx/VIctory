@@ -799,6 +799,9 @@ pub(crate) struct Batch {
     records: Pool,
     charges: Pool,
     room: u32,
+    /// Narrow waits ([`narrow_waits`]) for this list whatever the switch
+    /// says (tests).
+    narrow: Option<bool>,
 }
 
 /// The open window: its table (upload memory the list holds: the window's
@@ -1001,6 +1004,16 @@ fn open(
     // window's end writes how many).
     unsafe { data.cast::<[u32; 2]>().write([0, 0]) };
     let l = &list.list;
+    // Whether a draw's shaders may have written since the last wait on all
+    // shading (the next pass waits on all of it if so).
+    let draws_wrote = list
+        .draw_writes
+        .swap(false, std::sync::atomic::Ordering::Relaxed);
+    let narrow = batch
+        .narrow
+        .unwrap_or_else(narrow_waits)
+        .then(|| l.cast::<ID3D12GraphicsCommandList7>().ok())
+        .flatten();
     // SAFETY: an open list; our root signature, pipelines and command
     // signature; the table is upload memory the list holds, the chunks are
     // the list's (unordered access outside windows), the budget its word.
@@ -1010,8 +1023,16 @@ fn open(
         list.note_op(|| "batched indirect clamps".to_string());
         // Earlier shader writes first: the title's argument passes, in
         // buffers the window's executions name only later (so not scoped),
-        // and earlier clamps' budget.
-        l.ResourceBarrier(&[uav_barrier()]);
+        // and earlier clamps' budget. Narrow: on the stages that may have
+        // written, so the pixel work of draws before keeps running.
+        match &narrow {
+            Some(l7) => global_barrier(
+                l7,
+                pass_waits_on(draws_wrote),
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+            ),
+            None => l.ResourceBarrier(&[uav_barrier()]),
+        }
         l.SetComputeRootSignature(&b.root);
         l.SetPipelineState(&b.gather);
         l.SetComputeRootUnorderedAccessView(3, records_buffer.GetGPUVirtualAddress() + records_at);
@@ -1022,8 +1043,18 @@ fn open(
         // A command per run of the window: the table's first word, written
         // when the window ends.
         l.ExecuteIndirect(&b.signature, RUNS, &table, at + COMMANDS_AT, &table, at);
-        // The charge reads what the gather wrote, in the window's chunks.
-        l.ResourceBarrier(&[uav_barrier_for(&records_buffer), uav_barrier_for(&charges)]);
+        // The charge reads what the gather wrote, in the window's chunks:
+        // narrow, a wait on compute only.
+        match &narrow {
+            Some(l7) => global_barrier(
+                l7,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            ),
+            None => {
+                l.ResourceBarrier(&[uav_barrier_for(&records_buffer), uav_barrier_for(&charges)])
+            }
+        }
         // It reads only the root arguments set above, which the commands
         // leave as they were.
         l.SetPipelineState(&b.charge);
@@ -1095,6 +1126,100 @@ pub(crate) fn reset(list: &HostList) {
     for pool in [&mut batch.records, &mut batch.charges] {
         (pool.current, pool.used) = (0, 0);
     }
+}
+
+/// Whether batched windows wait with enhanced barriers on the stages that
+/// may have written what their pass reads, not on all earlier work
+/// (`VICTORY_NARROW_WAITS=1` with [`batching`], where the host has
+/// enhanced barriers). Based on ztrx#139 by ROZEREX, which does this for
+/// the per-call clamp.
+///
+/// A window's pass reads argument buffers its executions name only after
+/// the pass is recorded, so its first wait cannot name them: it is a
+/// global barrier either way. Legacy, it is a UAV barrier on every
+/// resource, which waits for all earlier work, the pixel shading of the
+/// draws before included. Narrow, it waits for compute, copies and
+/// unordered access clears, and for all shading only when a draw whose
+/// pipeline may write ran since the last wait on all of it (the title's
+/// own barriers are such waits, and a list starts with one owed): see
+/// [`pass_waits_on`]. The wait between the pass's two dispatches is on
+/// compute only. The transitions of the window's records and the budget's
+/// barrier stay legacy (the per-call clamp and the capture use the same
+/// buffers that way).
+pub(crate) fn narrow_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !(crate::switch::on("VICTORY_NARROW_WAITS") && batching()) {
+            return false;
+        }
+        let on = enhanced_barriers();
+        tracing::info!(
+            on,
+            "batched indirect clamps: narrow waits (VICTORY_NARROW_WAITS)"
+        );
+        on
+    })
+}
+
+/// Whether the host device has enhanced barriers (OPTIONS12).
+fn enhanced_barriers() -> bool {
+    let Some(host) = host() else { return false };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a plain query into a struct of the size given.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            std::ptr::from_mut(&mut options).cast(),
+            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+        )
+    }
+    .is_ok();
+    ok && options.EnhancedBarriersSupported.as_bool()
+}
+
+/// The stages a window's first wait waits on (narrow): those that write
+/// buffers without a draw (compute, copies, unordered access clears), and
+/// all shading if a draw's shaders may have written since the last wait
+/// on it.
+fn pass_waits_on(draws_wrote: bool) -> D3D12_BARRIER_SYNC {
+    let writers = D3D12_BARRIER_SYNC_COMPUTE_SHADING
+        | D3D12_BARRIER_SYNC_COPY
+        | D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW;
+    if draws_wrote {
+        writers | D3D12_BARRIER_SYNC_ALL_SHADING
+    } else {
+        writers
+    }
+}
+
+/// Records an enhanced global barrier: writes (`before`, of the stages
+/// `sync`) finish and are visible before the pass's compute reads and
+/// writes.
+///
+/// # Safety
+/// An open list.
+unsafe fn global_barrier(
+    l7: &ID3D12GraphicsCommandList7,
+    sync: D3D12_BARRIER_SYNC,
+    before: D3D12_BARRIER_ACCESS,
+) {
+    let barrier = [D3D12_GLOBAL_BARRIER {
+        SyncBefore: sync,
+        SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        AccessBefore: before,
+        AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+    }];
+    // SAFETY: an open list (the caller's); the barrier lives through the
+    // call and names no resource.
+    unsafe {
+        l7.Barrier(&[D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pGlobalBarriers: barrier.as_ptr(),
+            },
+        }])
+    };
 }
 
 /// A UAV barrier on every resource (null `pResource`).
@@ -1527,9 +1652,28 @@ mod tests {
     /// budget included (spent on the way, so active records run empty from
     /// there). The 150 batched executions mix counted and uncounted calls
     /// across several windows, with clamps one by one before and after them.
-    /// The batched source records stay as written.
+    /// The batched source records stay as written. With legacy waits and
+    /// with narrow ones (where the host has enhanced barriers).
     #[test]
     fn batched_clamps_leave_what_clamps_one_by_one_leave() {
+        for narrow in [false, true] {
+            if narrow_or_skip(narrow) {
+                clamps_one_by_one_and_batched(narrow);
+            }
+        }
+    }
+
+    /// Whether a test runs `narrow` (narrow waits need enhanced barriers).
+    fn narrow_or_skip(narrow: bool) -> bool {
+        if narrow && !super::enhanced_barriers() {
+            eprintln!("no enhanced barriers on this host: narrow waits not tested");
+            return false;
+        }
+        true
+    }
+
+    /// The body of [`batched_clamps_leave_what_clamps_one_by_one_leave`].
+    fn clamps_one_by_one_and_batched(narrow: bool) {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
@@ -1580,6 +1724,7 @@ mod tests {
         // Batched, but the first five and the last five.
         let (new, new_data, _) = fill(&calls);
         let batched = host.new_list().unwrap();
+        batched.clamps.lock().unwrap().narrow = Some(narrow);
         // SAFETY: a live buffer.
         let new_gpu = unsafe { new.GetGPUVirtualAddress() };
         let mut members = Vec::new();
@@ -1685,7 +1830,7 @@ mod tests {
             "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
              [RootSignature(RS)][numthreads(1, 1, 1)] void main() { b.Store3(0, uint3(5, 6, 7)); }",
         );
-        let run = |ends: bool| {
+        let run = |ends: bool, narrow: bool| {
             let (buffer, data) = host.shared_buffer(512).unwrap();
             let data = data.cast::<u32>();
             // SAFETY: our mapped buffer, before the list runs.
@@ -1697,6 +1842,7 @@ mod tests {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             let list = host.new_list().unwrap();
+            list.clamps.lock().unwrap().narrow = Some(narrow);
             let first = super::member(&list, (gpu, 0), None, (2, 12, 1)).unwrap();
             assert!(first.opened);
             if ends {
@@ -1723,8 +1869,65 @@ mod tests {
             host.execute(&[&list]);
             (words_of(&back, starts[0], 3), words_of(&back, starts[1], 3))
         };
-        assert_eq!(run(true), (vec![1, 1, 1], vec![5, 6, 7]));
-        assert_eq!(run(false), (vec![1, 1, 1], vec![1, 1, 1]));
+        for narrow in [false, true] {
+            if narrow_or_skip(narrow) {
+                // Narrow, the dispatch is a compute write the pass waits on.
+                assert_eq!(
+                    run(true, narrow),
+                    (vec![1, 1, 1], vec![5, 6, 7]),
+                    "narrow {narrow}"
+                );
+                assert_eq!(
+                    run(false, narrow),
+                    (vec![1, 1, 1], vec![1, 1, 1]),
+                    "narrow {narrow}"
+                );
+            }
+        }
+    }
+
+    /// A narrow pass waits on compute, copies and clears always, and on all
+    /// shading only when a draw may have written since the last wait on it.
+    #[test]
+    fn a_narrow_pass_waits_on_all_shading_only_after_draw_writes() {
+        let without = super::pass_waits_on(false);
+        let with = super::pass_waits_on(true);
+        for stage in [
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW,
+        ] {
+            assert_eq!(without.0 & stage.0, stage.0);
+            assert_eq!(with.0 & stage.0, stage.0);
+        }
+        assert_eq!(without.0 & D3D12_BARRIER_SYNC_ALL_SHADING.0, 0);
+        assert_ne!(with.0 & D3D12_BARRIER_SYNC_ALL_SHADING.0, 0);
+    }
+
+    /// A list starts owing a wait on draws (earlier lists' draws), a window's
+    /// pass pays it, and a reset owes it again.
+    #[test]
+    fn a_list_owes_a_wait_on_draws_until_a_pass_waits() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: our mapped buffer, before the list runs; a live buffer.
+        let gpu = unsafe {
+            data.cast::<u32>().write_bytes(0, 3);
+            buffer.GetGPUVirtualAddress()
+        };
+        let list = host.new_list().unwrap();
+        assert!(list.draw_writes.load(Relaxed), "a new list owes one");
+        super::member(&list, (gpu, 0), None, (2, 12, 1)).unwrap();
+        assert!(!list.draw_writes.load(Relaxed), "the pass waited");
+        super::end(&list);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.draw_writes.load(Relaxed), "a reset list owes one");
+        list.close();
     }
 
     /// Executions read the window's records and counts: draws, a mesh

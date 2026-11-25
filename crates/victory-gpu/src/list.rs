@@ -383,6 +383,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
+        let waits_on_all = host.iter().any(|b| b.kind == 2 && b.first.is_null());
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -396,6 +397,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            // A UAV barrier on every resource waits for all earlier work:
+            // no wait on draws is owed (`crate::indirect::narrow_waits`).
+            if waits_on_all {
+                list.draw_writes
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     0
@@ -1381,6 +1388,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // It waits for all earlier work (`crate::indirect::narrow_waits`).
+        list.draw_writes
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
     #[cfg(not(windows))]
     let _ = (this, count);

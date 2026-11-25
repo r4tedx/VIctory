@@ -497,6 +497,11 @@ pub(crate) struct HostList {
     /// open (checked without the lock by every command that may write).
     pub(crate) clamps: Mutex<crate::indirect::Batch>,
     pub(crate) clamps_open: std::sync::atomic::AtomicBool,
+    /// Whether a draw whose shaders may write GPU memory ran since the last
+    /// wait on all shading in the list (a list starts owing one: earlier
+    /// lists' draws). The next batched window's pass then waits on all of
+    /// it (`crate::indirect::narrow_waits`).
+    pub(crate) draw_writes: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -801,6 +806,7 @@ impl Host {
                 budget: OnceLock::new(),
                 clamps: Mutex::default(),
                 clamps_open: false.into(),
+                draw_writes: true.into(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1383,6 +1389,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         crate::indirect::reset(self);
+        self.draw_writes.store(true, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();

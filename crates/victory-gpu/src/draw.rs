@@ -1043,10 +1043,18 @@ impl State {
 
     /// Before a draw or mesh dispatch whose pipeline may write: the open
     /// window of batched indirect clamps ends, so that executions after it
-    /// clamp what it writes.
+    /// clamp what it writes, and (narrow waits) the next window's pass
+    /// waits on all shading.
     fn end_clamps_if_writing(&self, list: &HostList) {
-        if list.clamps_open.load(Ordering::Relaxed) && self.may_write() {
-            crate::indirect::end(list);
+        let open = list.clamps_open.load(Ordering::Relaxed);
+        let narrow = crate::indirect::narrow_waits();
+        if (open || narrow) && self.may_write() {
+            if narrow {
+                list.draw_writes.store(true, Ordering::Relaxed);
+            }
+            if open {
+                crate::indirect::end(list);
+            }
         }
     }
 
@@ -1736,7 +1744,12 @@ impl State {
             crate::capture::read_indirect(list, records, count, (kind, stride, max), name);
         }
         done(list);
-        if batched.is_some() && (kind == DISPATCH || self.may_write()) {
+        let writes = (batched.is_some() || crate::indirect::narrow_waits()) && self.may_write();
+        if kind != DISPATCH && writes && crate::indirect::narrow_waits() {
+            // Its draws may write: the next window's pass waits on them.
+            list.draw_writes.store(true, Ordering::Relaxed);
+        }
+        if batched.is_some() && (kind == DISPATCH || writes) {
             // It may write later executions' records: they clamp after it.
             crate::indirect::end(list);
         }
