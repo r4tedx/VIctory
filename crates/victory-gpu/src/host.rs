@@ -1084,6 +1084,12 @@ impl Host {
         }
     }
 
+    /// The queue lists run on: tile mappings (`crate::tiles`) go on it
+    /// ahead of the lists submitted after them.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -3018,6 +3024,7 @@ impl Meter {
                 crate::descriptor::USAGE.2.swap(0, Ordering::Relaxed),
                 crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
             );
+            crate::tiles::status();
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
