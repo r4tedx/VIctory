@@ -326,3 +326,111 @@ No unit tests were run for this layer. Only test compilation was
 checked (above). #2085's new synthetic tests loop over `("hardware",
 false), ("warp", true)`. Run them only with hardware turned off, or not
 at all, while the hardware hold is in place.
+
+## Layer 4 final (`gpu-run/layer4-final`)
+
+Base: `gpu-run/layer4` at `01c5d98d`. Each piece is one `git merge
+--no-ff` and keeps its authorship. After each merge, `cargo check --locked
+-p victory --features diagnostics` passed through `heavy-run --light`,
+with `CARGO_TARGET_DIR=C:\Users\PC\.t3\targets\layer4-final`.
+
+| # | Piece | Source SHA | Merge | Conflicts |
+|---|-------|-----------|-------|-----------|
+| 1 | upstream #2294: a typed depth format in a shader resource view is made in the readable colour format | `298a0067` | `0245d605` | `descriptor/host.rs`, tests only |
+| 2 | upstream #2269: marks in the last dword of the written-pages bitmap are not discarded | `a8bc74c8` | `2dc089a2` | `shadow.rs`, tests only |
+| 3 | upstream #2295: the fifth dword of a root constants parameter is read as a constant | `ec236e64` | `972ed409` | none |
+| 4 | fork `gpu/ambient-stand-in`: opt-in `VICTORY_AMBIENT` | `2f829fb4` | `c43cf5f6` | none |
+| 5 | fork `gpu-run/layer4-wpg`: wave-per-group `6551f220` on layer 4, rect clippy fix `15ac13f1`, upstream #2306 `a4057f25` | `a47125be` | `b12f7683` | none here (its own are in its merge `4330dba8`) |
+| 6 | fork `play/layer4-library-saves`: the pipeline library is saved after 256 new pipelines or 60 s | `9baeb2de` | `83a7b32a` | none |
+| 7 | fork `gpu/dynamic-slots-no-drops` `a6cd2b68`, ported as `play/layer4-dynamic-slots` | `d0e2d2c3` | `abe0ed49` | `descriptor/host.rs`, `draw.rs`, see below |
+| 8 | fork `play/layer4-1962-memory`: #1873 `81ebd7c6`, #2221 `df15bd1e` (in place of #1969), #2161 `e04431f7`, idle staging buffers released | `47bb09c9` | `80440ae9` | none |
+| 9 | fork `gpu/shadow-stand-in`: opt-in `VICTORY_STAND_IN` | `669f7ff5` | `6188353e` | `draw.rs`, see below |
+
+Between pieces 7 and 8: `cd2d17ec` "GPU tests: the root constant pixel
+test follows layer 4's shader API". This commit changes test code only.
+
+### Left out
+
+- `play/layer4-2130-2389` (#2130 with #2222, and #2389): not final when
+  this layer was handed over. It conflicts with piece 8 in `texture.rs`
+  (`Staging::refresh_now`, the `Staging` fields) and `resource.rs` (the
+  `placed` argument of `shared_texture` belongs in #2221's
+  `host_texture()`), and with piece 1 in a test module. It is to follow
+  as its own head.
+- Upstream #2306 was not merged on its own: piece 5 carries it.
+
+### Conflict resolutions
+
+- Pieces 1 and 2: each side added a test at the same place in a test
+  module. Both tests are kept.
+- Piece 7 (in `d0e2d2c3`): `descriptor/host.rs`, layer 4's
+  `fallback_samplers()` and the fix's `Slots` allocator were added at
+  the same place; both are kept, `fallback_samplers()` first.
+  `draw.rs`, layer 4's `SAMPLERS_OURS` next to `ROOT_VIEW_RUN`, whose
+  doc comment the fix rewrote; both are kept. The fix branch's own merge
+  of #2295 adds nothing here (piece 3).
+- Piece 9, `draw.rs` `dispatch()`: layer 4's batched clamps end the
+  list's open clamp window at the top of `dispatch()`; `669f7ff5` makes
+  `dispatch()` a wrapper over `run_dispatch()`. Both are kept: the
+  wrapper ends the window, runs `run_dispatch()`, and runs the stand-ins
+  if it did not run. One line was added that neither side has:
+  `instead()` ends an open clamp window before its stand-in clear, since
+  on this tree every command that writes GPU memory does. It is reached
+  only with `VICTORY_STAND_IN` set.
+- `cd2d17ec`: #2295's test builds `HostShader` and calls `emit` and
+  `hand_out` the way main has them. On this tree `emit` takes a
+  `Target`, `HostShader` has `heap_usage` (#1962) and `group_waves`
+  (piece 5), and `hand_out` takes the program's code. The fix fills in
+  `Target::ANY`, `false`, `1` and `&[]`.
+
+### Shader translator
+
+Only piece 5 changes `crates/victory-shader` (13 files, 557 insertions,
+105 deletions against `01c5d98d`), so the shader cache needs a new pass
+for this layer. `git diff a47125be <head> -- crates/victory-shader
+crates/victory-pipeline apps/victory` is empty: the translator is the
+one of `gpu-run/layer4-wpg`, and a cache made for that head serves this
+one.
+
+Offline, `victory translate --host-lanes 32-32 --validate --list --jobs
+6` over the title's shader archive (local title data, CPU only), base
+`01c5d98d` against the binary built at `80440ae9`: 25,889 programs in
+both; validated 25,701 before, 25,725 after; 0 lost; 24 gained (21 were
+"console wave64 lanes in a group of more than 64 threads", 3 "a
+whole-wave section of a wave64"). The listing matches the one of
+`a47125be` program by program (0 lost, 0 gained). The binary of the
+head, `6188353e`, was not listed itself; it differs from `80440ae9` in
+`crates/victory-gpu` only.
+
+### Build
+
+`cargo build --locked --profile diag -p victory --features diagnostics`
+at `6188353e`, through `heavy-run --light`, into `targets\layer4-final`:
+`diag\victory.exe`, sha256
+`5a9c0b14238d4775e5fb2bb78ab125d47f037e78d9a578feb7664b894b11be31`.
+This file only changes docs, so the binary matches this layer's head.
+
+### Switches
+
+New and opt-in (unset: no change): `VICTORY_AMBIENT` (piece 4),
+`VICTORY_STAND_IN` (piece 9). New and on by default: the staging and
+placed-texture sweeps of piece 8 (`VICTORY_STAGING_SWEEP=0`,
+`VICTORY_TEXTURE_SWEEP=0` turn them off for an A/B) and the library-save
+thresholds of piece 6 (`VICTORY_LIBRARY_SAVE_MIN`, default 256;
+`VICTORY_LIBRARY_SAVE_SECS`, default 60).
+
+### Tests and review
+
+Checked on this layer: `cargo check --locked -p victory-gpu -p
+victory-shader --features victory-gpu/diagnostics --tests` passes at
+`6188353e`. Run on the software adapter, on the port branch `d0e2d2c3`
+with the test fix above applied by hand: the three tests of piece 7,
+#2295's two tests and the two older dynamic-slot tests (7 passed). No
+suite was run on this layer's head; each piece's own suite results are
+with its branch. The title was not run.
+
+A read-only review of the merged draw path at `abe0ed49` (pieces 1 to
+7) found no conflict between the pieces. It noted that each
+`VICTORY_AMBIENT` clear takes one more dynamic slot, held until the list
+resets, and that `external::record` (already in layer 4) does not end an
+open clamp window. Pieces 8 and 9 were not reviewed that way.
