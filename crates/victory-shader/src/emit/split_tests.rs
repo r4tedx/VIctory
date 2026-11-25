@@ -1337,3 +1337,98 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+/// A 16-bit sum over the whole wave as the console compiler expands
+/// `WaveActiveSum` of a `half` (`v_add_f16` steps; a 16-bit result keeps
+/// its register's high half): v4 = t << 16 | 1.0 (f16) in every lane, the
+/// scan of [`reduction_scan`] with `v_add_f16`, the result in v2. Its low
+/// half is the sum, its high half lane 63's (t = 63).
+fn half_sum() -> Vec<u32> {
+    let op = 0x32 << 25; // v_add_f16
+    vec![
+        0x3408_0090, // v_lshlrev_b32 v4, 16, v0
+        0x3808_08FF,
+        0x0000_3C00, // v_or_b32 v4, 0x3c00, v4
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0880, // v_cndmask_b32 v1, 0, v4, s[0:1]
+        op | 0x0002_02FA,
+        0xFF01_1101, // v_add_f16 v1, v1, v1 row_shr:1
+        op | 0x0002_02FA,
+        0xFF01_1201, // row_shr:2
+        op | 0x0002_02FA,
+        0xFF01_1401, // row_shr:4
+        op | 0x0002_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E06_02FA,
+        0xAF00_E402,      // v_mov_b32 v3, v2 row_mask:0xa
+        op | 0x0002_0701, // v_add_f16 v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01,      // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380,      // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1,      // s_mov_b32 exec_hi, -1
+        op | 0x0002_0209, // v_add_f16 v1, s9, v1
+        0xD760_000A,
+        0x0001_7F01, // v_readlane_b32 s10, v1, 63
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_020A, // v_mov_b32 v2, s10
+    ]
+}
+
+/// The 16-bit sum of [`half_sum`] in the console flow in halves: each
+/// half's sum is exchanged and lane 63's high half read in the upper half
+/// (a group of 32 threads has no lane 63: the identity's 0). The modules
+/// validate; on every hardware adapter, and on WARP (waves of 64, no
+/// halves), lane t stores 63 << 16 | f16(64) in a group of 64 and
+/// f16(32) in one of 32.
+#[test]
+fn half_sums_join_both_host_waves() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref());
+    let mut validator = validator.ok();
+    let want = |threads: u32| {
+        if threads == 64 {
+            63 << 16 | 0x5400
+        } else {
+            0x5000
+        }
+    };
+    for threads in [64, 32] {
+        let cs = emit_for(&program(&half_sum(), threads), nvidia)
+            .unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{threads} threads");
+        if let Some(v) = &mut validator {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        }
+        console_flow_case("half sum", &half_sum(), threads, |_| want(threads));
+    }
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    if !host.target().runs(64) {
+        eprintln!("WARP runs no waves of 64; skipped");
+        return;
+    }
+    for threads in [64, 32] {
+        match run(&host, &program(&half_sum(), threads), 2) {
+            Ok(out) => {
+                assert_eq!(
+                    out,
+                    vec![want(threads); 2 * threads as usize],
+                    "WARP: {threads} threads"
+                );
+                eprintln!("WARP: {threads} threads exact");
+            }
+            Err(e) => eprintln!("WARP: {threads} threads: {e}; skipped"),
+        }
+    }
+}

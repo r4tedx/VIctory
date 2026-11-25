@@ -1362,10 +1362,16 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
                 }
-                // Its sum, ballot and lane `hi` are the host wave's.
-                if self.split {
+                // Its sum, ballot and lane `hi` are the host wave's, or in
+                // the console flow in halves each half's, exchanged.
+                if self.split && !self.console_cf {
                     return Err("a wave reduction in a wave64 program split in halves");
                 }
+                let halves = self.split
+                    && self
+                        .s
+                        .threads
+                        .is_some_and(|t| t.iter().product::<u32>() > 32);
                 let c = self.cur;
                 let &m = self
                     .x
@@ -1379,14 +1385,16 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.select(c, on, x, id);
                 self.s.flags |= flags::WAVE_OPS;
                 // shortcut: the f16 sum is taken in f32 and rounded once; the
-                // console rounds each step, in its own order.
+                // console rounds each step, in its own order. (In halves,
+                // each half's f32 sum crosses as its bits and the two are
+                // added before the rounding.)
                 let low = self.s.m.i32(0xFFFF);
                 let h = self.s.m.bin(c, Bin::And, x, low);
                 let f = self
                     .s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
                 let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
-                let r = self.s.op(
+                let mut r = self.s.op(
                     c,
                     "waveActiveOp.f32",
                     Attr::NoUnwind,
@@ -1394,25 +1402,45 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                if halves {
+                    let bits = self.as_int(r);
+                    let (lo, up) = self.exchange(c, bits);
+                    let (lo, up) = (self.as_float(lo), self.as_float(up));
+                    r = self.s.m.bin(c, Bin::Add, lo, up);
+                }
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
+                // elsewhere on the host; there it holds the identity. In
+                // halves it is lane `hi % 32` of half `hi / 32`, which each
+                // half reads of its own and the exchange picks; a group of
+                // 32 threads or fewer has no upper half.
+                let (lane, word) = if self.split {
+                    (hi % 32, 0)
+                } else {
+                    (hi, hi / 32)
+                };
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let word = self.s.m.extract(c, b, word);
+                let (sh, one, z) = (self.s.m.i32(lane % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
-                let lane = self.s.m.i32(hi);
+                let lane = self.s.m.i32(lane);
                 let at = self.read_lane(x, lane);
-                let top = self.s.m.select(c, there, at, id);
+                let mut top = self.s.m.select(c, there, at, id);
+                if halves {
+                    let (lo, up) = self.exchange(c, top);
+                    top = if hi < 32 { lo } else { up };
+                } else if self.split && hi >= 32 {
+                    top = id;
+                }
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
                 return Ok(self.s.m.bin(c, Bin::Or, top, r));
