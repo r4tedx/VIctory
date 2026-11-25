@@ -238,8 +238,8 @@ pub(crate) fn batching() -> bool {
 const BATCH_SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3), UAV(u4), CBV(b1)"
 // One execution of the window: its kind, record stride and count, its
-// first record among the window's, where its clamped records go in `clamped_args`
-// and where its count goes (none: ~0).
+// first record among the window's, where its clamped records go in
+// `clamped_args` and where its count goes (none: ~0).
 cbuffer Entry : register(b0) { uint kind; uint stride; uint records; uint first; uint dst; uint count_at; };
 RWByteAddressBuffer src : register(u0);
 RWByteAddressBuffer count_src : register(u1);
@@ -252,8 +252,8 @@ RWByteAddressBuffer budget : register(u4);
 cbuffer Window : register(b1) { uint entries; uint total; };
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `from` in `src` into `to` in `clamped_args` as the in-place
-// clamp does (the same bounds); its cost.
+// Clamps the record at `from` in `src` into `to` in `clamped_args` as the
+// in-place clamp does (the same bounds); its cost.
 uint clamped(uint from, uint to) {
     uint cost;
     if (kind <= 1) {
