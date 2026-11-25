@@ -2936,12 +2936,20 @@ impl Meter {
                 );
             }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
+            let waiting = crate::resource::waiting_textures();
+            let (let_go, let_go_bytes) = crate::resource::let_go_counts();
+            let (staging, staging_bytes, staging_let_go, staging_let_go_bytes) = crate::texture::staging_counts();
             tracing::info!(
-                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
+                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures waiting for a first use {waiting}, sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
+                 placed textures let go while idle {let_go} ({:.0} MB); \
+                 staging buffers {staging} ({:.0} MB), let go while idle {staging_let_go} ({:.0} MB); \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
                 bytes as f64 / 1e6,
                 used as f64 / 1e6,
                 saved as f64 / 1e6,
+                let_go_bytes as f64 / 1e6,
+                staging_bytes as f64 / 1e6,
+                staging_let_go_bytes as f64 / 1e6,
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
             );
@@ -3361,6 +3369,60 @@ impl Host {
             }
         }
     }
+}
+
+/// How many references are held on a host object (its COM count): ours
+/// all, since the host's views and commands hold none. A host texture with
+/// one is held by its owner alone: no view heap slot keeps it
+/// (`HostHeap::kept`) and none was retired ([`retire`]).
+pub(crate) fn references(object: &impl Interface) -> u32 {
+    type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+    let raw = object.as_raw();
+    // SAFETY: a live COM object, whose first three methods are those of
+    // `IUnknown` (query, add a reference, release one); the pair leaves the
+    // count as it was, and the release returns it.
+    unsafe {
+        let methods = *raw.cast::<*const [Method; 3]>();
+        ((*methods)[1])(raw);
+        ((*methods)[2])(raw)
+    }
+}
+
+/// The card's memory budget the system gives this process and how much of
+/// it the process uses, in bytes (DXGI's local segment); none without an
+/// adapter to ask. Past the budget the system moves the card's memory into
+/// the PC's.
+pub(crate) fn video_memory() -> Option<(u64, u64)> {
+    struct Adapter(IDXGIAdapter3);
+    // SAFETY: DXGI adapters are free-threaded.
+    unsafe impl Send for Adapter {}
+    // SAFETY: as above.
+    unsafe impl Sync for Adapter {}
+    static ADAPTER: OnceLock<Option<Adapter>> = OnceLock::new();
+    let adapter = ADAPTER
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: plain DXGI and device queries.
+            unsafe {
+                let luid = host.device.GetAdapterLuid();
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                factory
+                    .EnumAdapterByLuid::<IDXGIAdapter3>(luid)
+                    .ok()
+                    .map(Adapter)
+            }
+        })
+        .as_ref()?;
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a plain query that fills our structure.
+    unsafe {
+        adapter
+            .0
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+    }
+    .ok()?;
+    Some((info.Budget, info.CurrentUsage))
 }
 
 /// Host resources that view heap slots stopped viewing while a submission

@@ -306,11 +306,14 @@ pub(crate) struct Barrier {
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// GPU does not have (buffers so far), or a texture whose host texture is
+/// not made yet: a barrier is not a use, and the texture's first use in a
+/// list moves it where that use needs.
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host =
+        |r: This| crate::resource::host_resource_made(r).map(|h| h.as_raw().cast_const().cast());
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -318,6 +321,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
             }
+            crate::resource::host_resource_made(b.first)?;
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);

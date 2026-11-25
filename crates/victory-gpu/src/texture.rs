@@ -18,6 +18,8 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -50,15 +52,190 @@ pub(crate) struct Staging {
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
+    /// [`crate::resource::now_ms`] and frames presented when it was last
+    /// needed: a list copied from it ([`upload`]) or the memory changed
+    /// ([`upload_changed`]). Idle ones go ([`let_go_idle_staging`]).
+    used: [AtomicU64; 2],
+    /// Made again after one was let go: the next refresh detiles whatever
+    /// the tracker or hash says (the buffer is new).
+    force: std::sync::atomic::AtomicBool,
+}
+
+/// A host texture's uploads from title memory ([`HostTexture::staging`]):
+/// its staging buffer, or what one let go while idle knew of the memory.
+///
+/// [`HostTexture::staging`]: crate::resource::HostTexture
+#[derive(Default)]
+pub(crate) struct Stage {
+    live: Option<Arc<Staging>>,
+    dormant: Option<Dormant>,
+}
+
+/// What a staging buffer let go while idle knew: the memory's tracker,
+/// which keeps marking the pages written since, or (memory not tracked)
+/// the hash it last detiled. While the memory is unchanged, the host
+/// texture holds it and no staging buffer is needed.
+struct Dormant {
+    tracked: Option<crate::watch::Tracked>,
+    hash: Option<blake3::Hash>,
+    memory: *const u8,
+    size: usize,
+}
+
+// SAFETY: the title memory is only read.
+unsafe impl Send for Dormant {}
+
+impl Dormant {
+    /// Whether the memory is as the host texture last took it.
+    fn unchanged(&self) -> bool {
+        if let Some(t) = &self.tracked {
+            return t.unchanged();
+        }
+        if self.hash.is_none() || !committed(self.memory, self.size) {
+            // Never detiled, or not readable (a refresh would read nothing).
+            return self.hash.is_some();
+        }
+        let started = std::time::Instant::now();
+        // SAFETY: committed memory of the texture's layout size.
+        let hash = blake3::hash(unsafe { std::slice::from_raw_parts(self.memory, self.size) });
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[3].fetch_add(self.size as u64, Relaxed);
+        self.hash == Some(hash)
+    }
+}
+
+impl Staging {
+    fn touch(&self) {
+        self.used[0].store(crate::resource::now_ms(), Relaxed);
+        self.used[1].store(crate::queue::presented(), Relaxed);
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGING[0].fetch_sub(1, Relaxed);
+        STAGING[1].fetch_sub(self.size, Relaxed);
+    }
+}
+
+/// Staging buffers alive and their bytes (upload heap: the PC's memory).
+static STAGING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Staging buffers let go while idle so far, and their bytes.
+static STAGING_LET_GO: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Host textures that have a staging buffer (registered when it is made).
+static STAGED: Mutex<Vec<std::sync::Weak<crate::resource::HostTexture>>> = Mutex::new(Vec::new());
+
+/// Staging buffers alive and their bytes, and those let go while idle so
+/// far and their bytes.
+pub(crate) fn staging_counts() -> (u64, u64, u64, u64) {
+    (
+        STAGING[0].load(Relaxed),
+        STAGING[1].load(Relaxed),
+        STAGING_LET_GO[0].load(Relaxed),
+        STAGING_LET_GO[1].load(Relaxed),
+    )
+}
+
+/// Lets go of the staging buffers not needed in 5 seconds and 4 frames
+/// (no list copied from one, its memory did not change), keeping their
+/// host textures. A staging buffer is the size of its host texture, in the
+/// upload heap (the PC's memory), and was kept as long as its host
+/// texture: with #1962's placed-texture views, which heap slots keep, that
+/// was one per texture the title ever placed and a shader read. The host
+/// texture keeps what was uploaded, and the memory's tracker (or last
+/// hash) stays with it: while the memory is unchanged no buffer is made
+/// again; once it changes, or a list copies from it, a new one is made and
+/// the whole memory detiled into it.
+///
+/// Called at present, at most once a second. `VICTORY_STAGING_SWEEP=0`
+/// keeps them all, as before.
+pub(crate) fn let_go_idle_staging() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_SWEEP").is_none_or(|v| v != "0"));
+    let now = crate::resource::now_ms();
+    let last = LAST.load(Relaxed);
+    if !on || now < last + 1000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let_go_staging(now, crate::queue::presented(), 5_000, 4, |_| true);
+}
+
+/// Lets go of the staging buffers of host textures `within` takes that no
+/// upload asked for in `ms` milliseconds and `frames` frames at `now` and
+/// frame `frame`, and that no list holds (one not yet reset holds those it
+/// will refresh at submission): how many went, and their bytes. A list
+/// that copies from one keeps its buffer ([`HostList::keep`]) and the
+/// buffer is retired besides, so a submission running now still has it.
+fn let_go_staging(
+    now: u64,
+    frame: u64,
+    ms: u64,
+    frames: u64,
+    within: impl Fn(&crate::resource::HostTexture) -> bool,
+) -> (u64, u64) {
+    // Out of the list while we look (`staging` registers under its
+    // texture's lock, which we take below: never both the other way).
+    let staged = std::mem::take(&mut *STAGED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut keep = Vec::with_capacity(staged.len());
+    let mut gone = Vec::new();
+    for weak in staged {
+        let Some(copy) = weak.upgrade() else {
+            continue;
+        };
+        if !within(&copy) {
+            keep.push(weak);
+            continue;
+        }
+        let mut stage = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+        let stage = &mut *stage;
+        let Some(s) = stage.live.as_mut() else {
+            continue; // registered again when made again
+        };
+        let idle = now.saturating_sub(s.used[0].load(Relaxed)) >= ms
+            && frame.saturating_sub(s.used[1].load(Relaxed)) >= frames;
+        // Clones are made under this lock: one now is no list's.
+        let Some(m) = idle.then(|| Arc::get_mut(s)).flatten() else {
+            keep.push(weak);
+            continue;
+        };
+        // A detiling still to come (made, never refreshed): the host
+        // texture may not hold the memory yet, so the next one starts anew.
+        stage.dormant = (!*m.force.get_mut()).then(|| Dormant {
+            tracked: m.tracked.take(),
+            hash: m.last.get_mut().unwrap_or_else(|e| e.into_inner()).hash,
+            memory: m.memory,
+            size: m.layout.size as usize,
+        });
+        gone.extend(stage.live.take());
+    }
+    STAGED.lock().unwrap_or_else(|e| e.into_inner()).append(&mut keep);
+    let went = gone.len() as u64;
+    let mut bytes = 0;
+    for s in gone {
+        bytes += s.size;
+        crate::host::retire(s.buffer.clone());
+    }
+    if went > 0 {
+        STAGING_LET_GO[0].fetch_add(went, Relaxed);
+        STAGING_LET_GO[1].fetch_add(bytes, Relaxed);
+        tracing::debug!(went, kib = bytes >> 10, "idle staging buffers let go");
+    }
+    (went, bytes)
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// (memory not tracked).
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    read: Vec<u8>,
 }
+
+/// Shared scratch buffer for reading tracked title-texture memory before
+/// detiling, so each `Staging` does not retain a full-size `Vec<u8>`.
+static READ_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -199,7 +376,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let Some(staging) = staging(resource, texture, true) else {
         return;
     };
     // The staging buffer lives as long as `staging`, which the deferred
@@ -218,12 +395,20 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     if is_host_written(resource) {
         return false;
     }
-    let Some(staging) = staging(resource, texture) else {
+    // One let go while idle: none is made while the memory is unchanged.
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        let stage = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+        if stage.live.is_none() && stage.dormant.as_ref().is_some_and(Dormant::unchanged) {
+            return false;
+        }
+    }
+    let Some(staging) = staging(resource, texture, false) else {
         return false;
     };
     if !staging.refresh() {
         return false;
     }
+    staging.touch();
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
     true
@@ -302,15 +487,20 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        let forced = self.force.swap(false, Relaxed);
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            if t.take(start, start + size).is_empty() && !forced {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut scratch = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if scratch.len() < size {
+                scratch.resize(size, 0);
+            }
+            let tiled = &mut scratch[..size];
+            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            self.detile(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -330,7 +520,7 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if last.hash == Some(hash) && !forced {
             return (size, false);
         }
         last.hash = Some(hash);
@@ -415,10 +605,13 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = held.as_ref() {
+    if let Some(s) = held.live.as_ref() {
+        if used {
+            s.touch();
+        }
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -467,6 +660,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
+    // What one let go knew: the tracker has marked every page written since.
+    let (tracked, hash, force) = match held.dormant.take() {
+        Some(d) => (d.tracked, d.hash, true),
+        None => (crate::watch::track(memory as usize, layout_size, true), None, false),
+    };
     let s = Arc::new(Staging {
         buffer,
         size: total,
@@ -476,10 +674,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
-        tracked: crate::watch::track(memory as usize, layout_size, true),
-        last: Mutex::default(),
+        tracked,
+        last: Mutex::new(Last { hash }),
+        used: [AtomicU64::new(0), AtomicU64::new(0)],
+        force: force.into(),
     });
-    *held = Some(s.clone());
+    s.touch();
+    STAGING[0].fetch_add(1, Relaxed);
+    STAGING[1].fetch_add(total, Relaxed);
+    held.live = Some(s.clone());
+    drop(held);
+    STAGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arc::downgrade(&copy));
     Some(s)
 }
 
@@ -494,6 +702,74 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    /// A staging buffer not needed for long enough (no list copies from
+    /// it, its memory unchanged), and that no list holds, goes; its host
+    /// texture stays. While the memory stays unchanged, heap uploads make no
+    /// new one; once the title writes it, one is made again and the whole
+    /// memory detiled into it.
+    #[test]
+    fn idle_staging_goes_and_its_host_texture_stays() {
+        let p = crate::watch::tests::pool(4);
+        let words = crate::resource::texture_words(256, 256, 28, 1);
+        let Some(r) = crate::resource::texture_at(p as u64, &words) else {
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let host = host().expect("a host GPU");
+        let copy = crate::resource::host_copy(r).expect("its host copy");
+        let texture = copy.texture.clone();
+        // Only this test's texture (tests run side by side).
+        let mine = |h: &crate::resource::HostTexture| std::ptr::eq(h, &raw const *copy);
+        let stage = |f: fn(&Stage) -> bool| f(&copy.staging.lock().unwrap_or_else(|e| e.into_inner()));
+        let list = host.new_list().expect("a list");
+        upload(&list, r, &texture);
+        assert!(stage(|s| s.live.is_some()), "an upload makes it");
+        let (now, frame) = (crate::resource::now_ms(), crate::queue::presented());
+        let later = |ms: u64, frames: u64| let_go_staging(now + ms, frame + frames, 5_000, 4, mine);
+        assert_eq!(later(10_000, 10).0, 0, "a list not yet reset holds it");
+        // The list's refresh at submission (it is not submitted here).
+        assert!(staging(r, &texture, false).unwrap().refresh(), "the first refresh detiles");
+        list.close();
+        list.reset();
+        assert_eq!(later(0, 0).0, 0, "just used");
+        assert_eq!(later(10_000, 3).0, 0, "too few frames since");
+        assert_eq!(later(4_000, 10).0, 0, "too short a time since");
+        let (went, bytes) = later(10_000, 10);
+        assert_eq!(went, 1);
+        assert!(bytes >= 256 * 256 * 4, "{bytes} bytes");
+        assert!(stage(|s| s.live.is_none() && s.dormant.is_some()), "the buffer went, the tracker stays");
+        assert!(
+            crate::resource::host_resource(r).is_some_and(|t| t == &texture),
+            "the host texture stays"
+        );
+        assert_eq!(later(20_000, 20).0, 0, "nothing more to let go");
+        let heap = host.new_list().expect("a list");
+        assert!(!upload_changed(&heap, r, &texture), "unchanged memory: nothing to upload");
+        assert!(stage(|s| s.live.is_none()), "and no buffer made for it");
+        // SAFETY: committed pages of ours: the title writes its texture.
+        unsafe { ((p + 100) as *mut u8).write_volatile(7) };
+        assert!(upload_changed(&heap, r, &texture), "changed memory is uploaded");
+        assert!(stage(|s| s.live.is_some() && s.dormant.is_none()), "into a new buffer");
+        heap.close();
+        heap.reset();
+        // The whole memory went into it, not only the page written.
+        let again = staging(r, &texture, false).unwrap();
+        assert!(again.tracked.as_ref().is_some_and(|t| t.unchanged()), "everything taken");
+        drop(again);
+        let soon = (crate::resource::now_ms(), crate::queue::presented());
+        assert_eq!(let_go_staging(soon.0 + 10_000, soon.1 + 10, 5_000, 4, mine).0, 1, "registered again, let go again");
+        // One made but never refreshed leaves no tracker: the next starts anew.
+        let pending = host.new_list().expect("a list");
+        upload(&pending, r, &texture);
+        pending.close();
+        pending.reset();
+        let soon = (crate::resource::now_ms(), crate::queue::presented());
+        assert_eq!(let_go_staging(soon.0 + 10_000, soon.1 + 10, 5_000, 4, mine).0, 1);
+        assert!(stage(|s| s.live.is_none() && s.dormant.is_none()), "no tracker kept");
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     #[test]
