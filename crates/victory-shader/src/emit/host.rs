@@ -885,6 +885,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        group_waves: lowered.group_waves,
     })
 }
 

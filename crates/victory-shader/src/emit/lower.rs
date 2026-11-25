@@ -476,10 +476,10 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 }
 
 /// Whether `v` is a lane mask in any form the structure knows: a mask, the
-/// high dword of one, or one held as a number ([`Structured::others`], as
+/// high dword of one, or one held as a number ([`Structured::other`], as
 /// an exit mask grown from 0 is).
 fn any_mask(st: &Structured, v: Value) -> bool {
-    st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.others.contains_key(&v)
+    st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.other.contains_key(&v)
 }
 
 /// Instructions that read a value `is_mask` says is a lane mask as a number.

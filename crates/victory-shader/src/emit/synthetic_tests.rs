@@ -119,6 +119,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        group_waves: lowered.group_waves,
     })
 }
 
