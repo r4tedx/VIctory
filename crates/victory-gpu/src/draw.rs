@@ -70,6 +70,8 @@ pub(crate) struct State {
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
+    /// The last [`Self::dispatch`] ran (else its stand-ins take its place).
+    dispatch_ran: bool,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
@@ -91,6 +93,14 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Slots made for unordered access clears in this list
+    /// ([`State::clear_view`]): (view heap, view, host resource) → dynamic
+    /// slot, so that clears of one view (a stand-in's, at each dispatch of
+    /// its program) share one. The slots are among [`Self::dynamic`], held
+    /// until the list is reset (which drops this with them) or released;
+    /// the list keeps the host resource, so its address names no other.
+    /// Made again in each segment of the list, as root views are.
+    clear_slots: std::collections::BTreeMap<(usize, View, usize), u32>,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -316,6 +326,7 @@ impl State {
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
+        self.clear_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
@@ -1037,24 +1048,52 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
+        self.clear_view(list, &view, values, float, rects, false, None);
+    }
+
+    /// The clear of [`Self::clear_unordered`] of `view`; `written`: a
+    /// dispatch just wrote it, so unordered access barriers go before and
+    /// after the clear. `predicate`: a word the clear alone (not what
+    /// readies the view for it) is predicated on, skipped where it holds
+    /// zero. Whether it was recorded. Its shader-visible slot is a dynamic
+    /// one the list holds until reset, one per view however often the list
+    /// clears it (`clear_slots`).
+    #[allow(clippy::too_many_arguments)]
+    fn clear_view(
+        &mut self,
+        list: &HostList,
+        view: &View,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+        written: bool,
+        predicate: Option<&ID3D12Resource>,
+    ) -> bool {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
             once!("an unordered access clear without a bound view heap");
-            return;
+            return false;
         };
-        let Some(visible) = heap.host() else { return };
-        let Some(slot) = visible.dynamic(1) else {
-            return;
-        };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
+        let Some(visible) = heap.host() else { return false };
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some(resource) = crate::descriptor::host::make_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
-            return;
+            return false;
         };
-        let written = UsedResource {
+        let key = (std::ptr::from_ref(heap) as usize, view.clone(), resource.as_raw() as usize);
+        let slot = match self.clear_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let Some(slot) = visible.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, slot, 1));
+                visible.make_at(slot, view);
+                self.clear_slots.insert(key, slot);
+                slot
+            }
+        };
+        let uav = UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -1064,12 +1103,29 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view, false);
+        readable(list, &uav, view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
+        let barrier = || D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: borrowed without a reference of its own,
+                    // never released (ManuallyDrop); the list keeps it.
+                    pResource: unsafe { std::mem::transmute_copy(&resource) },
+                }),
+            },
+        };
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
+            if written {
+                list.list.ResourceBarrier(&[barrier()]);
+            }
+            if let Some(predicate) = predicate {
+                list.list.SetPredication(predicate, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
@@ -1078,13 +1134,243 @@ impl State {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
+            if predicate.is_some() {
+                list.list.SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
+            if written {
+                list.list.ResourceBarrier(&[barrier()]);
+            }
+        }
+        true
+    }
+
+    /// After a dispatch of `p`: the stand-ins `VICTORY_AMBIENT` sets for
+    /// its program (`crate::ambient`). `indirect`: an indirect dispatch's
+    /// most records and its record count ([`Self::stand_in_after_indirect`]).
+    fn stand_ins(&mut self, list: &HostList, p: &HostPipeline, indirect: Option<(u32, Records<'_>)>) {
+        let rules = crate::ambient::rules();
+        if rules.is_empty() {
+            return;
+        }
+        let Some(stage) = p.stages.first() else { return };
+        let (program, used) = (&stage.shader.hash, Some(&stage.translated().used[..]));
+        match indirect {
+            None => {
+                self.stand_in(list, program, used, rules, None);
+            }
+            Some((max, records)) => {
+                self.stand_in_after_indirect(list, program, used, rules, max, records);
+            }
         }
     }
 
-    /// Runs a dispatch on the host.
+    /// Whether `VICTORY_AMBIENT` names the program of the bound pipeline:
+    /// whether a dispatch of it has stand-ins after it.
+    fn names_stand_ins(&self) -> bool {
+        let rules = crate::ambient::rules();
+        !rules.is_empty()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .and_then(|p| p.stages.first())
+                .is_some_and(|s| rules.iter().any(|r| r.program == s.shader.hash))
+    }
+
+    /// [`Self::stand_in`] after an indirect dispatch of at most `max`
+    /// records, as many as `records` says. The stand-ins follow shader
+    /// work, so where no record runs the views keep what they held: no
+    /// records at most, no clears; with a count, the clears are predicated
+    /// on it, so a count of zero skips them on the GPU; without one, every
+    /// clear. How many were recorded.
+    fn stand_in_after_indirect(
+        &mut self,
+        list: &HostList,
+        program: &str,
+        used: Option<&[UsedResource]>,
+        rules: &[crate::ambient::Rule],
+        max: u32,
+        records: Records<'_>,
+    ) -> usize {
+        if max == 0 || !rules.iter().any(|r| r.program == program) {
+            return 0;
+        }
+        let predicate = match records {
+            Records::Uncounted => return self.stand_in(list, program, used, rules, None),
+            Records::Counted(predicate) => predicate,
+            Records::Unknown => {
+                once!(program, "stand-ins after an indirect dispatch with a count: no predicate word took it, so they are skipped");
+                for _ in rules.iter().filter(|r| r.program == program) {
+                    crate::ambient::note(false);
+                }
+                return 0;
+            }
+        };
+        use crate::host::transition;
+        // SAFETY: an open list; our word, common between uses.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION)]);
+        }
+        let filled = self.stand_in(list, program, used, rules, Some(predicate));
+        // SAFETY: as above.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        filled
+    }
+
+    /// In place of a dispatch that did not run (held back, dropped, or
+    /// without a host pipeline): the stand-ins `VICTORY_STAND_IN` sets for
+    /// its program (`crate::ambient`). Nothing of the program runs. Its
+    /// translation is not asked for: it may have none. `indirect`: for an
+    /// indirect dispatch, its most records and the title address of its
+    /// record count, if it has one. The stand-ins take the place of the
+    /// records it would have run, so as after one that runs
+    /// ([`Self::stand_in_after_indirect`]): none for no records at most,
+    /// and with a count, predicated on it (its host copy brought up to
+    /// date, as the execution would have).
+    fn instead(&mut self, list: &HostList, indirect: Option<(u32, Option<u64>)>) {
+        let rules = crate::ambient::instead_rules();
+        if rules.is_empty() {
+            return;
+        }
+        let Some(program) = crate::pipeline::compute_hash(self.pipeline as This) else {
+            return;
+        };
+        let Some((max, count)) = indirect else {
+            self.stand_in(list, program, None, rules, None);
+            return;
+        };
+        let Some(at) = count else {
+            self.stand_in_after_indirect(list, program, None, rules, max, Records::Uncounted);
+            return;
+        };
+        if max == 0 || !rules.iter().any(|r| r.program == program) {
+            return;
+        }
+        let Some(copy) = crate::shadow::find(at, 4) else {
+            once!(program, "a stand-in in place of an indirect dispatch whose count is outside title buffers: skipped");
+            for _ in rules.iter().filter(|r| r.program == program) {
+                crate::ambient::note(false);
+            }
+            return;
+        };
+        copy.refresh(list, at, 4);
+        // The count where the execution would have read it.
+        let records = match count_predicate(list, &copy.buffer, copy.offset(at)) {
+            Some(predicate) => Records::Counted(predicate),
+            None => Records::Unknown,
+        };
+        self.stand_in_after_indirect(list, program, None, rules, max, records);
+    }
+
+    /// The views of `rules` for `program`, whose code uses `used` (none:
+    /// not known, as for a program that did not run), cleared to their
+    /// values (each clear predicated on `predicate`, if given,
+    /// [`Self::clear_view`]): how many were.
+    fn stand_in(
+        &mut self,
+        list: &HostList,
+        program: &str,
+        used: Option<&[UsedResource]>,
+        rules: &[crate::ambient::Rule],
+        predicate: Option<&ID3D12Resource>,
+    ) -> usize {
+        let mut filled = 0;
+        for rule in rules.iter().filter(|r| r.program == program) {
+            let uavs = || -> Vec<String> {
+                used.unwrap_or_default()
+                    .iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
+                    .collect()
+            };
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let named = used.is_none_or(|used| {
+                used.iter().any(|u| {
+                    u.kind == ResourceType::Uav
+                        && u.root == RootType::Table
+                        && (u.slot, u.table_offset_dwords) == (rule.slot, rule.offset)
+                })
+            });
+            if !named {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "stand-in: the program has no such unordered view in a table");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let view = match self.roots_ref(true).get(usize::from(rule.slot)) {
+                Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(rule.offset) * 4),
+                _ => None,
+            };
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let formats = |view: &View| match view {
+                View::Unordered(r, _, words) => crate::resource::title_format(*r as This).map(|own| {
+                    // SAFETY: a live resource.
+                    let size = crate::resource::host_resource(*r as This).map(|t| unsafe { t.GetDesc() }).map(|d| (d.Width, d.Height));
+                    (words.map_or(0, |w| w[0]), own, size)
+                }),
+                View::Placed(true, texture, words) => Some((words[0], texture[8], None)),
+                _ => None,
+            };
+            let Some((view, (format, own, size))) = view.and_then(|v| formats(&v).map(|f| (v, f))) else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "stand-in: no unordered view of a texture there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            let format = if format == 0 { own } else { format };
+            let fill = crate::ambient::fill(rule.value, format, own);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    views = ?uavs(),
+                    format,
+                    texture_format = own,
+                    ?size,
+                    value = ?rule.value,
+                    ?fill,
+                    ran = used.is_some(),
+                    "stand-in: first dispatch of the program"
+                );
+            }
+            let recorded = match fill {
+                Ok(crate::ambient::Fill::Float(rgba)) => {
+                    self.clear_view(list, &view, rgba.map(f32::to_bits), true, &[], true, predicate)
+                }
+                Ok(crate::ambient::Fill::Uint(words)) => {
+                    self.clear_view(list, &view, words, false, &[], true, predicate)
+                }
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "stand-in: {why}");
+                    }
+                    false
+                }
+            };
+            crate::ambient::note(recorded);
+            filled += usize::from(recorded);
+        }
+        filled
+    }
+
+    /// Runs a dispatch on the host; if it does not run, the stand-ins
+    /// `VICTORY_STAND_IN` names for its program take its place
+    /// ([`Self::instead`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // Indirect executions after it clamp what it writes.
+        // Indirect executions after it clamp what it writes (it or the
+        // stand-ins that take its place).
         crate::indirect::end(list);
+        self.dispatch_ran = false;
+        self.run_dispatch(list, x, y, z);
+        if !self.dispatch_ran {
+            self.instead(list, None);
+        }
+    }
+
+    /// [`Self::dispatch`] itself; `dispatch_ran` says whether it ran.
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1127,9 +1413,11 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.dispatch_ran = true;
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.stand_ins(list, p, None);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1730,7 +2018,26 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// If an indirect dispatch does not run, the stand-ins
+    /// `VICTORY_STAND_IN` names for its program take the place of the
+    /// records it would have run ([`Self::instead`]).
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        const DISPATCH: u32 = 2;
+        let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if !ran && kind == DISPATCH {
+            self.instead(list, Some((max, count)));
+        }
+        ran
+    }
+
+    /// [`Self::execute_indirect`] itself.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -1893,6 +2200,14 @@ impl State {
             (None, Some(clamped)) => ((clamped, 0), counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)))),
             (None, None) => unreachable!("bounded above"),
         };
+        // The count where the execution reads it, for the stand-ins after
+        // it: the same value, whatever the records then write.
+        let predicate = match &counter {
+            Some((s, at)) if kind == DISPATCH && max > 0 && self.names_stand_ins() => {
+                count_predicate(list, &s.buffer, s.offset(*at))
+            }
+            _ => None,
+        };
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh) or its own, the signature is
         // cached.
@@ -1924,11 +2239,50 @@ impl State {
         }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                let records = match (&counter, predicate) {
+                    (None, _) => Records::Uncounted,
+                    (Some(_), Some(predicate)) => Records::Counted(predicate),
+                    (Some(_), None) => Records::Unknown,
+                };
+                self.stand_ins(list, p, Some((max, records)));
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
+}
+
+/// The records an indirect dispatch ran, for the stand-ins after it
+/// ([`State::stand_in_after_indirect`]).
+#[derive(Clone, Copy)]
+enum Records<'a> {
+    /// No count: as many as its arguments give, up to its most.
+    Uncounted,
+    /// As many as its count says, copied into the list's predicate word
+    /// ([`count_predicate`]) where the execution read it.
+    Counted(&'a ID3D12Resource),
+    /// A count no predicate word took.
+    Unknown,
+}
+
+/// The list's predicate word ([`HostList::predicate`]) holding the 32-bit
+/// count at `offset` of `buffer` in its low half (the high half stays
+/// zero), copied where this is recorded: just before the execution that
+/// reads the count, so the word holds what it read. Common before and
+/// after. None without the word.
+fn count_predicate<'a>(list: &'a HostList, buffer: &ID3D12Resource, offset: u64) -> Option<&'a ID3D12Resource> {
+    use crate::host::transition;
+    let predicate = list.predicate()?;
+    // SAFETY: an open list; our word, and the count's host copy, which the
+    // list keeps.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.list.CopyBufferRegion(predicate, 0, buffer, offset, 4);
+        list.list.ResourceBarrier(&[transition(predicate, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+    }
+    Some(predicate)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -2997,6 +3351,577 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
+    /// The ambient stand-in (`crate::ambient`): a program writes three
+    /// unordered views of a title table; after it, the views the rules name
+    /// for its hash hold their values (an R32_UINT texture the R9G9B9E5
+    /// packing, an RGBA16F one the colour as halves), the view no rule of
+    /// its names keeps what it wrote, and a program no rule names changes
+    /// nothing.
+    #[test]
+    fn the_ambient_stand_in_fills_the_named_views_after_the_named_program() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R32_UINT, RGBA16F, R32_UINT.
+        let formats = [42u32, 10, 42];
+        let textures: Vec<This> = formats
+            .iter()
+            .map(|&f| texture_at_address(title_memory(1 << 20), &texture_words(N, N, f, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Unordered(t as usize, 0, Some([f, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        for (i, (&t, f)) in textures.iter().zip(formats).enumerate() {
+            let desc = [f, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, t, null, &desc, title_heap.start + 32 * i as u64);
+        }
+        let slots = Slots::new(6);
+        for (i, v) in uavs.iter().enumerate() {
+            slots.make(i as u32, v);
+        }
+        let reads: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Shader(t as usize, Some([f, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])))
+            .collect();
+        for (i, v) in reads.iter().enumerate() {
+            slots.make(3 + i as u32, v);
+        }
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=3))"
+RWTexture2D<uint> a : register(u0);
+RWTexture2D<float4> b : register(u1);
+RWTexture2D<uint> c : register(u2);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    a[id.xy] = 0xdeadbeef;
+    b[id.xy] = float4(9, 9, 9, 9);
+    c[id.xy] = 0xdeadbeef;
+}
+"#,
+        );
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<float4> b : register(t1);
+Texture2D<uint> c : register(t2);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    uint i = (id.y * 16 + id.x) * 32;
+    o.Store2(i, uint2(a.Load(at), c.Load(at)));
+    o.Store4(i + 16, asuint(b.Load(at)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 32).unwrap();
+        let rules = crate::ambient::parse(
+            "aaaaaaaaaaaaaaaa:s1+0:rgb9e5=0.6,0.588,0.564; AAAAAAAAAAAAAAAA:1+8:0.25,0.5,1; bbbbbbbbbbbbbbbb:s1+16:0x12345678",
+        )
+        .unwrap();
+        let program_uses: Vec<UsedResource> = (0..3)
+            .map(|i| UsedResource { slot: 1, table_offset_dwords: 8 * i, ..used(ResourceType::Uav) })
+            .collect();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 1, title_heap.start);
+        for v in &uavs {
+            readable(&list, &used(ResourceType::Uav), v, false);
+        }
+        run(&list, &slots, &write, 0, None, (N / 8, N / 8));
+        let before = crate::ambient::filled();
+        assert_eq!(state.stand_in(&list, "aaaaaaaaaaaaaaaa", Some(&program_uses), &rules, None), 2, "the two views of its rules");
+        assert_eq!(state.stand_in(&list, "cccccccccccccccc", Some(&program_uses), &rules, None), 0, "a program no rule names");
+        assert_eq!(crate::ambient::filled() - before, 2);
+        for v in &reads {
+            readable(&list, &used(ResourceType::Srv), v, false);
+        }
+        run(&list, &slots, &read, 3, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        let grey = crate::ambient::rgb9e5([0.6, 0.588, 0.564]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output.
+            let (words, colour) = unsafe {
+                (
+                    (data.add(i * 32) as *const [u32; 2]).read(),
+                    (data.add(i * 32 + 16) as *const [f32; 4]).read(),
+                )
+            };
+            assert_eq!(words, [grey, 0xdeadbeef], "texel {i}: the packed grey, and the unnamed view as written");
+            assert_eq!(colour, [0.25, 0.5, 1.0, 1.0], "texel {i}: the colour as halves");
+        }
+    }
+
+    /// The ambient stand-in after an indirect dispatch clears only where
+    /// records ran: a view is seeded with a
+    /// sentinel, an indirect dispatch of a program that writes it runs,
+    /// then its stand-in. With at most one record and a count of zero the
+    /// sentinel survives; with a count of one the record writes the view
+    /// and the stand-in clears it after; with at most no records nothing
+    /// changes; with no count the stand-in clears. The count sits at an
+    /// offset that is not 8-byte aligned with a nonzero word after it, so a
+    /// 64-bit predicate read in place would get it wrong.
+    #[test]
+    fn the_ambient_stand_in_follows_only_indirect_dispatches_that_ran_records() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        const SENTINEL: u32 = 0x5e5e_5e5e;
+        const RECORD: u32 = 0xdead_beef;
+        const STAND_IN: u32 = 0x1234_5678;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R32_UINT.
+        let texture = texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4));
+        let desc = [42, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let uav = View::Unordered(texture as usize, 0, Some(desc));
+        crate::descriptor::create_uav(null, texture, null, &desc, title_heap.start);
+        let srv = View::Shader(texture as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+        let slots = Slots::new(2);
+        slots.make(0, &uav);
+        slots.make(1, &srv);
+        let writes = |value: u32| {
+            compile_cs(&format!(
+                r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<uint> a : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    a[id.xy] = {value}u;
+}}
+"#
+            ))
+        };
+        let (seed, record) = (writes(SENTINEL), writes(RECORD));
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<uint> t : register(t0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store((id.y * 16 + id.x) * 4, t.Load(int3(id.xy, 0)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 4).unwrap();
+        let signature = host_signature(2, 12).expect("a dispatch signature");
+        let (arguments, words) = host.shared_buffer(12).unwrap();
+        // SAFETY: the mapped record, written before any list reads it.
+        unsafe { (words as *mut [u32; 3]).write([N / 8, N / 8, 1]) };
+        let (counts, count_words) = host.shared_buffer(16).unwrap();
+        let rules = crate::ambient::parse(&format!("aaaaaaaaaaaaaaaa:s1+0:{STAND_IN:#x}")).unwrap();
+        let program_uses = [UsedResource { slot: 1, ..used(ResourceType::Uav) }];
+        let uav_barrier = || D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        };
+        // (most records, count, the view after, stand-ins recorded)
+        let cases = [
+            (1, Some(0), SENTINEL, 1),
+            (1, Some(1), STAND_IN, 1),
+            (0, None, SENTINEL, 0),
+            (1, None, STAND_IN, 1),
+        ];
+        for (max, count, want, recorded) in cases {
+            if let Some(n) = count {
+                // SAFETY: the mapped words, written before the list runs.
+                unsafe { (count_words as *mut [u32; 4]).write([1, n, u32::MAX, u32::MAX]) };
+            }
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 1, title_heap.start);
+            readable(&list, &used(ResourceType::Uav), &uav, false);
+            run(&list, &slots, &seed, 0, None, (N / 8, N / 8));
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.ResourceBarrier(&[
+                    uav_barrier(),
+                    crate::host::transition(&arguments, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                ]);
+                list.list.SetComputeRootSignature(&record.0);
+                list.list.SetPipelineState(&record.1);
+                list.list.SetComputeRootDescriptorTable(0, slots.gpu(0));
+            }
+            // The count where the execution reads it.
+            let records = match count {
+                Some(_) => Records::Counted(count_predicate(&list, &counts, 4).expect("a predicate word")),
+                None => Records::Uncounted,
+            };
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.ExecuteIndirect(&signature, max, &arguments, 0, count.map(|_| &counts), count.map_or(0, |_| 4));
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &arguments,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            assert_eq!(
+                state.stand_in_after_indirect(&list, "aaaaaaaaaaaaaaaa", Some(&program_uses), &rules, max, records),
+                recorded,
+                "max {max} count {count:?}: stand-ins recorded"
+            );
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+            run(&list, &slots, &read, 1, Some(&out), (N / 8, N / 8));
+            list.close();
+            host.execute(&[&list]);
+            for i in [0usize, 5, 7 * 16 + 9, 255] {
+                // SAFETY: inside the mapped output, after the list ran.
+                let got = unsafe { (data.add(i * 4) as *const u32).read() };
+                assert_eq!(got, want, "max {max} count {count:?} texel {i}: {got:#x}");
+            }
+        }
+    }
+
+    /// Clears of one view in one list share one dynamic slot (a stand-in
+    /// clears its view at each dispatch of its program): eight clears of a
+    /// view take one, a clear of another view one more, and the views hold
+    /// their last clears; the slots come back when the list is reset.
+    #[test]
+    fn clears_of_one_view_in_a_list_share_a_dynamic_slot() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        // R32_UINT.
+        let textures: Vec<This> = (0..2)
+            .map(|_| texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .map(|&t| View::Unordered(t as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        let slots = Slots::new(2);
+        for (i, &t) in textures.iter().enumerate() {
+            slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
+        }
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<uint> b : register(t1);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 8).unwrap();
+        let free = heap_host.dynamic_free();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        for k in 1..=8 {
+            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true, None), "clear {k}");
+        }
+        assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
+        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true, None));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
+        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true, None));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
+        for t in &textures {
+            let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+        }
+        run(&list, &slots, &read, 0, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output, after the list ran.
+            let words = unsafe { (data.add(i * 8) as *const [u32; 2]).read() };
+            assert_eq!(words, [0x55, 0x77], "texel {i}: each view's last clear");
+        }
+        list.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
+        // A new recording takes a slot afresh.
+        state.set_heaps(&[heap]);
+        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true, None));
+        assert_eq!(heap_host.dynamic_free(), free - 1);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        state.reset(null);
+    }
+
+    /// A title compute pipeline of `bytes`, which do not translate: it never
+    /// gets a host pipeline, so its dispatches do not run (the gate), and
+    /// its program's hash.
+    fn gated_compute(bytes: &'static [u8]) -> (This, String) {
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+        let desc = ComputeDesc { root: std::ptr::null(), code: bytes.as_ptr(), size: bytes.len() };
+        let mut out = std::ptr::null();
+        let made = crate::pipeline::create_compute(
+            std::ptr::null(),
+            std::ptr::from_ref(&desc).cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        (out, blake3::hash(bytes).to_hex()[..16].to_owned())
+    }
+
+    /// `VICTORY_STAND_IN` (`crate::ambient`): dispatches of programs that
+    /// cannot run (no host pipeline: the gate a held-back program meets
+    /// too) clear the views their rules name in their place, direct and
+    /// indirect; a program no rule names and an indirect draw clear
+    /// nothing, and nothing of the gated programs runs.
+    #[test]
+    fn stand_ins_take_the_place_of_dispatches_that_do_not_run() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R16_FLOAT (a shadow mask, say), R8_UINT, R16_FLOAT.
+        let formats = [54u32, 62, 54];
+        let textures: Vec<This> = formats
+            .iter()
+            .map(|&f| texture_at_address(title_memory(1 << 20), &texture_words(N, N, f, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Unordered(t as usize, 0, Some([f, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        for (i, (&t, f)) in textures.iter().zip(formats).enumerate() {
+            let desc = [f, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(null, t, null, &desc, title_heap.start + 32 * i as u64);
+        }
+        let slots = Slots::new(6);
+        for (i, v) in uavs.iter().enumerate() {
+            slots.make(i as u32, v);
+        }
+        let reads: Vec<View> = textures
+            .iter()
+            .zip(formats)
+            .map(|(&t, f)| View::Shader(t as usize, Some([f, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])))
+            .collect();
+        for (i, v) in reads.iter().enumerate() {
+            slots.make(3 + i as u32, v);
+        }
+        // What the views held before: last frame's, say.
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=3))"
+RWTexture2D<float> a : register(u0);
+RWTexture2D<uint> b : register(u1);
+RWTexture2D<float> c : register(u2);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    a[id.xy] = 0.25;
+    b[id.xy] = 7;
+    c[id.xy] = 0.25;
+}
+"#,
+        );
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u1)"
+Texture2D<float> a : register(t0);
+Texture2D<uint> b : register(t1);
+Texture2D<float> c : register(t2);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store3((id.y * 16 + id.x) * 12, uint3(asuint(a.Load(at)), b.Load(at), asuint(c.Load(at))));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 12).unwrap();
+        let (direct, direct_hash) = gated_compute(b"stand-in test: a program that does not translate (direct)");
+        let (indirect, indirect_hash) = gated_compute(b"stand-in test: a program that does not translate (indirect)");
+        let (unnamed, _) = gated_compute(b"stand-in test: a program no rule names");
+        assert!(crate::pipeline::host_pipeline(direct).is_none(), "the gate");
+        let rules: &'static [crate::ambient::Rule] = Vec::leak(
+            crate::ambient::parse(&format!(
+                "{direct_hash}:s1+0:1,1,1; {direct_hash}:s1+8:mask; {indirect_hash}:s1+16:0.5,0.5,0.5"
+            ))
+            .unwrap(),
+        );
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(Some(rules)));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 1, title_heap.start);
+        for v in &uavs {
+            readable(&list, &used(ResourceType::Uav), v, false);
+        }
+        run(&list, &slots, &write, 0, None, (N / 8, N / 8));
+        let filled = crate::ambient::filled();
+        let ran = dispatched();
+        state.set_pipeline(direct);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(crate::ambient::filled() - filled, 2, "both views of the direct program's rules");
+        state.set_pipeline(indirect);
+        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None), "the indirect dispatch does not run");
+        assert_eq!(crate::ambient::filled() - filled, 3, "the view of the indirect program's rule");
+        state.set_pipeline(direct);
+        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None));
+        state.set_pipeline(unnamed);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(crate::ambient::filled() - filled, 3, "nothing for an indirect draw or a program no rule names");
+        assert_eq!(dispatched(), ran, "nothing of the programs ran");
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(None));
+        for v in &reads {
+            readable(&list, &used(ResourceType::Srv), v, false);
+        }
+        run(&list, &slots, &read, 3, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output.
+            let [a, b, c] = unsafe { (data.add(i * 12) as *const [u32; 3]).read() };
+            assert_eq!((f32::from_bits(a), b, f32::from_bits(c)), (1.0, 0xff, 0.5), "texel {i}");
+        }
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for p in [direct, indirect, unnamed] {
+            assert_eq!(release(p), 0);
+        }
+    }
+
+    /// `VICTORY_STAND_IN` in place of an indirect dispatch that does not
+    /// run stands in for the records it would have run: with at most one
+    /// record and a count of zero (in a title buffer, at an offset that is
+    /// not 8-byte aligned, a nonzero word after it) the view keeps its
+    /// sentinel; with a count of one it is cleared; with at most no records
+    /// it keeps the sentinel; with no count it is cleared.
+    #[test]
+    fn stand_ins_in_place_of_indirect_dispatches_follow_their_record_counts() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        const SENTINEL: u32 = 0x5e5e_5e5e;
+        const STAND_IN: u32 = 0x1234_5678;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // R32_UINT.
+        let texture = texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4));
+        let desc = [42, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let uav = View::Unordered(texture as usize, 0, Some(desc));
+        crate::descriptor::create_uav(null, texture, null, &desc, title_heap.start);
+        let srv = View::Shader(texture as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+        let slots = Slots::new(2);
+        slots.make(0, &uav);
+        slots.make(1, &srv);
+        let seed = compile_cs(&format!(
+            r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<uint> a : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    a[id.xy] = {SENTINEL}u;
+}}
+"#
+        ));
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<uint> t : register(t0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store((id.y * 16 + id.x) * 4, t.Load(int3(id.xy, 0)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 4).unwrap();
+        // The title buffer holding the count.
+        let counts = title_memory(1 << 16);
+        crate::shadow::register(counts as usize, counts, 1 << 16);
+        let (gated, hash) = gated_compute(b"stand-in test: an indirect dispatch that does not translate");
+        let rules: &'static [crate::ambient::Rule] =
+            Vec::leak(crate::ambient::parse(&format!("{hash}:s1+0:{STAND_IN:#x}")).unwrap());
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(Some(rules)));
+        // (most records, count, the view after)
+        let cases = [(1, Some(0), SENTINEL), (1, Some(1), STAND_IN), (0, None, SENTINEL), (1, None, STAND_IN)];
+        for (max, count, want) in cases {
+            if let Some(n) = count {
+                // SAFETY: the title buffer's words, written before the list runs.
+                unsafe { (counts as *mut [u32; 4]).write([1, n, u32::MAX, u32::MAX]) };
+            }
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 1, title_heap.start);
+            readable(&list, &used(ResourceType::Uav), &uav, false);
+            run(&list, &slots, &seed, 0, None, (N / 8, N / 8));
+            state.set_pipeline(gated);
+            let ran = state.execute_indirect(&list, (2, 12, max), 0, count.map(|_| counts + 4));
+            assert!(!ran, "max {max} count {count:?}: the dispatch does not run");
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+            run(&list, &slots, &read, 1, Some(&out), (N / 8, N / 8));
+            list.close();
+            host.execute(&[&list]);
+            for i in [0usize, 5, 7 * 16 + 9, 255] {
+                // SAFETY: inside the mapped output, after the list ran.
+                let got = unsafe { (data.add(i * 4) as *const u32).read() };
+                assert_eq!(got, want, "max {max} count {count:?} texel {i}: {got:#x}");
+            }
+        }
+        crate::ambient::TEST_INSTEAD.with(|t| t.set(None));
+        crate::shadow::unregister(counts as usize, counts);
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(gated), 0);
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the

@@ -421,6 +421,13 @@ impl HostHeap {
         self.count
     }
 
+    /// The dynamic slots free now (tests).
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> usize {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.iter().filter(|&&taken| !taken).count()
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
