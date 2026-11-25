@@ -109,6 +109,8 @@ pub(crate) struct Shader {
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
+    /// The heap-usage bitmap's handle, once a heap slot is marked.
+    pub heap_used: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
     /// The view-mark table's and the buffer views' written-pages bitmap's
@@ -178,6 +180,7 @@ impl Shader {
             root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
+            heap_used: None,
             view_addresses: None,
             view_marks: None,
             view_writes: None,
@@ -557,6 +560,7 @@ impl Shader {
             || !self.root_uavs.is_empty()
             || self.memory.is_some()
             || self.memory_dirty.is_some()
+            || self.heap_used.is_some()
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
