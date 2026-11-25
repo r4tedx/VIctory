@@ -445,6 +445,8 @@ pub struct Structured {
     pub bools: Bools,
     /// Per block.
     pub exits: Vec<LaneExit>,
+    /// Joins with an incoming edge that only part of a wave can take.
+    pub(crate) divergent_joins: Vec<bool>,
     /// Per block and instruction: the condition, beyond reaching it, under
     /// which a lane runs a vector instruction; `None` when reaching it is
     /// enough (lanes outside EXEC then never get there, so a VGPR write
@@ -857,6 +859,25 @@ impl<'a> Lanes<'a> {
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
+        // Test the incoming edges before the loop-header path calculation
+        // forgets the atoms defined in the loop. A scalar phi on a divergent
+        // back edge must carry one value for the wave's next iteration.
+        let divergent_joins = blocks
+            .iter()
+            .enumerate()
+            .map(|(n, block)| {
+                !self.console
+                    && block.phis.iter().any(|phi| !matches!(phi.reg, Reg::V(_)))
+                    && (0..self.incoming[n].len()).any(|i| {
+                        let (q, taken) = self.incoming[n][i];
+                        let edge = self.edge(cond[q], q, taken);
+                        self.b
+                            .support(edge)
+                            .iter()
+                            .any(|a| !matches!(a, Atom::Uniform(_)))
+                    })
+            })
+            .collect();
         let b = &mut self.b;
         let guards = blocks
             .iter()
@@ -923,6 +944,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             bools: self.b,
             exits,
+            divergent_joins,
             guards,
             execs: execs.to_vec(),
             pairs: self
