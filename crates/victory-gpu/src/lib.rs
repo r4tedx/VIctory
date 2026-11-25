@@ -59,6 +59,8 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod tables;
+#[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;

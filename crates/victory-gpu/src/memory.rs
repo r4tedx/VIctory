@@ -35,8 +35,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
@@ -96,8 +94,7 @@ struct Shared {
     /// The host heap it was made for (a heap made later at a released one's
     /// address is another).
     host: usize,
-    table: ID3D12Resource,
-    data: usize,
+    table: crate::tables::Table,
     gpu: u64,
     /// The pair of null views entries without a copy name.
     null: u32,
@@ -108,8 +105,8 @@ struct Shared {
     layout: Arc<Layout>,
 }
 
-// SAFETY: `data` is the persistent mapping of `table`, written only under
-// the lock; D3D12 resources are free-threaded.
+// SAFETY: the table's mapping is written only under the lock; D3D12
+// resources are free-threaded.
 unsafe impl Send for Shared {}
 
 /// Page tables by view heap (the title heap's address, or [`OURS`]).
@@ -326,16 +323,13 @@ impl Shared {
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = (LEVEL1 + (CAPACITY + 1) * BLOCK * 2) as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
-        crate::host::name(&table, || "title memory page table".into());
+        let table = crate::tables::Table::new(bytes as usize, "title memory page table")?;
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
-        // SAFETY: a live buffer.
-        let gpu = unsafe { table.GetGPUVirtualAddress() };
+        let gpu = table.gpu();
         Some(Shared {
             host: std::ptr::from_ref(heap) as usize,
             table,
-            data: data as usize,
             gpu,
             null,
             pairs: HashMap::new(),
@@ -380,9 +374,9 @@ impl Shared {
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
         let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
-        // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
-        // keeps to; no submission runs.
-        unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
+        // The table has room for `CAPACITY` blocks, which `table` keeps to;
+        // no submission runs.
+        self.table.write(0, &dwords);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
@@ -442,13 +436,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
+            list.keep(s.table.resource());
             return Some(s.gpu);
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
-        list.keep(&s.table);
+        list.keep(s.table.resource());
         let gpu = s.gpu;
         shared.push((key, s));
         Some(gpu)
@@ -546,7 +540,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Writes of lists using title memory are held back from a frame with a
@@ -635,7 +629,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline(source: &str) -> (
+    pub(crate) fn pipeline(source: &str) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
