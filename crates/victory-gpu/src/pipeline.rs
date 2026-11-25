@@ -208,6 +208,10 @@ struct Pipeline {
     /// ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Whether one of its programs walks the builder's structures
+    /// (`image_bvh*_intersect_ray`, [`builder::built`]).
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -246,12 +250,43 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// Whether a dispatch with the title pipeline is held back: it is the
+/// Why a dispatch with the title pipeline is held back, if it is: it is the
 /// acceleration-structure builder's, which does not run this frame
-/// ([`builder::runs`]).
+/// ([`builder::runs`]), or it walks the builder's structures, which the
+/// builder has not built yet ([`builder::built`]).
 #[cfg(windows)]
-pub(crate) fn held_back(this: This) -> bool {
-    !this.is_null() && pipeline(this).builder && !builder::runs()
+pub(crate) fn held_back(this: This) -> Option<&'static str> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if p.builder && !builder::runs() {
+        return Some("the BVH builder held back: not all its pipelines are made");
+    }
+    if p.walks_bvh && !builder::built() {
+        return Some("a BVH walk held back: the builder has not built its structures");
+    }
+    None
+}
+
+/// Whether a console container's programs walk acceleration structures
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`).
+#[cfg(windows)]
+fn walks_bvh(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.code)))
+}
+
+/// Whether GFX10 machine code has an `image_bvh*_intersect_ray`.
+#[cfg(windows)]
+fn code_walks_bvh(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code)
+        .is_ok_and(|insts| insts.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
@@ -392,6 +427,8 @@ fn hand_out(
     #[cfg(not(windows))]
     let _ = code;
     #[cfg(windows)]
+    let walks_bvh = !builder && shaders.iter().any(|s| walks_bvh(&s.container));
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
@@ -406,6 +443,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -787,13 +826,42 @@ mod tests {
         assert!(refused, "the builder's pipeline was started");
         assert_eq!(make::state(&pipeline(p).host), Some(false));
         assert!(
-            held_back(p),
+            held_back(p).is_some(),
             "one builder pipeline missing: the builder waits"
         );
-        assert!(!held_back(other));
+        assert_eq!(held_back(other), None);
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    /// Programs with `image_bvh_intersect_ray` or its 64-bit form walk the
+    /// builder's structures; others do not.
+    #[cfg(windows)]
+    #[test]
+    fn programs_that_intersect_rays_walk_the_structures() {
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        // Result v[20:23], descriptor s[12:15] (as in victory-shader's BVH tests).
+        let rest = 20 << 8 | 3 << 16;
+        let narrow = code(&[0xF198_9F01, rest | 2, S_ENDPGM]);
+        // NSA: pointer v2, v13, then the ray from v3 to v12.
+        let wide = code(&[0xF19C_9F07, rest | 2, 0x0504_030D, 0x0908_0706, 0x000C_0B0A, S_ENDPGM]);
+        assert!(code_walks_bvh(&narrow), "image_bvh_intersect_ray");
+        assert!(code_walks_bvh(&wide), "image_bvh64_intersect_ray");
+        assert!(!code_walks_bvh(&code(&[S_ENDPGM])));
+    }
+
+    /// What walks the structures waits until the builder has run whole: in a
+    /// title with the builder, not before; in a title without it, at once.
+    #[cfg(windows)]
+    #[test]
+    fn walks_wait_for_the_builder_to_run_whole() {
+        let _one = builder::test_lock();
+        builder::note_title_dll("XboxBvhBuilder.dll", 0x1000, 0x1000);
+        assert!(!builder::built(), "a title with the builder: not built yet");
+        builder::clear_image_for_tests();
+        assert!(builder::built(), "a title without the builder: walks run");
     }
 
     #[test]

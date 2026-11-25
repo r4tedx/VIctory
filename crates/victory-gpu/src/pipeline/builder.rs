@@ -14,6 +14,13 @@
 //!
 //! Its pipelines are known by where they come from: created by its code (a
 //! return address in its image on the stack) or from bytecode in its image.
+//!
+//! The programs that walk the structures (`image_bvh*_intersect_ray`) wait
+//! for the builder too: until it has run whole once, the structures are
+//! whatever lay in that memory, and a walk of them (the title bounds it at
+//! 65,535 steps per wave) outlasts the host's GPU timeout. On a host where
+//! the builder cannot run (its 64-lane programs refused on 32-lane waves)
+//! they never run, and the device is not lost (`built`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -37,6 +44,16 @@ pub fn note_title_dll(file: &str, base: usize, size: usize) {
 
 fn image() -> Option<(usize, usize)> {
     *IMAGE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The builder has run whole in some frame: its structures exist.
+static BUILT: AtomicBool = AtomicBool::new(false);
+
+/// Whether programs that walk the structures may run: the builder has run
+/// whole once, or the title has no builder (its structures come from
+/// elsewhere).
+pub(crate) fn built() -> bool {
+    BUILT.load(Ordering::Relaxed) || image().is_none()
 }
 
 /// Whether the pipeline being created is the builder's: `code` (the title's
@@ -131,6 +148,10 @@ pub(crate) fn runs() -> bool {
         );
     }
     *decided = (frame, open);
+    // Asked at a builder dispatch: with every pipeline made, it runs whole.
+    if open && !states.is_empty() && !BUILT.swap(true, Ordering::Relaxed) {
+        tracing::info!(frame, "BVH builder ran whole: programs that walk its structures run from here on");
+    }
     open
 }
 
@@ -147,7 +168,14 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
+    BUILT.store(false, Ordering::Relaxed);
     guard
+}
+
+/// No builder mapped (a title without it).
+#[cfg(test)]
+pub(crate) fn clear_image_for_tests() {
+    *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(test)]
