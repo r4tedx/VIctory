@@ -234,6 +234,11 @@ impl Host {
     /// The wave sizes the device runs ([`super::Target::ANY`] if it does
     /// not say).
     pub fn target(&self) -> super::Target {
+        self.reported_target().unwrap_or(super::Target::ANY)
+    }
+
+    /// The device's wave range, only when it reports support for wave operations.
+    pub(super) fn reported_target(&self) -> Option<super::Target> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         // SAFETY: the query writes the structure of the given size.
         let ok = unsafe {
@@ -245,14 +250,10 @@ impl Host {
                 )
                 .is_ok()
         };
-        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
-            super::Target {
-                lanes_min: o.WaveLaneCountMin,
-                lanes_max: o.WaveLaneCountMax,
-            }
-        } else {
-            super::Target::ANY
-        }
+        (ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0).then_some(super::Target {
+            lanes_min: o.WaveLaneCountMin,
+            lanes_max: o.WaveLaneCountMax,
+        })
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -914,6 +915,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        group_waves: lowered.group_waves,
     })
 }
 
@@ -992,6 +994,7 @@ pub fn position_vs() -> HostShader {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        group_waves: 1,
     }
 }
 
@@ -1062,6 +1065,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        group_waves: 1,
     }
 }
 

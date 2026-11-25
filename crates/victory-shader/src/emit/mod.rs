@@ -342,6 +342,13 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Compute: host thread groups per console thread group (1 unless the
+    /// console's group is several wave64 waves emitted as one host group of
+    /// 64 threads each, on a host without 64-lane waves). A dispatch of
+    /// (x, y, z) console groups must run (x * group_waves, y, z) host
+    /// groups: host group id x is console group x / group_waves, wave
+    /// x % group_waves.
+    pub group_waves: u32,
 }
 
 impl HostShader {
@@ -739,6 +746,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        group_waves: l.group_waves,
     })
 }
 
@@ -1512,6 +1520,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            group_waves: 1,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1530,6 +1539,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                group_waves: 1,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2455,11 +2465,16 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: each console wave is a host group of its own on
+        // NVIDIA.
         let two = compute_of(&words, true, 128);
-        assert!(emit_for(&two, RDNA).is_ok());
+        assert_eq!(emit_for(&two, RDNA).map(|s| s.group_waves), Ok(1));
+        assert_eq!(emit_for(&two, NVIDIA).map(|s| s.group_waves), Ok(2));
+        // A group that is no whole number of console waves still stops.
+        let partial = compute_of(&words, true, 96);
+        assert!(emit_for(&partial, RDNA).is_ok());
         assert_eq!(
-            emit_for(&two, NVIDIA),
+            emit_for(&partial, NVIDIA).map(|s| s.group_waves),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
@@ -2505,9 +2520,9 @@ mod tests {
 
     /// On every hardware adapter: a wave64 program that reads other lanes
     /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// flow) and the adapter takes it; in groups of two it is one host
+    /// group where the adapter runs 64-lane waves and two where it does not.
+    /// On a machine with an AMD and an NVIDIA GPU this checks both answers.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -2527,14 +2542,15 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                two.group_waves,
+                if target.runs(64) { 1 } else { 2 },
+                "{name}"
+            );
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

@@ -91,20 +91,28 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
             roots: vec![(0, Root::Constants(data))],
             views: &views,
             samplers: &[],
-            groups: [groups, 1, 1],
+            // One host group per console wave where the shader says so.
+            groups: [groups * cs.group_waves, 1, 1],
         },
     )?;
     Ok(out.into_iter().next().unwrap_or_default())
 }
 
+fn hardware_adapters() -> Vec<String> {
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("VICTORY_WARP=1; skipping hardware adapters");
+        return Vec::new();
+    }
+    adapters().unwrap_or_else(|e| {
+        eprintln!("no DXGI; skipped: {e}");
+        Vec::new()
+    })
+}
+
 #[test]
 fn in_half_lane_reads_match_the_console_on_every_adapter() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
     let mut ran = 0;
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
@@ -139,10 +147,24 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
 /// 3-D groups: the console forms waves from the flat thread id (x
 /// fastest). Lane f (f = x + X * (y + Y * z)) stores f ^ 31 at dword f.
 fn program_3d(threads: [u32; 3]) -> crate::NativeProgram {
+    program_3d_of(
+        threads,
+        &[
+            0xD8D4_401F,
+            0x0100_0004, // ds_swizzle_b32 v1, v4 offset:swizzle(BITMASK_PERM, and 0x1f, xor 0x10)
+            0x7E04_02FA,
+            0xFF01_4001, // v_mov_b32_dpp v2, v1 row_mirror
+        ],
+    )
+}
+
+/// [`program_3d`] with `core` between the flat id (in v4) and the store of
+/// v2 at dword f.
+fn program_3d_of(threads: [u32; 3], core: &[u32]) -> crate::NativeProgram {
     let [x, y, _] = threads;
     let (sx, sxy) = (x.trailing_zeros(), (x * y).trailing_zeros());
     assert!(x.is_power_of_two() && y.is_power_of_two());
-    let words = [
+    let mut words = vec![
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
@@ -152,15 +174,14 @@ fn program_3d(threads: [u32; 3]) -> crate::NativeProgram {
         0x340C_0400 | (128 + sxy), // v_lshlrev_b32 v6, log2 XY, v2
         0x4A08_0B00,               // v_add_nc_u32 v4, v0, v5
         0x4A08_0D04,               // v_add_nc_u32 v4, v4, v6
-        0xD8D4_401F,
-        0x0100_0004, // ds_swizzle_b32 v1, v4 offset:swizzle(BITMASK_PERM, and 0x1f, xor 0x10)
-        0x7E04_02FA,
-        0xFF01_4001, // v_mov_b32_dpp v2, v1 row_mirror
+    ];
+    words.extend_from_slice(core);
+    words.extend([
         0x3406_0882, // v_lshlrev_b32 v3, 2, v4
         0xE070_1000,
         0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
         S_ENDPGM,
-    ];
+    ]);
     let mut p = compute(&words, true);
     p.layout = program(&[], 64).layout;
     // One user SGPR; thread ids x, y and z in v0..v2.
@@ -173,11 +194,7 @@ fn program_3d(threads: [u32; 3]) -> crate::NativeProgram {
 
 #[test]
 fn three_dimensional_groups_keep_the_consoles_lanes() {
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -219,11 +236,7 @@ fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32
         unreachable!()
     };
     let threads = io.threads[0];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
@@ -292,8 +305,10 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// The console flow is for one console wave per host group. A group of
+/// several console waves that share no LDS is emitted as that many host
+/// groups of 64 threads; one whose waves share LDS, or meet at an
+/// `s_barrier`, or whose size is no multiple of 64, still stops.
 #[test]
 fn console_flow_is_for_one_console_wave_per_group() {
     let body = [
@@ -305,8 +320,88 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_min: 32,
         lanes_max: 32,
     };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    let amd = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    assert_eq!(
+        emit_for(&program(&body, 64), nvidia).unwrap().group_waves,
+        1
+    );
+    let two = emit_for(&program(&body, 128), nvidia).unwrap();
+    assert_eq!(two.group_waves, 2);
+    assert_eq!(wave_size(&two.dxil), Some(32));
+    assert_eq!(
+        emit_for(&program(&body, 1024), nvidia).unwrap().group_waves,
+        16
+    );
+    // A host with 64-lane waves keeps the console's groups.
+    assert_eq!(emit_for(&program(&body, 128), amd).unwrap().group_waves, 1);
+    let stops = |p: &crate::NativeProgram| {
+        let e = emit_for(p, nvidia).expect_err("stops").to_string();
+        assert!(
+            e.contains("in a group of more than 64 threads"),
+            "the reason: {e}"
+        );
+    };
+    stops(&program(&body, 96));
+    stops(&program_lds(&body, 128));
+    let mut with_barrier = body.to_vec();
+    with_barrier.push(0xBF8A_0000); // s_barrier
+    stops(&program(&with_barrier, 128));
+}
+
+/// Groups of two and four console waves as host groups of one wave each,
+/// two console groups per dispatch. v0 is the thread id in the console's
+/// group and s1 its group id, which the store address is built from: lane
+/// 40 of each wave holds 64 * wave + 40, and a mask of the lanes whose id
+/// in the wave is below 40 counts 40 in every wave.
+#[test]
+fn groups_of_several_console_waves_run_as_one_host_group_each() {
+    let read = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let count = [
+        0x3602_00BF, // v_and_b32 v1, 63, v0
+        0x7D88_02A8, // v_cmp_gt_u32 vcc, 40, v1
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    for threads in [128, 256] {
+        console_flow_case("v_readlane 40 in each wave", &read, threads, |t| {
+            (t & !63) + 40
+        });
+        console_flow_case("s_bcnt1 of 40 lanes in each wave", &count, threads, |_| 40);
+    }
+    // 2-D and 3-D groups: the console forms its waves from the flat thread
+    // id, which the three ids give (v4); lane 40 of each wave holds
+    // 64 * wave + 40.
+    for name in hardware_adapters() {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        for threads in [[16, 16, 1], [8, 16, 1], [8, 8, 2], [4, 4, 8], [32, 32, 1]] {
+            let read = [
+                0xD760_0009,
+                0x0001_5104, // v_readlane_b32 s9, v4, 40
+                0x7E04_0209, // v_mov_b32 v2, s9
+            ];
+            let p = program_3d_of(threads, &read);
+            let n: u32 = threads.iter().product();
+            let out = run(&host, &p, 1).unwrap_or_else(|e| panic!("{name}: {threads:?}: {e}"));
+            let want: Vec<u32> = (0..n).map(|f| (f & !63) + 40).collect();
+            assert_eq!(out, want, "{name}: {threads:?}");
+            eprintln!("{name}: v_readlane 40 in each wave, {threads:?} exact");
+        }
+    }
+    // A whole-wave section in each wave: the sum of its thread ids.
+    let mut sum = reduction_scan(37, 0x80);
+    sum.push(0x7E04_020A); // v_mov_b32 v2, s10
+    console_flow_case("a whole-wave sum in each wave", &sum, 128, |t| {
+        2016 + 64 * 64 * (t / 64)
+    });
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -651,8 +746,9 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves only in a group of exactly one
-/// console wave: with a partial upper half, or none, it still stops.
+/// A whole-wave section crosses the halves in a group of exactly one
+/// console wave, and needs no crossing in a group of 32 threads or fewer
+/// (the lower half alone): with a partial upper half it still stops.
 #[test]
 fn whole_wave_sections_in_partial_groups_still_stop() {
     let nvidia = super::Target {
@@ -661,8 +757,13 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
     };
     let mut body = reduction_scan(37, 0x80);
     body.push(0x7E04_020A); // v_mov_b32 v2, s10
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    for threads in [48, 32] {
+    for threads in [64, 32, 16] {
+        assert!(
+            emit_for(&program(&body, threads), nvidia).is_ok(),
+            "{threads} threads"
+        );
+    }
+    for threads in [48, 33] {
         assert_eq!(
             emit_for(&program(&body, threads), nvidia),
             Err(crate::ShaderError::Unsupported {
@@ -671,6 +772,28 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
             }),
             "{threads} threads"
         );
+    }
+}
+
+/// A wave64 group of 32 threads or fewer is the console wave's lower half
+/// alone: its upper lanes are in no mask, so a whole-wave reduction is the
+/// one host wave's, with nothing exchanged. (With the halves combined as in
+/// a full wave, a minimum or an AND would take the absent half's 0.)
+#[test]
+fn whole_wave_reductions_in_a_group_of_one_half() {
+    // (operation, VOP2 opcode, identity operand, the console's result per
+    // thread count)
+    for (label, opcode, ident, want) in [
+        ("v_add_nc_u32", 37, 0x80, [496, 120]),
+        ("v_max_u32", 20, 0x80, [31, 15]),
+        ("v_min_u32", 19, 0xC1, [0, 0]),
+        ("v_or_b32", 28, 0x80, [31, 15]),
+    ] {
+        for (threads, want) in [32, 16].into_iter().zip(want) {
+            let mut body = reduction_scan(opcode, ident);
+            body.push(0x7E04_020A); // v_mov_b32 v2, s10
+            console_flow_case(&format!("whole-wave {label}"), &body, threads, |_| want);
+        }
     }
 }
 
@@ -963,17 +1086,15 @@ fn selects_on_masks_held_as_numbers() {
         0xD501_0002,
         0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
     ];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    for name in names {
+    for name in hardware_adapters() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
         for (label, body, by_group) in [("constant", &constant[..], false), ("built", &built, true)]
         {
-            for (wave64, threads) in [(true, 64), (false, 64), (false, 32)] {
+            // (128 threads of a wave64: two console waves, one host group
+            // each where the host has no 64-lane waves.)
+            for (wave64, threads) in [(true, 64), (false, 64), (false, 32), (true, 128)] {
                 let mut p = program(body, threads);
                 p.wave64 = wave64;
                 let groups = 2;
@@ -984,8 +1105,8 @@ fn selects_on_masks_held_as_numbers() {
                         // s8 = g * threads * 4: bit 8 in group 1 of 64, bit 7 of 32.
                         let lo = 0x0F0F_0F0F | if by_group { g * threads * 4 } else { 0 };
                         (0..threads).map(move |t| {
-                            let (word, lane) = if wave64 && t >= 32 {
-                                (0x3333_3333, t - 32)
+                            let (word, lane) = if wave64 && t % 64 >= 32 {
+                                (0x3333_3333, t % 64 - 32)
                             } else {
                                 (lo, t % 32)
                             };
@@ -1261,4 +1382,97 @@ fn selects_on_constant_masks_beside_in_half_reads() {
         |t| if t == 0 || t == 2 { t } else { t ^ 16 },
         true,
     );
+}
+
+/// The exit mask of a loop its lanes leave at different iterations, counted
+/// after the loop: all 64 lanes are in it. Per lane, each lane counted what
+/// its own path saw (1 on a host with 64-lane waves). Fixture from the
+/// scalar-state patch posted on upstream PR #439, after PR #269's.
+#[test]
+fn loop_exit_mask_counted_after_the_loop() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1 (v1 - 1)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("loop_exit_mask_counted_after_the_loop", &body, 64, |_| 64);
+}
+
+/// A mask grown inside a branch only lanes 32-63 take and counted after it:
+/// lanes 0-15 and 32-47. Per lane the program stopped (`a lane mask holding
+/// lanes elsewhere read as data`). Same source as the test above.
+#[test]
+fn mask_grown_inside_a_branch_counted_after_it() {
+    let body = [
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0      (lanes 0-15)
+        0xBE8A_046A, // s_mov_b64 s[10:11], vcc
+        0x7D86_00A0, // v_cmp_le_u32 vcc, 32, v0      (lanes 32-63)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0      (of those: 32-47)
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x88FE_0C7E, // join: s_or_b64 exec, exec, s[12:13]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case(
+        "mask_grown_inside_a_branch_counted_after_it",
+        &body,
+        64,
+        |_| 32,
+    );
+}
+
+/// The wave32 form of `loop_exit_mask_counted_after_the_loop`, with one
+/// dword of mask per wave.
+fn wave32_exit_mask_program(threads: u32) -> crate::NativeProgram {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+        0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let mut p = program(&body, threads);
+    p.wave64 = false;
+    p
+}
+
+#[test]
+fn wave32_loop_exit_mask_counted_after_the_loop() {
+    let p = wave32_exit_mask_program(32);
+    program_case("wave32 loop exit mask counted", &p, |_| 32, true);
+}
+
+#[test]
+fn wave32_loop_exit_mask_counts_a_partial_second_wave() {
+    let p = wave32_exit_mask_program(48);
+    let groups = 3;
+    let expected: Vec<u32> = (0..groups)
+        .flat_map(|_| (0..48).map(|lane| if lane < 32 { 32 } else { 16 }))
+        .collect();
+    for name in hardware_adapters() {
+        let Ok(host) = Host::on(&name) else { continue };
+        // This case checks native Wave32 execution. WARP can report
+        // incorrect active-lane counts for a partial wave.
+        if host.reported_target().is_some_and(|target| target.runs(32)) {
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(out, expected, "{name}: partial Wave32 exit mask");
+            eprintln!("{name}: all {} lane counts exact", out.len());
+        } else {
+            eprintln!("{name}: native Wave32 support not reported; skipped");
+        }
+    }
 }
