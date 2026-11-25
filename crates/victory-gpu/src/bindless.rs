@@ -571,6 +571,125 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
+    /// Reads texel (0, 0) of mips 0 and 1 of slot 0's texture into slot 1.
+    const MIPS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+Texture2D<float4> tex : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, (uint)round(tex.Load(int3(0, 0, 0)).x * 255.0));
+    dst.Store(4, (uint)round(tex.Load(int3(0, 0, 1)).x * 255.0));
+}
+"#;
+
+    /// A texture of two mips in memory the change journal follows, viewed
+    /// by a heap and read in turn through the heap and through a table
+    /// (`texture::upload`, every subresource copied), as a texture's role
+    /// changes: the first upload detiles both mips, a title write into one
+    /// mip detiles that mip alone, and the shader reads the new texels there
+    /// and the kept ones in the other, whichever way came before; no write,
+    /// nothing detiled.
+    #[test]
+    fn a_write_into_one_mip_uploads_that_mip_alone_through_the_heap_or_a_table() {
+        let p = crate::watch::tests::pool(24);
+        one_mip_rounds(p, p);
+        // The pool stays: the texture and its tracker outlive the test.
+    }
+
+    /// The same with the title writing the texture through another mapping
+    /// of its pages (it fills streamed textures through a pool view).
+    #[test]
+    fn a_write_into_one_mip_through_another_mapping_uploads_that_mip_alone() {
+        let (a, b) = crate::watch::tests::twin_views(24);
+        one_mip_rounds(a, b);
+    }
+
+    /// [`a_write_into_one_mip_uploads_that_mip_alone_through_the_heap_or_a_table`]
+    /// with the texture at `at` and the title writing it at `written`.
+    fn one_mip_rounds(at: usize, written: usize) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        // RGBA8 512x512, two mips, linear (smallest mip first).
+        let words: [u32; 14] = [3, 0, 0, 0, 512, 0, 512, 1 | 2 << 16, 28, 1, 0, LINEAR, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut tex = null;
+        assert_eq!(crate::resource::create_at_address(null, at as u64, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut tex), S_OK);
+        let (_, desc) = crate::resource::texture_memory(tex).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        assert!(layout.size as usize <= 24 * PAGE_BYTES);
+        let mip = |m: usize| {
+            let mip = &layout.mips[m];
+            (written + mip.offset as usize, (mip.pitch * mip.rows * 4) as usize)
+        };
+        let dst = resource(1, 256, 1, 0, 1);
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(0));
+        crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
+        let heap_host = title_heap.host().expect("a host view heap");
+        let texture = crate::resource::host_resource(tex).expect("its host texture").clone();
+        let (root, pso) = compile(MIPS);
+        let list = host.new_list().unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        // Through the heap (or a table); what the title writes (mip, byte)
+        // after recording; the subresources detiled; the texels of mips 0
+        // and 1.
+        type Round = (bool, &'static [(usize, u8)], u64, [u32; 2]);
+        let rounds: [Round; 7] = [
+            (true, &[(0, 0x40), (1, 0x40)], 2, [0x40, 0x40]),
+            (true, &[(1, 0x80)], 1, [0x40, 0x80]),
+            (false, &[(0, 0x10)], 1, [0x10, 0x80]),
+            (true, &[], 0, [0x10, 0x80]),
+            (false, &[(1, 0x22)], 1, [0x10, 0x22]),
+            (true, &[(0, 0x33)], 1, [0x33, 0x22]),
+            (false, &[], 0, [0x33, 0x22]),
+        ];
+        let mut detiled = 0;
+        for (round, (heaped, writes, n, texels)) in rounds.into_iter().enumerate() {
+            if round > 0 {
+                list.reset();
+            }
+            if !heaped {
+                // A table names it: the list copies every subresource.
+                crate::texture::upload(&list, tex, &texture);
+                crate::list::ensure_state(&list, tex, 0x40 | 0x80);
+            }
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            if heaped {
+                list.defer_heap(&heap_host.viewed);
+            }
+            list.close();
+            for &(m, byte) in writes {
+                let (at, len) = mip(m);
+                // SAFETY: mip `m`'s bytes in the texture's memory.
+                unsafe { std::ptr::write_bytes(at as *mut u8, byte, len) };
+            }
+            host.execute(&[&list]);
+            let now = crate::texture::detiled(tex);
+            assert_eq!(now - detiled, n, "round {round} (heap: {heaped}): subresources detiled");
+            detiled = now;
+            let words = out.read_host(dst_bytes as u64, 2);
+            assert_eq!(words, texels, "round {round} (heap: {heaped}): texels of mips 0 and 1");
+        }
+    }
+
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),
     /// submit, check the output's host copy.
