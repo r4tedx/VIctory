@@ -80,8 +80,33 @@ impl Drop for Pages<'_> {
 /// copy-back of marked pages).
 #[derive(Default)]
 struct Saved {
-    armed: BTreeSet<usize>,
+    /// The armed pages as runs `[first, last)`, none inside another: a
+    /// root view declares its copy from its address to the end, the
+    /// world's 174 MB heap many times a submission, and a set entry per
+    /// page cost 30 microseconds a declaration.
+    armed: Vec<(usize, usize)>,
+    /// Pages of those runs that are not armed any more.
+    unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+}
+
+impl Saved {
+    /// Whether page `page` is armed.
+    fn armed(&self, page: usize) -> bool {
+        self.armed.iter().any(|&(first, last)| (first..last).contains(&page)) && !self.unarmed.contains(&page)
+    }
+
+    /// Arms pages `[first, last)`.
+    fn arm(&mut self, first: usize, last: usize) {
+        if !self.unarmed.is_empty() {
+            self.unarmed.retain(|page| !(first..last).contains(page));
+        }
+        if self.armed.iter().any(|&(a, b)| a <= first && last <= b) {
+            return;
+        }
+        self.armed.retain(|&(a, b)| !(first <= a && b <= last));
+        self.armed.push((first, last));
+    }
 }
 
 impl Changed {
@@ -99,7 +124,7 @@ impl Changed {
     /// taken: its bytes now, if armed for it.
     fn save(&self, page: usize) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
-        if !saved.armed.contains(&page) || saved.bytes.contains_key(&page) {
+        if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
         let mut bytes = vec![0u8; PAGE].into_boxed_slice();
@@ -411,20 +436,24 @@ impl Tracked {
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
+            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
         }
     }
 
     /// Page `page` (a page number) needs no saving any more: its copy-back
     /// is under way.
     pub(crate) fn unarm(&self, page: usize) {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.armed(page) {
+            saved.unarmed.insert(page);
+        }
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
         saved.armed.clear();
+        saved.unarmed.clear();
         saved.bytes.clear();
     }
 
@@ -792,6 +821,47 @@ pub(crate) mod tests {
         assert_eq!(t.take(p, p + 3 * PAGE), [(p + PAGE, p + 2 * PAGE + 100)]);
         assert!(t.take(p, p + 3 * PAGE).is_empty());
         assert!(t.unchanged());
+        drop(t);
+        free(p);
+    }
+
+    /// Pages of the ranges armed keep their bytes from before the first
+    /// write after they were taken, whichever overlapping ranges armed
+    /// them; a page unarmed keeps none until it is armed again, and none
+    /// does once the tracker is disarmed.
+    #[test]
+    fn armed_ranges_keep_their_pages_bytes_from_before_the_first_write() {
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("pool memory is tracked");
+        let all = || t.take(p, p + 4 * PAGE);
+        // SAFETY: (every write below) a byte of our pool; a guarded page
+        // faults into the handler, which saves it first where it is armed.
+        let write = |page: usize, value: u8| unsafe { ((p + page * PAGE + 8) as *mut u8).write_volatile(value) };
+        let saved = |page: usize| t.saved(p / PAGE + page).map(|bytes| bytes[8]);
+        all();
+        write(0, 1);
+        assert_eq!(saved(0), None, "nothing armed yet");
+        all();
+        // Bytes 100 of page 0 to 1 of page 2: pages 0 to 2, page 3 not.
+        t.arm(p + 100, p + 2 * PAGE + 1);
+        t.arm(p + PAGE, p + 2 * PAGE);
+        t.arm(p + PAGE + 5, p + 2 * PAGE + 1);
+        t.unarm(p / PAGE + 1);
+        for page in 0..4 {
+            write(page, 2);
+        }
+        assert_eq!([saved(0), saved(1), saved(2), saved(3)], [Some(1), None, Some(0), None]);
+        assert_eq!(saved(0), None, "handed out once");
+        all();
+        // Armed again by a range holding it.
+        t.arm(p + PAGE, p + 2 * PAGE);
+        write(1, 3);
+        write(1, 4);
+        assert_eq!(saved(1), Some(2), "from before the first write");
+        t.disarm();
+        all();
+        write(2, 5);
+        assert_eq!(saved(2), None, "disarmed");
         drop(t);
         free(p);
     }
