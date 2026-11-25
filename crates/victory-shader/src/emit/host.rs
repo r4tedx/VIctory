@@ -319,6 +319,9 @@ impl Host {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
+        if stages.iter().any(|(s, _)| s.heap_usage) {
+            views.push((super::HEAP_USAGE, super::MEMORY_SPACE, 2));
+        }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -876,6 +879,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         root_uavs: lowered.root_uavs,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
+        heap_usage: lowered.heap_usage,
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
@@ -975,6 +979,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_uavs: Vec::new(),
         memory: false,
         memory_writes: false,
+        heap_usage: false,
         view_addresses: false,
         heap: false,
         heap_writes: false,
