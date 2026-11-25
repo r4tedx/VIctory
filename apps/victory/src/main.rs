@@ -91,13 +91,18 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Count the instructions of every emitted shader (the DXIL the
+        /// host's compiler is given): the total, by stage and by kind; with
+        /// `--list`, a line per program too.
+        #[arg(long)]
+        count: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        #[arg(long, conflicts_with_all = ["validate", "list", "count"])]
         cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -179,9 +184,10 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            count,
             jobs,
             cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => translate::run(paths, validate, pipelines, list, count, jobs),
         Command::Run {
             exe,
             unimplemented,
