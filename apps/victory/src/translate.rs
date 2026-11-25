@@ -374,7 +374,12 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    pipelines: bool,
+    host_lanes: Option<(u32, u32)>,
+) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
@@ -391,8 +396,14 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     // Containers already cached, translated now, refused now.
     let counts = [const { AtomicUsize::new(0) }; 3];
     // The run's own host and wave sizes: entries are keyed by them, so
-    // another target's would never be found.
-    let target = victory_gpu::shader_cache::host_target();
+    // another target's would never be found. `--host-lanes` names the
+    // wave sizes of the card the cache is for, when this pass runs on
+    // another adapter.
+    let target = match host_lanes {
+        Some((lanes_min, lanes_max)) => victory_shader::emit::Target { lanes_min, lanes_max },
+        None => victory_gpu::shader_cache::host_target(),
+    };
+    println!("host waves   {}-{} lanes", target.lanes_min, target.lanes_max);
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()

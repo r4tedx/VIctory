@@ -108,8 +108,9 @@ enum Command {
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines), for this
-        /// host's wave sizes as `run` translates.
-        #[arg(long, conflicts_with_all = ["validate", "list", "count", "host_lanes"])]
+        /// host's wave sizes as `run` translates, or for the wave sizes
+        /// `--host-lanes` names (a pass on another adapter for this card).
+        #[arg(long, conflicts_with_all = ["validate", "list", "count"])]
         cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -184,8 +185,9 @@ fn main() -> Result<()> {
             jobs,
             pipelines,
             cache: true,
+            host_lanes,
             ..
-        } => translate::warm(paths, jobs, pipelines),
+        } => translate::warm(paths, jobs, pipelines, host_lanes),
         Command::Translate {
             paths,
             validate,
