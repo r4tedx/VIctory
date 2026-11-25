@@ -2883,11 +2883,21 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// Whether a quad-local read must reach discarded lanes: after a pixel's
-    /// discard they are the host's helpers, which only quad reads see (wave
-    /// reads give 0 from them on AMD).
+    /// Whether a quad-local read must reach helper lanes: in a pixel
+    /// program, always. On the console the quad's other pixels are in EXEC
+    /// (whole-quad mode) wherever they come from: lanes outside the
+    /// triangle at its edges, and lanes a discard took out. On the host
+    /// these are helper lanes, which wave operations leave out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`; AMD's wave reads give 0 from them) and
+    /// only quad reads see. A derivative a program takes by hand through a
+    /// quad permute then reads 0 at every triangle edge, not only after a
+    /// discard.
+    ///
+    /// The idea comes from Belobug's VIctory-Belobug-AMD (03629f3), which
+    /// reports lines along triangle edges on car paint, glass and skin
+    /// without it.
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel && !self.x.st.discards.is_empty()
+        quad && self.s.pixel
     }
 
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
