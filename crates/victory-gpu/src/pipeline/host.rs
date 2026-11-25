@@ -682,7 +682,12 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(
+                ?shaders,
+                depth_bounds_test = g.depth_bounds,
+                depth_bounds_applied = depth_with_bounds.is_some(),
+                "host mesh pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -787,7 +792,14 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
+        tracing::info!(
+            ?shaders,
+            ms = started.elapsed().as_millis(),
+            rectangles = !gs.is_empty(),
+            depth_bounds_test = g.depth_bounds,
+            depth_bounds_applied = depth_with_bounds.is_some(),
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
