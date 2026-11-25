@@ -138,8 +138,8 @@ pub(crate) fn staging_counts() -> (u64, u64, u64, u64) {
     )
 }
 
-/// Lets go of the staging buffers not needed in 5 seconds and 4 frames
-/// (no list copied from one, its memory did not change), keeping their
+/// Lets go of the staging buffers not needed for a while ([`staging_idle_time`]:
+/// no list copied from one, its memory did not change), keeping their
 /// host textures. A staging buffer is the size of its host texture, in the
 /// upload heap (the PC's memory), and was kept as long as its host
 /// texture: with #1962's placed-texture views, which heap slots keep, that
@@ -160,7 +160,29 @@ pub(crate) fn let_go_idle_staging() {
     if !on || now < last + 1000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
         return;
     }
-    let_go_staging(now, crate::queue::presented(), 5_000, 4, |_| true);
+    let (ms, frames) = staging_idle_time(STAGING[1].load(Relaxed));
+    let_go_staging(now, crate::queue::presented(), ms, frames, |_| true);
+}
+
+/// Staging bytes alive past which an idle buffer goes as soon as a frame
+/// was presented without it.
+const STAGING_PRESSURE: u64 = 512 << 20;
+
+/// How long a staging buffer goes unused before it may go, milliseconds
+/// and frames, with `alive` staging bytes. Each buffer is private commit
+/// the size of its texture: at world entry 1,000-3,400 of them held
+/// 0.9-2.3 GB for the 5 s and 4 frames they were kept before (runs
+/// L4Fa/L4Fa2, where commit ran out), and letting 1.6 GB go brought the
+/// process's private bytes down by 1.4 GB. Past [`STAGING_PRESSURE`] one
+/// goes once a frame was presented since its last use; under it, after
+/// 2 s and 2 frames (a texture the title writes every frame or two keeps
+/// its buffer). A buffer a list holds stays either way.
+fn staging_idle_time(alive: u64) -> (u64, u64) {
+    if alive > STAGING_PRESSURE {
+        (0, 1)
+    } else {
+        (2_000, 2)
+    }
 }
 
 /// Lets go of the staging buffers of host textures `within` takes that no
@@ -694,6 +716,17 @@ fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_goes_sooner_past_the_pressure_line() {
+        assert_eq!(staging_idle_time(0), (2_000, 2));
+        assert_eq!(staging_idle_time(STAGING_PRESSURE), (2_000, 2));
+        assert_eq!(
+            staging_idle_time(STAGING_PRESSURE + 1),
+            (0, 1),
+            "a frame without it is enough"
+        );
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
