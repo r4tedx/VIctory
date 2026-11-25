@@ -347,6 +347,13 @@ fn log_gpu_times(frames: f64) {
 /// system's memory manager sees them: use over budget makes it page
 /// allocations at submissions.
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
+    let mb = |(usage, budget): (u64, u64)| (usage as f64 / 1e6, budget as f64 / 1e6);
+    Some([mb(memory_info(true)?), mb(memory_info(false)?)])
+}
+
+/// The host device's use and budget in bytes, of video memory on the card
+/// (`local`) or of the system memory it reads.
+pub(crate) fn memory_info(local: bool) -> Option<(u64, u64)> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
         .get_or_init(|| {
@@ -359,13 +366,15 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
             }
         })
         .as_ref()?;
-    let info = |group| {
-        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: a valid out pointer.
-        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
-        Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+    let group = if local {
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL
+    } else {
+        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL
     };
-    Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a valid out pointer.
+    unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+    Some((info.CurrentUsage, info.Budget))
 }
 
 #[cfg(test)]
@@ -1364,6 +1373,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // What shaders wrote into host copies in video memory first comes
+        // into their system memory side, which the copy-backs read.
+        crate::shadow::pull_written(back.iter().map(|(s, a, n, _)| (s, *a, *n)));
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2904,6 +2916,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                crate::vram::log(copy_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
@@ -3193,6 +3206,16 @@ impl Host {
         } else {
             heap
         };
+        self.buffer_in(size, &heap)
+    }
+
+    /// A buffer of `size` bytes in `heap`, mapped, that shaders read and
+    /// write. Starts in the common state.
+    pub(crate) fn buffer_in(
+        &self,
+        size: u64,
+        heap: &D3D12_HEAP_PROPERTIES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -3213,7 +3236,7 @@ impl Host {
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
-                    &heap,
+                    heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -3228,9 +3251,77 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, heap = heap.Type.0, "no shared buffer");
                 None
             }
+        }
+    }
+
+    /// Copies `regions` (destination, its offset, source, its offset,
+    /// bytes) between buffers on the GPU, now, and waits: what shaders
+    /// wrote into host copies in video memory reaches their system memory
+    /// side before the CPU reads it (`crate::shadow::pull`). A list of its
+    /// own on the queue, after whatever the queue holds, so it can run
+    /// inside a submission's copy-back. Buffers start and end in the common
+    /// state (they enter and leave the copy states implicitly).
+    // From #2130 (0xkn0wh3r3).
+    pub(crate) fn copy_now(&self, regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)]) {
+        if regions.is_empty() {
+            return;
+        }
+        struct Copier {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; the event is waited on
+        // under the mutex only.
+        unsafe impl Send for Copier {}
+        static COPIER: OnceLock<Option<Mutex<Copier>>> = OnceLock::new();
+        let copier = COPIER.get_or_init(|| {
+            // SAFETY: plain creation; the list stays closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<Copier> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(Copier { allocator, list, fence, event, value: 0 })
+                })()
+            };
+            made.map_err(|e| tracing::warn!(error = %e, "no host copier: shader writes stay in video memory"))
+                .ok()
+                .map(Mutex::new)
+        });
+        let Some(copier) = copier else {
+            return;
+        };
+        let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
+        c.value += 1;
+        let value = c.value;
+        // SAFETY: the allocator's last list has run (each call waits); the
+        // buffers are live and the ranges inside them (the caller's).
+        let ran = unsafe {
+            c.allocator.Reset().and_then(|()| {
+                c.list.Reset(&c.allocator, None)?;
+                for &(dst, dst_at, src, src_at, bytes) in regions {
+                    c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
+                }
+                c.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(c.list.cast()?)]);
+                self.queue.Signal(&c.fence, value)?;
+                c.fence.SetEventOnCompletion(value, c.event)?;
+                WaitForSingleObject(c.event, INFINITE);
+                Ok(())
+            })
+        };
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "a host GPU copy did not run");
         }
     }
 }

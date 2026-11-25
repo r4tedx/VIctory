@@ -1759,7 +1759,11 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        if desc.flags & UNORDERED == 0 {
+            crate::shadow::register_read_only(at, resource.data() as u64, desc.width);
+        } else {
+            crate::shadow::register(at, resource.data() as u64, desc.width);
+        }
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());

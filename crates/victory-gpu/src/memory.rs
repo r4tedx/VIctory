@@ -512,6 +512,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
+        // Pages of copies in video memory come into their system memory
+        // side, withheld or not: it holds what the GPU side holds.
+        crate::shadow::pull(
+            writes
+                .iter()
+                .map(|&(k, at)| (&copies[k], at as usize, 1 << 16)),
+        );
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
             for &(_, at) in &writes {
