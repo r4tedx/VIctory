@@ -2085,14 +2085,20 @@ impl State {
         } else {
             None
         };
-        let batched = (rewritten.is_none() && crate::indirect::batching() && max != 0)
-            .then(|| {
-                // Host addresses as a copy's start and the offset in it.
-                let at = |s: &crate::shadow::Shadow, a: u64| (s.gpu(a) - s.offset(a), s.offset(a));
-                let count = counter.as_ref().map(|(s, a)| at(s, *a));
-                crate::indirect::member(list, at(&args, arguments), count, (kind, stride, max))
-            })
-            .flatten();
+        // With `VICTORY_BATCH_CLAMPS_ALONE=1`, one that would open a window
+        // and end it at once (a dispatch, or a pipeline that may write, with
+        // no window open) clamps on its own.
+        let batched = (rewritten.is_none()
+            && crate::indirect::batching()
+            && max != 0
+            && crate::indirect::joins_window(list, kind == DISPATCH || self.may_write()))
+        .then(|| {
+            // Host addresses as a copy's start and the offset in it.
+            let at = |s: &crate::shadow::Shadow, a: u64| (s.gpu(a) - s.offset(a), s.offset(a));
+            let count = counter.as_ref().map(|(s, a)| at(s, *a));
+            crate::indirect::member(list, at(&args, arguments), count, (kind, stride, max))
+        })
+        .flatten();
         // Bounded first: the clamp binds a compute pipeline of its own.
         let clamped = match (&rewritten, &batched) {
             (Some(_), _) => Some(crate::indirect::Clamped::Ready),

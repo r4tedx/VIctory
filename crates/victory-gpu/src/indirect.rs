@@ -336,6 +336,8 @@ pub(crate) fn bound(
         return None;
     }
     let (c, (budget_res, budget)) = (clamp()?, list.budget()?);
+    #[cfg(feature = "diagnostics")]
+    ALONE_CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let plan = Plan::for_call(
         records,
         buffer.as_raw() as usize,
@@ -432,6 +434,8 @@ pub(crate) fn dispatch(
         .as_ref()?;
     let (_, budget) = list.budget()?;
     let output = list.dispatch_args(u64::from(records) * 12 + 4)?;
+    #[cfg(feature = "diagnostics")]
+    REWRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut constants = [stride, records, waves, u32::from(count.is_some()), 0, 0, threads];
     // At most 2^21 groups carried in and 2^20 per record, even if every
     // refusal is still awaiting its refund. Each batch stays below 2^32.
@@ -1188,6 +1192,29 @@ fn open(
     })
 }
 
+/// Whether an indirect execution joins a window (opening one if none is
+/// open), given whether `list` has a window open and whether the execution
+/// would end it (a dispatch, or a pipeline that may write). Always, unless
+/// `VICTORY_BATCH_CLAMPS_ALONE=1`: then one that would open a window and
+/// end it at once (a window of one) takes its own clamp ([`bound`]), which
+/// clamps and charges the same records at the same place, as with batching
+/// off: one pass of ours instead of two, but the title's argument buffer
+/// (and count buffer) transitioned to and from the argument state instead
+/// of the window's records. Which costs less is for a timed run to say.
+pub(crate) fn joins_window(list: &HostList, ends_window: bool) -> bool {
+    static ALONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let alone = *ALONE.get_or_init(|| crate::switch::on("VICTORY_BATCH_CLAMPS_ALONE"));
+    takes_window(
+        alone,
+        list.clamps_open.load(std::sync::atomic::Ordering::Relaxed),
+        ends_window,
+    )
+}
+
+fn takes_window(alone: bool, open: bool, ends_window: bool) -> bool {
+    !alone || open || !ends_window
+}
+
 /// Ends `list`'s open window, if any: before a command that may write GPU
 /// memory, and when the list closes. Cheap when none is open.
 pub(crate) fn end(list: &HostList) {
@@ -1204,6 +1231,8 @@ fn close(list: &HostList, batch: &mut Batch) {
     list.clamps_open
         .store(false, std::sync::atomic::Ordering::Relaxed);
     let Some(w) = batch.window.take() else { return };
+    #[cfg(feature = "diagnostics")]
+    note_window(w.entries);
     // SAFETY: the window's table, upload memory the list holds; an open list
     // and the list's chunk.
     unsafe {
@@ -1216,6 +1245,41 @@ fn close(list: &HostList, batch: &mut Batch) {
     }
     batch.records.take(w.written);
     batch.charges.take(u64::from(w.total) * 8);
+}
+
+/// Executions clamped on their own ([`bound`]) and dispatches rewritten
+/// ([`dispatch`]), for [`note_window`]'s line.
+#[cfg(feature = "diagnostics")]
+static ALONE_CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static REWRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Windows closed, those of one execution and of two to four, executions in
+/// them, and (since the start, as the windows) executions clamped on their
+/// own and dispatches rewritten: a log line every 2^14 windows.
+#[cfg(feature = "diagnostics")]
+fn note_window(entries: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static SINGLE: AtomicU64 = AtomicU64::new(0);
+    static FEW: AtomicU64 = AtomicU64::new(0);
+    static EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+    let add = |c: &AtomicU64, n: u64| c.fetch_add(n, Relaxed) + n;
+    let single = add(&SINGLE, u64::from(entries == 1));
+    let few = add(&FEW, u64::from((2..=4).contains(&entries)));
+    let executions = add(&EXECUTIONS, u64::from(entries));
+    let windows = add(&WINDOWS, 1);
+    if windows.is_multiple_of(1 << 14) {
+        tracing::info!(
+            windows,
+            single,
+            two_to_four = few,
+            executions,
+            alone = ALONE_CLAMPS.load(Relaxed),
+            rewritten = REWRITES.load(Relaxed),
+            "batched indirect clamp windows"
+        );
+    }
 }
 
 /// After the list's last submission ran: its memory is free again (the
@@ -1988,6 +2052,37 @@ mod tests {
             ([3].as_slice(), [1].as_slice())
         );
         assert_eq!(got[7], [0]);
+    }
+
+    /// With windows of one left out, an execution that would end its
+    /// window joins one only when one is open; one that would not always
+    /// does. Otherwise every execution joins. A list has a window open from
+    /// a member to its end.
+    #[test]
+    fn executions_that_end_their_window_join_only_an_open_one() {
+        for (open, ends) in [(true, true), (true, false), (false, false), (false, true)] {
+            assert!(super::takes_window(false, open, ends));
+            assert_eq!(super::takes_window(true, open, ends), open || !ends);
+        }
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let calls: Vec<Call> = (0..2).map(|_| (0, 1, vec![3, 1, 0, 0])).collect();
+        let (buffer, _, offsets) = fill(&calls);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let open =
+            |list: &super::HostList| list.clamps_open.load(std::sync::atomic::Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        assert!(!open(&list));
+        let first = super::member(&list, (gpu, offsets[0]), None, (0, 16, 1)).unwrap();
+        assert!(first.opened);
+        assert!(open(&list));
+        let second = super::member(&list, (gpu, offsets[1]), None, (0, 16, 1)).unwrap();
+        assert!(!second.opened);
+        super::end(&list);
+        assert!(!open(&list));
+        list.close();
     }
 
     /// A list runs its batched clamps again at each submission (the budget
