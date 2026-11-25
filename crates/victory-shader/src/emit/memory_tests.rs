@@ -564,6 +564,7 @@ fn writes_through_views_mark_their_pages() {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        heap_usage: l.heap_usage,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,

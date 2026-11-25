@@ -219,7 +219,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    HEAP_SAMPLERS, HEAP_USAGE, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
     USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
@@ -291,9 +291,9 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
-    /// Whether the host binds the heap-usage bitmap `u1` in
+    /// Whether the host binds the heap-usage bitmap `u`[`HEAP_USAGE`] in
     /// [`MEMORY_SPACE`]: shaders taking resource views from the heap itself
-    /// set bit `index` for each slot they read (once per wave when uniform),
+    /// set bit `index` for each slot they read,
     /// so that the host makes the views it left null (placed textures) the
     /// next time.
     pub heap_usage: bool,

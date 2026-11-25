@@ -35,6 +35,8 @@ pub const VIEW_MARKS: u32 = 2;
 /// The written-pages bitmap of buffer views: `u1` (a raw root UAV) in
 /// [`MEMORY_SPACE`].
 pub const VIEW_WRITES: u32 = 1;
+/// The heap-usage bitmap: `u2` (a raw root UAV) in [`MEMORY_SPACE`].
+pub const HEAP_USAGE: u32 = 2;
 /// A view-mark table entry's base for a slot whose writes are not marked.
 pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
@@ -444,6 +446,16 @@ impl Shader {
         h
     }
 
+    /// The handle of the heap-usage bitmap, made in the entry block.
+    pub fn heap_used_handle(&mut self) -> V {
+        if let Some(h) = self.heap_used {
+            return h;
+        }
+        let h = self.memory_space_handle(HEAP_USAGE, true);
+        self.heap_used = Some(h);
+        h
+    }
+
     /// A raw buffer bound at `register` in [`MEMORY_SPACE`] (`uav`: `u`,
     /// else `t`), made in the entry block.
     fn memory_space_handle(&mut self, register: u32, uav: bool) -> V {
@@ -660,7 +672,11 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if !self.root_uavs.is_empty()
+                || self.memory_dirty.is_some()
+                || self.view_writes.is_some()
+                || self.heap_used.is_some()
+            {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -675,6 +691,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.heap_used.map(|_| (MEMORY_SPACE, HEAP_USAGE)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
