@@ -467,9 +467,9 @@ impl<'a> Lower<'a> {
                 (n.contains("permute") && n != "ds_bpermute_b32")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || reads_mask_as_data(x.st, i)
             };
-            let reads_whole = insts().any(whole);
+            let reads_mask_data = insts().any(|i| reads_mask_as_data(x.st, i));
+            let reads_whole = reads_mask_data || insts().any(whole);
             let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -510,8 +510,14 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            console_lanes = reads_whole || masks_held || insts().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
+            // Scalar detection can request console flow. If that lowering
+            // declines the program, try the original per-lane requirements.
+            let scalar_console_flow = x.st.divergent_scalar_joins
+                && !x.per_lane_only
+                && (x.target.runs(wave) || x.target.runs(32));
+            console_lanes =
+                scalar_console_flow || reads_whole || masks_held || insts().any(in_half);
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
@@ -524,6 +530,7 @@ impl<'a> Lower<'a> {
             // flow below.)
             split = console_lanes
                 && x.native.wave64
+                && !scalar_console_flow
                 && !reads_whole
                 && !insts().any(|i| i.name() == "v_readfirstlane_b32")
                 && !masks_held
@@ -609,6 +616,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            wants_console_flow |= scalar_console_flow;
             // A lane mask joined where lanes arrive by different paths (a
             // loop its lanes leave at different iterations, a branch only
             // some take) is, per lane, what that lane's path saw of it. Read

@@ -263,6 +263,15 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        self.project(b, &|bdd, v| bdd.born[v as usize] >= from, memo)
+    }
+
+    fn project(
+        &mut self,
+        b: Bool,
+        remove: &impl Fn(&Self, u32) -> bool,
+        memo: &mut Map<Bool, Bool>,
+    ) -> Bool {
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -270,9 +279,9 @@ impl Bools {
         if let Some(&r) = memo.get(&b) {
             return r;
         }
-        let lo = self.forget(lo, from, memo);
-        let hi = self.forget(hi, from, memo);
-        let r = if self.born[v as usize] >= from {
+        let lo = self.project(lo, remove, memo);
+        let hi = self.project(hi, remove, memo);
+        let r = if remove(self, v) {
             self.or(lo, hi)
         } else {
             self.mk(v, lo, hi)
@@ -337,6 +346,8 @@ pub struct Structured {
     pub exits: Vec<LaneExit>,
     /// Joins with an incoming edge that only part of a wave can take.
     pub(crate) divergent_joins: Vec<bool>,
+    /// Live scalar joins whose incoming edges can split the lanes reaching them.
+    pub(crate) divergent_scalar_joins: bool,
     /// Per block and instruction: the condition, beyond reaching it, under
     /// which a lane runs a vector instruction; `None` when reaching it is
     /// enough (lanes outside EXEC then never get there, so a VGPR write
@@ -470,6 +481,11 @@ struct SopMasks {
     scc: Option<Bool>,
 }
 
+fn scalar_state(reg: Reg) -> bool {
+    matches!(reg, Reg::Scc)
+        || matches!(reg, Reg::S(r) if ![EXEC, EXEC + 1, VCC, VCC + 1].contains(&r))
+}
+
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
@@ -585,14 +601,152 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
-        match self.when[q] {
-            Some(w) if taken => self.b.and(c, w),
+        Self::edge_condition(&mut self.b, c, self.when[q], taken)
+    }
+
+    fn edge_condition(b: &mut Bools, c: Bool, when: Option<Bool>, taken: bool) -> Bool {
+        match when {
+            Some(w) if taken => b.and(c, w),
             Some(w) => {
-                let nw = self.b.not(w);
-                self.b.and(c, nw)
+                let nw = b.not(w);
+                b.and(c, nw)
             }
             None => c,
         }
+    }
+
+    /// A loop's scalar phi matters only if its state survives the loop,
+    /// possibly through a newer SSA version of the scalar.
+    fn loop_live_out(&self, header: usize, mut pending: Vec<usize>) -> HashSet<Value> {
+        let blocks = &self.p.blocks;
+        let mut inside = HashSet::from([header]);
+        while let Some(b) = pending.pop() {
+            if inside.insert(b) {
+                pending.extend(&blocks[b].preds);
+            }
+        }
+
+        fn reads(inst: &Inst) -> impl Iterator<Item = Value> + '_ {
+            inst.reads
+                .iter()
+                .filter_map(|&(r, v)| scalar_state(r).then_some(v))
+        }
+        let mut values = Vec::new();
+        for (b, block) in blocks.iter().enumerate() {
+            if inside.contains(&b) {
+                continue;
+            }
+            for phi in block.phis.iter().filter(|phi| scalar_state(phi.reg)) {
+                values.extend(&phi.args);
+            }
+            values.extend(block.insts.iter().flat_map(reads));
+        }
+        let mut live = HashSet::new();
+        while let Some(v) = values.pop() {
+            if !live.insert(v) {
+                continue;
+            }
+            if let Some(&(b, i)) = self.phis.get(&v)
+                && inside.contains(&b)
+            {
+                values.extend(&blocks[b].phis[i].args);
+            }
+            if let Some(&(b, i)) = self.defs.get(&v)
+                && inside.contains(&b)
+            {
+                values.extend(reads(&blocks[b].insts[i]));
+            }
+        }
+        live
+    }
+
+    fn divergent_scalar_joins(&self, cond: &[Bool]) -> bool {
+        // The wave64 console path can synchronize halves on 32-lane hosts.
+        // Keep wave32's existing lowering on narrower hosts, where forcing
+        // a 32-lane console wave would refuse programs that translate today.
+        if self.console || !self.p.wave64 {
+            return false;
+        }
+        let mut mask_words = HashSet::new();
+        for &(lo, hi) in self.masks.keys() {
+            mask_words.extend([lo, hi]);
+        }
+        for &key in self.other.keys() {
+            let Some((header, _, args)) = self.join_args(key) else {
+                continue;
+            };
+            // Only forward inputs contribute to mask provenance at a loop
+            // header. Recognize a zero seed and a mask-derived back edge.
+            let mut zero_seed = false;
+            let mut derived_back_edge = false;
+            let all_masks = self.incoming[header]
+                .iter()
+                .zip(args)
+                .all(|(&(pred, _), arg)| {
+                    let derived = self.masks.contains_key(&arg);
+                    let zero = self.other.get(&arg) == Some(&Bool::FALSE);
+                    if self.index[pred] < self.index[header] {
+                        zero_seed |= zero;
+                    } else {
+                        derived_back_edge |= derived;
+                    }
+                    derived || zero
+                });
+            if all_masks && zero_seed && derived_back_edge {
+                mask_words.extend([key.0, key.1]);
+            }
+        }
+
+        let mut probe = None;
+        let mut uniform = Map::default();
+        for &n in &self.order {
+            let block = &self.p.blocks[n];
+            let mut candidates = block
+                .phis
+                .iter()
+                .filter(|phi| scalar_state(phi.reg) && !mask_words.contains(&phi.value))
+                .peekable();
+            if candidates.peek().is_none() {
+                continue;
+            }
+            let b = probe.get_or_insert_with(|| self.b.clone());
+            let drop_lane =
+                |bdd: &Bools, v: u32| !matches!(bdd.atoms[v as usize], Atom::Uniform(_));
+            let split = self.incoming[n].iter().any(|&(pred, taken)| {
+                let edge = Self::edge_condition(b, cond[pred], self.when[pred], taken);
+                let other = b.not(edge);
+                let other = b.and(cond[n], other);
+                if edge == Bool::FALSE || other == Bool::FALSE {
+                    return false;
+                }
+                // Under the same uniform decisions, can one lane reach
+                // the join by this edge and another lane by a different one?
+                let along = b.project(edge, &drop_lane, &mut uniform);
+                let other = b.project(other, &drop_lane, &mut uniform);
+                b.and(along, other) != Bool::FALSE
+            });
+            if b.overflow {
+                // Leave existing lowering available if the probe hits the
+                // BDD limit.
+                return false;
+            }
+            if split {
+                let back_edges: Vec<_> = block
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&pred| self.index[n] <= self.index[pred])
+                    .collect();
+                if back_edges.is_empty() {
+                    return true;
+                }
+                let live = self.loop_live_out(n, back_edges);
+                if candidates.any(|phi| live.contains(&phi.value)) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Joins whose constant fails on some edge, given what lanes know.
@@ -681,6 +835,7 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        let divergent_scalar_joins = self.divergent_scalar_joins(cond);
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -693,6 +848,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             divergent_joins,
+            divergent_scalar_joins,
             guards,
             execs: execs.to_vec(),
             others: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
@@ -777,11 +933,7 @@ impl<'a> Lanes<'a> {
         (m, derived)
     }
 
-    /// A mask joined by phis at a block entry, and whether a mask coming in
-    /// on a forward edge derives from EXEC or a VALU result. Where every
-    /// lane arriving so far has the incoming mask set (or clear), the join
-    /// is that constant, for a lane can only read it after arriving.
-    fn join(&mut self, k: Key) -> Option<(Bool, bool)> {
+    fn join_args(&self, k: Key) -> Option<(usize, Value, Vec<Key>)> {
         let p = self.p;
         let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
         let block = match (lo, hi) {
@@ -797,6 +949,15 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
+        Some((block, id, args))
+    }
+
+    /// A mask joined by phis at a block entry, and whether a mask coming in
+    /// on a forward edge derives from EXEC or a VALU result. Where every
+    /// lane arriving so far has the incoming mask set (or clear), the join
+    /// is that constant, for a lane can only read it after arriving.
+    fn join(&mut self, k: Key) -> Option<(Bool, bool)> {
+        let (block, id, args) = self.join_args(k)?;
         let mut derived = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();

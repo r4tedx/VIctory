@@ -359,7 +359,12 @@ pub fn emit(
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-            let console = structure::structure_console(p);
+            let console = structure::structure_console(p).map(|mut console| {
+                // Console branches are wave-wide by construction. Carry
+                // over the per-lane classification that selected them.
+                console.divergent_scalar_joins = st.divergent_scalar_joins;
+                console
+            });
             let lowered = match &console {
                 Ok(console) => {
                     parts.st = console;
