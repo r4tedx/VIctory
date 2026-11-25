@@ -82,6 +82,24 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
+//! * **Raw reads of typed views** (added 2026-11-25): a scalar buffer load
+//!   from an SRV, and an unindexed dword load (`buffer_load_dword*`
+//!   without `idxen`, a heap-indexed read by element included), read
+//!   through a raw handle at a byte address. Where the slot may hold a
+//!   typed buffer view (its used-resource entry has a stride, 1 for a
+//!   typed buffer of bytes included, or the descriptor comes from the
+//!   heap itself) the read goes through the view-alias table, root SRV
+//!   `t`[`VIEW_ALIASES`] in [`ROOT_CBV_SPACE`]: the host keeps a raw view
+//!   of each typed buffer view's bytes in a slot of its own and names it
+//!   there, 0 naming the slot itself (raw and structured views, which the
+//!   host makes raw). The alias starts at the 16 bytes at or below the
+//!   view's first byte, and its own view-stride entry holds the bytes
+//!   skipped as a structured view off 16 bytes does ("Views off 16
+//!   bytes"), so reads through it add them the same way. A raw handle on a
+//!   typed view reads what D3D12 leaves
+//!   undefined (WARP reads past the view's element count in dwords as 0,
+//!   an RTX 5070 read other dwords). Stride 0, root views and
+//!   descriptors the code builds keep their own handle and read no table.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
@@ -231,8 +249,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_SKIP_SHIFT, VIEW_STRIDES, VIEW_WRITE_BITS,
-    VIEW_WRITES,
+    USER_DATA_SPACE, VIEW_ALIASES, VIEW_MARK_NONE, VIEW_MARKS, VIEW_SKIP_SHIFT, VIEW_STRIDES,
+    VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.

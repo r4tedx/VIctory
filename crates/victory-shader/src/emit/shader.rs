@@ -28,6 +28,14 @@ pub const VIEW_STRIDES: u8 = 255;
 /// review of #1762: a copy of the view's own bytes instead missed writes
 /// made through the buffer's view in the same list, and the reverse.
 pub const VIEW_SKIP_SHIFT: u32 = 24;
+/// The root SRV slot (`t254` in [`ROOT_CBV_SPACE`]) of the view-alias
+/// table: dword `i` is 0 where raw reads of view-heap index `i` read the
+/// view there, else `alias - i`: the slot `alias` holds a raw view of the
+/// bytes of the typed buffer view at `i`, from the 16 bytes at or below
+/// them, and its view-stride entry the bytes skipped
+/// ([`VIEW_SKIP_SHIFT`]) as for a structured view off 16 bytes (`emit`,
+/// "Raw reads of typed views").
+pub const VIEW_ALIASES: u8 = 254;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;

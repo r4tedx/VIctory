@@ -649,6 +649,300 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Reads 16 dwords of a buffer view raw from byte `bias`, as translated
+    /// shaders read typed buffer views at byte addresses (scalar buffer
+    /// loads, unindexed dword loads) through the slot the view-alias table
+    /// names (`victory_shader::emit::VIEW_ALIASES`).
+    const RAW_FROM: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=1, b0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer Bias : register(b0) { uint bias; };
+[RootSignature(RS)]
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(bias + id.x * 4));
+}
+"#;
+
+    /// A typed buffer view keeps its typed view in its slot (for
+    /// `buffer_load_format`) and gets a raw view of the same bytes in a slot
+    /// of its own, which the view-alias table names; the alias slot's
+    /// view-stride entry holds the bytes it starts before the view (raw
+    /// views start on 16 bytes), as for a structured view off 16 bytes: raw reads through it
+    /// read the view's dwords, also for a view off 16 bytes and one of
+    /// bytes. A raw handle on the typed view itself (printed) reads the
+    /// RGBA32F view's dwords 8 to 15 as 0 on WARP, which bounds it by the
+    /// view's 8 elements counted as dwords; an RTX 5070 read 136 for 109 at
+    /// a byte of an RGBA32F view (#704's table). Raw views and the
+    /// structured views the host makes raw read themselves (entry 0).
+    #[test]
+    fn typed_buffer_views_have_raw_aliases_of_their_bytes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let src = resource(1, 256, 1, 0, 1);
+        let dst = resource(1, 256, 1, 0, 1);
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        // SAFETY: the buffer's own memory, 256 bytes.
+        let from = unsafe { std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64) };
+        for (i, w) in from.iter_mut().enumerate() {
+            *w = 1000 + i as u32;
+        }
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &raw_uav, slot(1));
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile(RAW_FROM);
+        // 16 dwords of slot `at` from byte `bias`.
+        let read = |at: u32, bias: u32| {
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list
+                    .SetComputeRootDescriptorTable(0, heap_host.gpu(at));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+                list.list.SetComputeRoot32BitConstant(2, bias, 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.defer_heap(&heap_host.viewed);
+            list.close();
+            host.execute(&[&list]);
+            let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+            out.read_host(dst_bytes as u64, 16)
+        };
+        // Shader views: format, buffer dimension, the default mapping, then
+        // first element, count, stride, flags. (What, the view, its first
+        // dword, whether it has an alias.)
+        let cases: [(&str, [u32; 10], u32, bool); 5] = [
+            (
+                "RGBA32F from element 1",
+                [2, 1, 0x1688, 0, 1, 0, 8, 0, 0, 0],
+                4,
+                true,
+            ),
+            (
+                "R32_UINT from element 1 (off 16 bytes)",
+                [42, 1, 0x1688, 0, 1, 0, 32, 0, 0, 0],
+                1,
+                true,
+            ),
+            (
+                "R8_UINT from byte 8 (off 16 bytes)",
+                [62, 1, 0x1688, 0, 8, 0, 128, 0, 0, 0],
+                2,
+                true,
+            ),
+            (
+                "raw from dword 4",
+                [39, 1, 0x1688, 0, 4, 0, 32, 0, 1, 0],
+                4,
+                false,
+            ),
+            (
+                "structured, stride 16, from element 1",
+                [0, 1, 0x1688, 0, 1, 0, 8, 16, 0, 0],
+                4,
+                false,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        let mut alias_slot = None;
+        for (what, view, first, aliased) in cases {
+            crate::descriptor::create_srv(null, src, &view, slot(0));
+            let (entry, kept) = heap_host.alias_of(0);
+            if (entry != 0) != aliased {
+                wrong.push(format!("{what}: alias entry {entry:#x}"));
+            }
+            if aliased {
+                alias_slot = alias_slot.or(kept);
+                if kept.is_none() || kept != alias_slot {
+                    wrong.push(format!("{what}: alias slot {kept:?}, first {alias_slot:?}"));
+                }
+            }
+            let want: Vec<u32> = (0..16).map(|i| 1000 + first + i).collect();
+            // What a raw handle on the slot's own view reads (undefined for
+            // a typed view: what translated shaders read before the alias).
+            eprintln!("{what}: slot 0 raw reads {:?}", read(0, 0));
+            // Through the entry: the slot it names, from the bytes that
+            // slot's view-stride entry says it starts early.
+            let got = read(entry, heap_host.skip_of(entry));
+            eprintln!("{what}: entry {entry:#x}, through it reads {got:?}");
+            if got != want {
+                wrong.push(format!("{what}: read {got:?}, want {want:?}"));
+            }
+        }
+        // Released, a title slot keeps its alias slot (a submission may read
+        // it still), its entry 0.
+        assert_eq!(
+            heap_host.alias_of(0),
+            (0, alias_slot),
+            "a raw view in the slot again"
+        );
+        // A typed unordered view has a raw unordered alias; a dynamic slot
+        // gives its alias back when released.
+        let typed_uav: [u32; 10] = [42, 1, 0, 0, 1, 0, 32, 0, 0, 0];
+        crate::descriptor::create_uav(null, dst, null, &typed_uav, slot(2));
+        assert_ne!(heap_host.alias_of(2).0, 0, "a typed unordered view's alias");
+        let view = crate::descriptor::view(slot(2)).expect("the typed unordered view");
+        let dynamic = heap_host.dynamic(1).expect("a dynamic slot");
+        heap_host.make_at(dynamic, &view);
+        let (entry, kept) = heap_host.alias_of(dynamic);
+        assert!(
+            entry != 0 && kept.is_some(),
+            "a dynamic slot's alias: {entry:#x} {kept:?}"
+        );
+        heap_host.release(dynamic, 1);
+        assert_eq!(
+            heap_host.alias_of(dynamic),
+            (0, None),
+            "a released dynamic slot"
+        );
+        assert!(
+            wrong.is_empty(),
+            "raw reads through aliases:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// Adds `add` to 16 dwords of `u0` from byte `from` and stores them to
+    /// `u1` from byte `to`.
+    const MOVE: &str = r#"
+#define RS "DescriptorTable(UAV(u0)), DescriptorTable(UAV(u1)), RootConstants(num32BitConstants=3, b0)"
+RWByteAddressBuffer src : register(u0);
+RWByteAddressBuffer dst : register(u1);
+cbuffer At : register(b0) { uint from; uint to; uint add; };
+[RootSignature(RS)]
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(to + id.x * 4, src.Load(from + id.x * 4) + add);
+}
+"#;
+
+    /// A typed view's alias is a raw view of the slot's own host buffer from
+    /// the 16 bytes at or below the view (the bytes skipped in its
+    /// view-stride entry), not a
+    /// copy of the view's bytes: within one list a write through the alias
+    /// is seen through a view of the whole buffer and the other way round,
+    /// for a view off 16 bytes. (From astrosteveo's review of #1762: a
+    /// structured view given a copy of its own bytes reads and leaves old
+    /// data both ways within one list, as copies meet only around a
+    /// submission.)
+    #[test]
+    fn typed_views_aliases_share_the_buffers_writes_in_one_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let (buffer, out) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let (buffer_bytes, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        let (out_bytes, _) = crate::resource::buffer_bytes(out).unwrap();
+        // SAFETY: the buffer's own memory, 256 bytes.
+        let words = unsafe { std::slice::from_raw_parts_mut(buffer_bytes.cast::<u32>(), 64) };
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = 1000 + i as u32;
+        }
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        // Unordered views: format, buffer dimension, then first element,
+        // count, stride, counter offset, flags. The whole buffer raw (slot
+        // 0), R32_UINT from element 1 (byte 4: off 16 bytes; slot 1), the
+        // output raw (slot 2).
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let typed: [u32; 10] = [42, 1, 1, 0, 32, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, buffer, null, &raw, slot(0));
+        crate::descriptor::create_uav(null, buffer, null, &typed, slot(1));
+        crate::descriptor::create_uav(null, out, null, &raw, slot(2));
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (entry, _) = heap_host.alias_of(1);
+        assert_ne!(entry, 0, "the typed view's alias");
+        let (alias, bias) = (1 + entry, heap_host.skip_of(1 + entry));
+        let (root, pso) = compile(MOVE);
+        let list = host.new_list().unwrap();
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // (from slot, from byte, to slot, to byte, add), each after the last.
+        let moves = [
+            // The whole buffer's dwords 1.. through the alias: 1101 + k.
+            (0, 4, alias, bias, 100),
+            // Read back through the whole buffer: out dwords 0..16.
+            (0, 4, 2, 0, 0),
+            // Through the whole buffer: 2101 + k.
+            (2, 0, 0, 4, 1000),
+            // Read back through the alias: out dwords 16..32.
+            (alias, bias, 2, 64, 0),
+        ];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            for (from, at, to, to_at, add) in moves {
+                list.list
+                    .SetComputeRootDescriptorTable(0, heap_host.gpu(from));
+                list.list
+                    .SetComputeRootDescriptorTable(1, heap_host.gpu(to));
+                list.list
+                    .SetComputeRoot32BitConstants(2, 3, [at, to_at, add].as_ptr().cast(), 0);
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(std::slice::from_ref(&barrier));
+            }
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+        let got = crate::shadow::find(out_bytes as u64, 256)
+            .expect("the output's host copy")
+            .read_host(out_bytes as u64, 32);
+        let want: Vec<u32> = (0..16)
+            .map(|k| 1101 + k)
+            .chain((0..16).map(|k| 2101 + k))
+            .collect();
+        assert_eq!(
+            got, want,
+            "written through the alias, read through the whole buffer; then the other way"
+        );
+    }
+
     /// The title's structured views of 16 elements of 16 bytes, made raw:
     /// their sizes are the title's bytes (256), so the translation's record
     /// count (bytes over the used-resource entry's stride) is the title's

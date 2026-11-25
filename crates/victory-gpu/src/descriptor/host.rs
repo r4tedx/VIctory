@@ -50,6 +50,15 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
+    /// View heaps: the view-alias table translated shaders read
+    /// (`victory_shader::emit::VIEW_ALIASES`), a dword per slot of the
+    /// heap: 0 where raw reads of the slot read its own view, else
+    /// `alias - slot` ([`alias_entry`]); the bytes the alias starts early
+    /// are in the alias slot's view-stride entry. Mapped at the address
+    /// kept beside it.
+    alias_table: Option<(ID3D12Resource, usize)>,
+    /// The raw views of the bytes of typed buffer views ([`Aliases`]).
+    aliases: Mutex<Aliases>,
     /// Per title slot, the title address of the buffer view it holds, as a
     /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
     /// address as data, `crate::memory`): the buffer, its mapping and host
@@ -96,6 +105,56 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Slots of a view heap for [`Aliases`], a range of their own: never title
+/// or dynamic slots. On a full heap the top of the room host copies' pairs
+/// have below the null buffer views (which then end this much lower); on a
+/// capped heap that takes this many more slots, past the dynamic ones
+/// ([`MIN_DYNAMIC`] unchanged). A heap at the host's cap ([`PORTABLE_VIEWS`])
+/// has none, and raw reads of typed views read the typed view as before
+/// (logged once).
+/// shortcut: a guess, not a measured need: title slots that held a typed
+/// buffer view and dynamic ones holding one at a time past this many read
+/// their own view raw, as before (with a warning). The most there have been
+/// at once is logged as it grows (`note_typed`).
+const ALIASES: u32 = 1 << 16;
+
+/// Raw views of the bytes of the typed buffer views in a heap (and the
+/// structured ones the host leaves structured, [`left_structured`]), which
+/// translated shaders read through raw handles at byte addresses (scalar
+/// buffer loads, unindexed dword loads; `victory_shader::emit`, "Raw reads
+/// of typed views"). D3D12 leaves a raw handle on a typed view undefined:
+/// an RTX 5070 read 136 for 109 at a byte of an RGBA32F view (#704's
+/// table), and WARP bounds a raw read of one by its element count in
+/// dwords (an RGBA32F view of 8 elements reads 0 from dword 8). The slot
+/// itself keeps the typed view, for `buffer_load_format`. The view-alias
+/// table names the alias.
+struct Aliases {
+    /// Pool slots from `next` (those never taken) to `end`.
+    next: u32,
+    end: u32,
+    /// Pool slots given back (by dynamic slots released).
+    free: Vec<u32>,
+    /// The pool slot of each heap slot given one. A title slot keeps its
+    /// alias slot while the heap lives (a submission in flight may still
+    /// read it through the table); a dynamic slot gives it back when it is
+    /// released (its lists' submissions have run).
+    of: std::collections::HashMap<u32, u32>,
+    /// The heap slots holding a typed buffer view now, with or without an
+    /// alias, and the most there have been: the need the pool is sized by
+    /// ([`ALIASES`]), logged as it grows, also where the heap has no pool.
+    typed: std::collections::HashSet<u32>,
+    most: usize,
+}
+
+/// What [`make_marked`] gives: the slot's view, its view-mark entry, the
+/// bytes the host's view starts early and the bytes a typed view reads.
+type Marked = (Option<Kept>, Option<(u32, u32)>, u32, Option<ViewedBytes>);
+
+/// The bytes of its host copy a typed buffer view reads, for its alias:
+/// the buffer, the first byte, the bytes, and whether it is for unordered
+/// access ([`buffer_srv`], [`buffer_uav`]).
+type ViewedBytes = (ID3D12Resource, u64, u64, bool);
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -150,6 +209,9 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(count + MIN_DYNAMIC + ALIASES) {
+            // Room for the typed views' aliases past the dynamic slots.
+            (heap, count, MIN_DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
             // faults on an index past them, as before the clamp.
@@ -185,6 +247,42 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let pairs_end = match victory_shader::emit::NULL_BUFFER_VIEW {
+            null if !sampler && null > count + extra && null < total => null - 1,
+            _ => total,
+        };
+        // The aliases take the last `ALIASES` slots of the pairs' room, below
+        // `HEAP_VIEWS` (shaders clamp indices below it).
+        let room = pairs_end.saturating_sub(count + extra);
+        let alias_base = if !sampler && room >= ALIASES && pairs_end <= views {
+            pairs_end - ALIASES
+        } else {
+            // A heap at the host's cap (`PORTABLE_VIEWS`) has no slot past
+            // its title and dynamic ones; the aliases never take those.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            if !sampler {
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        count,
+                        total,
+                        "no room for typed buffer views' raw aliases: raw reads of them read the typed view"
+                    )
+                });
+            }
+            pairs_end
+        };
+        // A dword per slot of the heap, and per index shaders clamp to: a
+        // zero entry names the slot itself.
+        let alias_table = (!sampler)
+            .then(|| host.upload_buffer(u64::from(total.max(views)) * 4))
+            .flatten()
+            .map(|(buffer, data)| {
+                crate::host::name(&buffer, || "view aliases".into());
+                // Every slot reads itself until a typed view is made there.
+                // SAFETY: our mapped buffer of a dword per slot.
+                unsafe { std::ptr::write_bytes(data, 0, total.max(views) as usize * 4) };
+                (buffer, data as usize)
+            });
         let h = HostHeap {
             heap,
             cpu,
@@ -196,12 +294,18 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: alias_base,
             strides,
             marks,
+            alias_table,
+            aliases: Mutex::new(Aliases {
+                next: alias_base,
+                end: pairs_end,
+                free: Vec::new(),
+                of: Default::default(),
+                typed: Default::default(),
+                most: 0,
+            }),
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
         };
@@ -376,6 +480,7 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        self.release_aliases(first, (at + n).min(self.dynamic) - at.min(self.dynamic));
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
@@ -386,13 +491,14 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark, skip) = make_marked(view, self.cpu(index));
+        let (kept, mark, skip, bytes) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view), skip);
         self.set_mark(index, mark);
+        self.set_alias(index, bytes);
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -450,6 +556,7 @@ impl HostHeap {
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.set_mark(index, None);
+        self.set_alias(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -462,6 +569,7 @@ impl HostHeap {
         self.keep(index, None);
         self.set_stride(index, None, 0);
         self.set_mark(index, None);
+        self.set_alias(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
@@ -511,6 +619,180 @@ impl HostHeap {
     /// The view-mark table, for the root SRV of shaders marking their writes.
     pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
         self.marks.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// The view-alias table, for root SRV `VIEW_ALIASES`.
+    pub(crate) fn alias_table(&self) -> Option<&ID3D12Resource> {
+        self.alias_table.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// Slot `index` now holds a typed buffer view of `bytes` of a host copy
+    /// (or none): makes the raw view of them in its alias slot, and enters
+    /// it in the view-alias table; with none, the slot reads itself.
+    fn set_alias(&self, index: u32, bytes: Option<ViewedBytes>) {
+        if self.alias_table.is_none() {
+            return;
+        }
+        self.note_typed(index, bytes.is_some());
+        let entry = bytes
+            .and_then(|bytes| self.make_alias(index, bytes))
+            .unwrap_or(0);
+        if entry == 0 {
+            // An alias slot it keeps reads nothing (no buffer is held for it).
+            let slot = self
+                .aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .of
+                .get(&index)
+                .copied();
+            if let Some(slot) = slot {
+                self.raw_view_at(slot, None, 0, 0, false);
+                self.write_stride(slot, 0);
+            }
+        }
+        self.write_alias(index, entry);
+    }
+
+    /// Notes whether slot `index` holds a typed buffer view, logging the
+    /// most slots that have at once as it grows (1,024, 4,096, ... ): what
+    /// the alias pool needs, also on a heap with none.
+    fn note_typed(&self, index: u32, typed: bool) {
+        let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        if !typed {
+            a.typed.remove(&index);
+            return;
+        }
+        a.typed.insert(index);
+        let n = a.typed.len();
+        if n > a.most {
+            a.most = n;
+            if n >= 1024 && n.is_power_of_two() && n.trailing_zeros().is_multiple_of(2) {
+                let pool = a.end - a.next + a.free.len() as u32 + a.of.len() as u32;
+                tracing::info!(
+                    slots = n,
+                    pool,
+                    "typed buffer views at once (raw aliases needed)"
+                );
+            }
+        }
+    }
+
+    /// Enters slot `index`'s view-alias table entry ([`alias_entry`]; 0: the
+    /// slot itself). The one place the table is written.
+    fn write_alias(&self, index: u32, entry: u32) {
+        let Some((_, data)) = &self.alias_table else {
+            return;
+        };
+        if index >= self.count + self.dynamic {
+            return;
+        }
+        // SAFETY: a dword of the mapped table, which has one per slot of the
+        // heap (`index` is below its title and dynamic slots).
+        unsafe {
+            (*data as *mut u32)
+                .add(index as usize)
+                .write_volatile(entry)
+        };
+    }
+
+    /// Makes the raw view of `bytes` in slot `index`'s alias slot (taking
+    /// one if it has none): its view-alias table entry, none if the bytes
+    /// cannot be viewed raw or the pool is used up.
+    fn make_alias(&self, index: u32, (buffer, first, len, uav): ViewedBytes) -> Option<u32> {
+        // SAFETY: a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let Some((start, bytes, bias)) = alias_window(first, len, width) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    first,
+                    len,
+                    "a typed buffer view off the dwords of its host copy has no raw alias"
+                )
+            });
+            return None;
+        };
+        let slot = {
+            let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+            match a.of.get(&index) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = match a.free.pop() {
+                        Some(slot) => slot,
+                        None if a.next < a.end => {
+                            a.next += 1;
+                            a.next - 1
+                        }
+                        None => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| tracing::warn!("no free raw alias slots: raw reads of typed buffer views read the typed view"));
+                            return None;
+                        }
+                    };
+                    a.of.insert(index, slot);
+                    slot
+                }
+            }
+        };
+        self.raw_view_at(slot, Some(&buffer), start, bytes, uav);
+        // The alias is raw (dwords) and starts `bias` bytes early, which
+        // shaders add as for a structured view off 16 bytes.
+        self.write_stride(slot, 4 | bias << victory_shader::emit::VIEW_SKIP_SHIFT);
+        Some(alias_entry(index, slot))
+    }
+
+    /// Dynamic slots `first..first + n` are released: their alias slots go
+    /// back to the pool.
+    fn release_aliases(&self, first: u32, n: u32) {
+        let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        for index in first..first + n {
+            a.typed.remove(&index);
+        }
+        if a.of.is_empty() {
+            return;
+        }
+        let mut cleared = Vec::new();
+        for index in first..first + n {
+            if let Some(slot) = a.of.remove(&index) {
+                a.free.push(slot);
+                cleared.push(index);
+            }
+        }
+        drop(a);
+        for index in cleared {
+            self.write_alias(index, 0);
+        }
+    }
+
+    /// Slot `index`'s view-alias table entry and its alias slot, if any
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn alias_of(&self, index: u32) -> (u32, Option<u32>) {
+        let (_, data) = self
+            .alias_table
+            .as_ref()
+            .expect("a view heap's alias table");
+        // SAFETY: as in `write_alias`.
+        let entry = unsafe { (*data as *const u32).add(index as usize).read_volatile() };
+        let slot = self
+            .aliases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .of
+            .get(&index)
+            .copied();
+        (entry, slot)
+    }
+
+    /// The bytes slot `index`'s view starts before the title's, from its
+    /// view-stride entry ([`victory_shader::emit::VIEW_SKIP_SHIFT`]; tests).
+    #[cfg(test)]
+    pub(crate) fn skip_of(&self, index: u32) -> u32 {
+        let (_, data) = self.strides.as_ref().expect("a view heap's stride table");
+        // SAFETY: as in `write_stride`.
+        let entry = unsafe { (*data as *const u32).add(index as usize).read_volatile() };
+        entry >> victory_shader::emit::VIEW_SKIP_SHIFT
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -612,6 +894,8 @@ impl HostHeap {
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
+        self.set_alias(index, None);
+        self.set_alias(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -674,13 +958,14 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let (kept, mark, skip) = if later {
-                (None, None, 0)
+            let (kept, mark, skip, bytes) = if later {
+                (None, None, 0, None)
             } else {
                 make_marked(&view, self.cpu(index))
             };
             self.set_stride(index, Some(&view), skip);
             self.set_mark(index, mark);
+            self.set_alias(index, bytes);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -955,6 +1240,32 @@ fn raw_window(start: u64, count: u32, stride: u32) -> Option<(u64, u32, u32)> {
     Some(((start - skip) / 4, dwords, skip as u32))
 }
 
+/// The raw view of `len` bytes from byte `first` of a host copy `width`
+/// bytes long, for a typed view's alias: its first byte (on 16 bytes,
+/// `D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), its bytes (whole dwords, within the
+/// copy) and the bytes from its start to `first` (the bias, 0, 4, 8 or
+/// 12, kept in the alias slot's view-stride entry as [`raw_window`]'s skip
+/// is). None for bytes not on a dword (a raw read cannot address them as
+/// the console does).
+/// shortcut: the window starts up to 12 bytes before the view; only an
+/// offset wrapping below the view's start reaches those bytes.
+fn alias_window(first: u64, len: u64, width: u64) -> Option<(u64, u64, u32)> {
+    if !first.is_multiple_of(4) || len == 0 || first >= width {
+        return None;
+    }
+    let bias = first % RAW_ALIGN;
+    let start = first - bias;
+    let bytes = (bias + len).next_multiple_of(4).min((width - start) & !3);
+    Some((start, bytes, bias as u32))
+}
+
+/// Slot `index`'s view-alias table entry for an alias in slot `alias` (past
+/// every title and dynamic slot): what translated shaders add to the slot.
+fn alias_entry(index: u32, alias: u32) -> u32 {
+    debug_assert!(alias > index);
+    alias - index
+}
+
 /// Where the host copy of a buffer view's bytes must start: on a dword if
 /// the host makes the view raw ([`raw_stride`], [`raw_window`]), else on
 /// one of its elements (`element`). [`crate::shadow::for_view`] makes a
@@ -1027,6 +1338,7 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1034,6 +1346,17 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     SKIP.with(|s| s.set(skip));
+    if !raw {
+        // Typed (or left structured): raw reads go through its alias.
+        VIEWED.with(|v| {
+            v.set(Some((
+                shadow.buffer.clone(),
+                first * element,
+                u64::from(count) * element,
+                false,
+            )))
+        });
+    }
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1107,6 +1430,7 @@ fn buffer_uav(
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1116,6 +1440,17 @@ fn buffer_uav(
     // Shaders mark bytes counted from the host view's first byte.
     MARK.with(|m| m.set(shadow.mark_entry(start - u64::from(skip))));
     SKIP.with(|s| s.set(skip));
+    if !raw {
+        // Typed (or left structured): raw reads go through its alias.
+        VIEWED.with(|v| {
+            v.set(Some((
+                shadow.buffer.clone(),
+                first * element,
+                u64::from(count) * element,
+                true,
+            )))
+        });
+    }
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1126,18 +1461,28 @@ thread_local! {
     /// The bytes the raw view [`make`] last made on this thread starts
     /// before the title's view ([`raw_window`]).
     static SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The bytes the typed buffer view [`make`] last made on this thread
+    /// reads ([`make_marked`]).
+    static VIEWED: std::cell::Cell<Option<ViewedBytes>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`make`], the view-mark entry of the view if it is an unordered buffer
 /// view whose writes shaders mark (`victory_shader::emit`, "Write marks"),
 /// and the bytes the host's view starts before the title's ([`raw_window`];
-/// for its view-stride entry).
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>, u32) {
+/// for its view-stride entry), and the bytes it reads if it is a typed
+/// buffer view (for its raw alias, [`Aliases`]).
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Marked {
     MARK.with(|m| m.set(None));
     SKIP.with(|s| s.set(0));
+    VIEWED.with(|v| v.set(None));
     let kept = make(view, at);
     let skip = if kept.is_some() { SKIP.with(std::cell::Cell::take) } else { 0 };
-    (kept, MARK.with(std::cell::Cell::take), skip)
+    (
+        kept,
+        MARK.with(std::cell::Cell::take),
+        skip,
+        VIEWED.with(std::cell::Cell::take),
+    )
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1244,7 +1589,9 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    let made = make(view, at).flatten().map(|k| k.0);
+    VIEWED.with(|v| v.set(None));
+    made
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
