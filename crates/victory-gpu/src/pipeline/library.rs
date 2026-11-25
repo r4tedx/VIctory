@@ -379,6 +379,11 @@ fn tag(blob: &[u8]) -> String {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    // Translations without their BVH reads (diagnostics) are other
+    // bytecode; the tag is unchanged without the switch.
+    if crate::shader_cache::rays_miss() {
+        h.update(b"VICTORY_RT_MISS");
+    }
     h.finalize().to_hex().to_string()
 }
 

@@ -296,6 +296,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
+        rays_miss: false,
     })
     .map_err(e)?;
     Ok(HostShader {

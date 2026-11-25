@@ -433,6 +433,11 @@ pub struct Options {
     pub view_marks: bool,
     /// The wave sizes the host runs ([`Target::ANY`] by default).
     pub target: Target,
+    /// Diagnostics: every `image_bvh*_intersect_ray` returns a miss without
+    /// reading its node, so the title's traversals end at once whatever
+    /// the structures hold. Not a correct image; it tells whether a dark
+    /// or slow pass comes from what the traversals find.
+    pub rays_miss: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -643,6 +648,7 @@ pub fn emit_with(
         console_cf,
         per_lane_only,
         view_marks: options.view_marks,
+        rays_miss: options.rays_miss,
     };
     // Discarded lanes run on as live lanes in the helper form (`st`). In a
     // loop they can leave only by being killed (the console's "no live lane
@@ -1263,7 +1269,7 @@ mod tests {
             (out, features, flags)
         };
 
-        let marks = Options { view_marks: true };
+        let marks = Options { view_marks: true, ..Options::default() };
         for stage in [HwStage::Vs, HwStage::Ms] {
             let (out, sfi0, flags) = translate_stage(stage, marks);
             assert!(

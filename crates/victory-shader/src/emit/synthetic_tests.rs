@@ -140,6 +140,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
+        rays_miss: false,
     })
 }
 

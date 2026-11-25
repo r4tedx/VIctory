@@ -97,6 +97,8 @@ pub(crate) struct Parts<'a> {
     pub per_lane_only: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Every BVH intersection is a miss ([`super::Options::rays_miss`]).
+    pub rays_miss: bool,
 }
 
 /// What [`lower`] stops with when a program should run as the console runs
@@ -10870,6 +10872,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             view_marks: false,
+            rays_miss: false,
         })
         .map(|_| ())
     }
@@ -10924,6 +10927,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             view_marks: false,
+            rays_miss: false,
         })
     }
 
@@ -11117,6 +11121,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
             view_marks: false,
+            rays_miss: false,
         })
         .unwrap();
 

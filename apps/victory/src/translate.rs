@@ -645,6 +645,7 @@ fn translate(
                     let options = emit::Options {
                         view_marks: true,
                         target: checks.target,
+                        rays_miss: false,
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {

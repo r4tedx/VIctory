@@ -516,7 +516,7 @@ fn program(wide: bool) -> Vec<u32> {
     w
 }
 
-fn build(wide: bool, memory: bool) -> HostShader {
+fn build(wide: bool, memory: bool, rays_miss: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -596,6 +596,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
+        rays_miss,
     })
     .expect("lower");
     let shader = HostShader {
@@ -715,7 +716,19 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 }
 
 fn run_cases(wide: bool, batches: usize, memory: bool) {
-    let shader = build(wide, memory);
+    run_cases_with(wide, batches, memory, false);
+}
+
+/// The result of a miss of a node of type `ty` (`Options::rays_miss`).
+fn miss(ty: u32) -> [u32; 4] {
+    match ty & 7 {
+        0..=3 => [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0],
+        _ => [INVALID; 4],
+    }
+}
+
+fn run_cases_with(wide: bool, batches: usize, memory: bool, rays_miss: bool) {
+    let shader = build(wide, memory, rays_miss);
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
@@ -787,7 +800,11 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let want = intersect(w, *ty, ray);
+                let want = if rays_miss {
+                    miss(*ty)
+                } else {
+                    intersect(w, *ty, ray)
+                };
                 let got = &out[0][4 * n..4 * n + 4];
                 assert_eq!(got, want, "{label}: type {ty}, {ray:?}, node {w:08x?}");
                 match ty {
@@ -811,6 +828,16 @@ fn intersections_on_the_gpu_equal_the_reference() {
 #[test]
 fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
     run_cases(true, 8, false);
+}
+
+/// With `Options::rays_miss` every intersection is a miss of its node's
+/// type, over the same nodes and rays (some of which hit), with 32- and
+/// 64-bit pointers and with nodes in title memory.
+#[test]
+fn with_rays_miss_every_intersection_misses() {
+    run_cases_with(false, 4, false, true);
+    run_cases_with(true, 4, false, true);
+    run_cases_with(false, 2, true, true);
 }
 
 /// The title address of the rays and nodes in the title-memory runs.

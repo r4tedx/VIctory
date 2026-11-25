@@ -93,6 +93,7 @@ fn lower_as(
         console_cf,
         per_lane_only: false,
         view_marks: false,
+        rays_miss: false,
     })
 }
 
