@@ -196,6 +196,7 @@ fn tag(blob: &[u8]) -> String {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    crate::shader_cache::hash_heap_usage(&mut h, victory_shader::emit::heap_usage_marks());
     h.finalize().to_hex().to_string()
 }
 

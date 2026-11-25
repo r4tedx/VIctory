@@ -52,8 +52,7 @@ pub fn counts() -> (u64, u64) {
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// translation settings (the loop limit and whether shaders mark heap usage).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,19 +63,32 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            victory_shader::emit::heap_usage_marks(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, heap_usage: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    hash_heap_usage(&mut h, heap_usage);
     *h.finalize().as_bytes()
+}
+
+/// The default adds no key bytes. Disabling marks changes the DXIL.
+pub(crate) fn hash_heap_usage(h: &mut blake3::Hasher, enabled: bool) {
+    if !enabled {
+        h.update(b"VICTORY_HEAP_USAGE=0");
+    }
 }
 
 /// The translation of a console shader container, from the cache when
@@ -439,17 +451,18 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, true);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::heap_usage_marks(),
             )
         );
         // The encoding part is this file as built.
@@ -458,6 +471,20 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn heap_usage_changes_the_key_only_when_disabled() {
+        let translator = "0123456789abcdef";
+        let encoding = b"encoding";
+        let limit = victory_shader::emit::DEFAULT_LOOP_LIMIT;
+        let mut main = blake3::Hasher::new();
+        main.update(translator.as_bytes());
+        main.update(blake3::hash(encoding).as_bytes());
+        main.update(&limit.to_le_bytes());
+        let default = key(translator, encoding, limit, true);
+        assert_eq!(&default, main.finalize().as_bytes());
+        assert_ne!(default, key(translator, encoding, limit, false));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
