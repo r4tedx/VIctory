@@ -3296,3 +3296,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 }
+
+#[cfg(test)]
+mod frame_bench;
