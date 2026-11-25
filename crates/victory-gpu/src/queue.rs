@@ -123,6 +123,11 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
+        // Before running them: the title may release a list as soon as it
+        // sees the submission done.
+        for &l in lists {
+            crate::list::with_state(l, |_, state| state.submitted());
+        }
         host.execute(&host_lists);
         return;
     }
