@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{Crumb, HostList, host, transition};
 use crate::object::This;
 use crate::resource::HostTexture;
 
@@ -323,7 +323,9 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        && list.crumbed(Crumb::Copy, Some("depth twin copy (ours)"), || {
+            twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        })
     {
         list.need_rebind();
     }

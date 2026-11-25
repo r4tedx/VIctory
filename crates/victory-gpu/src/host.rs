@@ -837,6 +837,22 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_BREADCRUMBS`: the commands recorded since the
+    /// reset, each with an id the GPU writes when it starts and finishes it.
+    #[cfg(feature = "diagnostics")]
+    crumbs: Mutex<crate::crumbs::Trail>,
+}
+
+/// What a command [`HostList::crumbed`] records is (`crate::crumbs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Crumb {
+    Draw,
+    Dispatch,
+    Mesh,
+    Indirect,
+    Copy,
+    Clear,
+    Resolve,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1126,6 +1142,8 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            #[cfg(feature = "diagnostics")]
+            let trail = crate::crumbs::Trail::new(id, &list, &self.device);
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
@@ -1148,6 +1166,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                crumbs: Mutex::new(trail),
             })
         }
     }
@@ -1280,6 +1300,11 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        #[cfg(feature = "diagnostics")]
+                        let group_runs = if groups.len() > 1 { &runs[i..=i] } else { runs };
+                        #[cfg(feature = "diagnostics")]
+                        self.wait_crumbed(group_runs, *submitted);
+                        #[cfg(not(feature = "diagnostics"))]
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
@@ -1323,6 +1348,8 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            #[cfg(feature = "diagnostics")]
+            report_crumbs(runs, *submitted, "device removed");
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
@@ -1443,6 +1470,32 @@ impl Host {
                 }
             }
             crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    /// Waits for submission `submission` of `runs` (its event set): with
+    /// breadcrumbs on, reports where each list is while it runs past
+    /// [`crate::crumbs::STUCK_AFTER`] (the first four times).
+    #[cfg(feature = "diagnostics")]
+    fn wait_crumbed(&self, runs: &[&HostList], submission: u64) {
+        if !crate::crumbs::on() {
+            // SAFETY: our event.
+            unsafe { WaitForSingleObject(self.event, INFINITE) };
+            return;
+        }
+        for list in runs {
+            list.crumbs.lock().unwrap_or_else(|e| e.into_inner()).submission = submission;
+        }
+        let step = crate::crumbs::STUCK_AFTER;
+        let mut waited = std::time::Duration::ZERO;
+        // SAFETY: our event.
+        while unsafe { WaitForSingleObject(self.event, step.as_millis() as u32) }
+            == windows::Win32::Foundation::WAIT_TIMEOUT
+        {
+            waited += step;
+            if waited <= 4 * step {
+                report_crumbs(runs, submission, &format!("still running after {} s", waited.as_secs()));
+            }
         }
     }
 
@@ -1789,6 +1842,8 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.crumbs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -2043,6 +2098,29 @@ impl HostList {
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::crumbs::on() {
+            self.crumbs.lock().unwrap_or_else(|e| e.into_inner()).bind(name);
+        }
+    }
+
+    /// Records a command with `record`: with `VICTORY_GPU_BREADCRUMBS`
+    /// (diagnostics builds), between the GPU writes of its id on starting
+    /// and finishing it, kept with `kind` and `what` it runs (else the
+    /// pipeline bound last).
+    #[inline]
+    pub(crate) fn crumbed<R>(&self, kind: Crumb, what: Option<&str>, record: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "diagnostics")]
+        if crate::crumbs::on() {
+            let id = self.crumbs.lock().unwrap_or_else(|e| e.into_inner()).start(kind, what);
+            let recorded = record();
+            if let Some(id) = id {
+                self.crumbs.lock().unwrap_or_else(|e| e.into_inner()).finish(id);
+            }
+            return recorded;
+        }
+        let _ = (kind, what);
+        record()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -3299,7 +3377,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                p.copy.crumbed(Crumb::Copy, Some("present copy"), || list.CopyResource(&back, texture));
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3755,6 +3833,49 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     }
     let _ = (runs, list);
     String::new()
+}
+
+/// Logs where each list of submission `submission` (`runs`) is, by its
+/// breadcrumbs: one line naming every list's state, then one per list
+/// with a command started and not finished (`crate::crumbs`).
+#[cfg(feature = "diagnostics")]
+fn report_crumbs(runs: &[&HostList], submission: u64, why: &str) {
+    use crate::crumbs::{Progress, lines, report_list};
+    if !crate::crumbs::on() {
+        return;
+    }
+    let mut states = Vec::with_capacity(runs.len());
+    let mut stuck = Vec::new();
+    for (i, r) in runs.iter().enumerate() {
+        let trail = r.crumbs.lock().unwrap_or_else(|e| e.into_inner());
+        let (progress, text) = report_list(r.id, i, runs.len(), &trail, why);
+        let state = match progress {
+            Progress::Empty => "none",
+            Progress::NotStarted => "waiting",
+            Progress::Done => "done",
+            Progress::Stuck { .. } => "STUCK",
+        };
+        states.push(format!("{}:{state}/{}", r.id, trail.entries.len()));
+        stuck.extend(text);
+    }
+    let head = format!(
+        "GPU breadcrumbs ({why}): submission {submission}, {} lists in order (list:state/commands) [{}]",
+        runs.len(),
+        states.join(" ")
+    );
+    for line in lines(&head) {
+        tracing::error!("{line}");
+    }
+    for text in &stuck {
+        for line in lines(text) {
+            tracing::error!("{line}");
+        }
+    }
+    if stuck.is_empty() {
+        tracing::error!(
+            "GPU breadcrumbs ({why}): no list has a command started and not finished (the GPU is between breadcrumbed commands: a barrier, a prelude or a command of ours without breadcrumbs)"
+        );
+    }
 }
 
 /// For adapters without device-removed data (the software one): the last
