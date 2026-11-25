@@ -80,10 +80,12 @@ impl Drop for Pages<'_> {
 /// copy-back of marked pages).
 #[derive(Default)]
 struct Saved {
-    /// The armed pages as runs `[first, last)`, none inside another: a
-    /// root view declares its copy from its address to the end, the
-    /// world's 174 MB heap many times a submission, and a set entry per
-    /// page cost 30 microseconds a declaration.
+    /// The armed pages as runs `[first, last)`, sorted, apart and not
+    /// touching (runs armed that meet merge): a root view declares its
+    /// copy from its address to the end, the world's 174 MB heap many
+    /// times a submission, and a set entry per page cost 30 microseconds a
+    /// declaration; descriptor tables arm many sub-ranges end to end, and
+    /// the write handler checks a page under the guards' lock.
     armed: Vec<(usize, usize)>,
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
@@ -93,19 +95,34 @@ struct Saved {
 impl Saved {
     /// Whether page `page` is armed.
     fn armed(&self, page: usize) -> bool {
-        self.armed.iter().any(|&(first, last)| (first..last).contains(&page)) && !self.unarmed.contains(&page)
+        // The first run ending after `page` is the only one that can hold it.
+        let i = self.armed.partition_point(|&(_, last)| last <= page);
+        self.armed.get(i).is_some_and(|&(first, _)| first <= page) && !self.unarmed.contains(&page)
     }
 
     /// Arms pages `[first, last)`.
     fn arm(&mut self, first: usize, last: usize) {
-        if !self.unarmed.is_empty() {
-            self.unarmed.retain(|page| !(first..last).contains(page));
-        }
-        if self.armed.iter().any(|&(a, b)| a <= first && last <= b) {
+        if first >= last {
             return;
         }
-        self.armed.retain(|&(a, b)| !(first <= a && b <= last));
-        self.armed.push((first, last));
+        if !self.unarmed.is_empty() {
+            let pages: Vec<usize> = self.unarmed.range(first..last).copied().collect();
+            for page in pages {
+                self.unarmed.remove(&page);
+            }
+        }
+        // Runs `[lo, hi)` overlap or touch the new one: it replaces them.
+        let lo = self.armed.partition_point(|&(_, b)| b < first);
+        let hi = self.armed.partition_point(|&(a, _)| a <= last);
+        if lo + 1 == hi && self.armed[lo].0 <= first && last <= self.armed[lo].1 {
+            return;
+        }
+        let run = if lo < hi {
+            (self.armed[lo].0.min(first), self.armed[hi - 1].1.max(last))
+        } else {
+            (first, last)
+        };
+        self.armed.splice(lo..hi, [run]);
     }
 }
 
@@ -883,6 +900,54 @@ pub(crate) mod tests {
         assert_eq!(saved(2), None, "disarmed");
         drop(t);
         free(p);
+    }
+
+    /// Runs armed that touch or overlap merge into one, so a page's check
+    /// stays a search however many sub-ranges are armed; pages unarmed in
+    /// them stay unarmed until a range holding them is armed again.
+    #[test]
+    fn adjacent_and_overlapping_armed_runs_coalesce() {
+        let mut s = Saved::default();
+        // Adjacent: [2k, 2k + 2) end to end, in order and out of it.
+        for k in 0..200 {
+            s.arm(2 * k, 2 * k + 2);
+        }
+        assert_eq!(s.armed, [(0, 400)]);
+        let mut s = Saved::default();
+        for k in (0..200).rev() {
+            s.arm(2 * k, 2 * k + 2);
+        }
+        assert_eq!(s.armed, [(0, 400)]);
+        // Overlapping, nested and disjoint.
+        let mut s = Saved::default();
+        s.arm(10, 20);
+        s.arm(15, 25);
+        assert_eq!(s.armed, [(10, 25)]);
+        s.arm(12, 14);
+        assert_eq!(s.armed, [(10, 25)], "nested");
+        s.arm(40, 50);
+        s.arm(0, 5);
+        assert_eq!(s.armed, [(0, 5), (10, 25), (40, 50)], "disjoint, sorted");
+        s.arm(5, 10);
+        assert_eq!(s.armed, [(0, 25), (40, 50)], "touching both sides");
+        s.arm(30, 35);
+        s.arm(20, 45);
+        assert_eq!(s.armed, [(0, 50)], "spanning several");
+        s.arm(60, 70);
+        s.arm(55, 55);
+        assert_eq!(s.armed, [(0, 50), (60, 70)], "an empty run arms nothing");
+        assert!(s.armed(0) && s.armed(49) && !s.armed(50) && !s.armed(59));
+        assert!(s.armed(60) && s.armed(69) && !s.armed(70) && !s.armed(1000));
+        // Unarmed pages stay out of a merged run until armed again.
+        s.unarmed.insert(45);
+        s.unarmed.insert(65);
+        s.arm(50, 60);
+        assert_eq!(s.armed, [(0, 70)]);
+        assert!(!s.armed(45) && !s.armed(65) && s.armed(55));
+        s.arm(44, 46);
+        assert!(s.armed(45) && !s.armed(65));
+        s.arm(0, 70);
+        assert!(s.armed(65) && s.unarmed.is_empty());
     }
 
     /// Plain committed memory (the C heap) is not tracked; reserved memory
