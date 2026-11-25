@@ -102,8 +102,50 @@ impl Drop for Changed {
 /// copy-back of marked pages).
 #[derive(Default)]
 struct Saved {
-    armed: BTreeSet<usize>,
+    /// The armed pages as runs `[first, last)`, sorted, apart and not
+    /// touching (runs armed that meet merge): a root view declares its
+    /// copy from its address to the end, the world's 174 MB heap many
+    /// times a submission, and a set entry per page cost 30 microseconds a
+    /// declaration; descriptor tables arm many sub-ranges end to end, and
+    /// the write handler checks a page under the guards' lock.
+    armed: Vec<(usize, usize)>,
+    /// Pages of those runs that are not armed any more.
+    unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+}
+
+impl Saved {
+    /// Whether page `page` is armed.
+    fn armed(&self, page: usize) -> bool {
+        // The first run ending after `page` is the only one that can hold it.
+        let i = self.armed.partition_point(|&(_, last)| last <= page);
+        self.armed.get(i).is_some_and(|&(first, _)| first <= page) && !self.unarmed.contains(&page)
+    }
+
+    /// Arms pages `[first, last)`.
+    fn arm(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        if !self.unarmed.is_empty() {
+            let pages: Vec<usize> = self.unarmed.range(first..last).copied().collect();
+            for page in pages {
+                self.unarmed.remove(&page);
+            }
+        }
+        // Runs `[lo, hi)` overlap or touch the new one: it replaces them.
+        let lo = self.armed.partition_point(|&(_, b)| b < first);
+        let hi = self.armed.partition_point(|&(a, _)| a <= last);
+        if lo + 1 == hi && self.armed[lo].0 <= first && last <= self.armed[lo].1 {
+            return;
+        }
+        let run = if lo < hi {
+            (self.armed[lo].0.min(first), self.armed[hi - 1].1.max(last))
+        } else {
+            (first, last)
+        };
+        self.armed.splice(lo..hi, [run]);
+    }
 }
 
 impl Changed {
@@ -116,7 +158,7 @@ impl Changed {
     /// taken: its bytes now, if armed for it.
     fn save(&self, page: usize) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
-        if !saved.armed.contains(&page) || saved.bytes.contains_key(&page) {
+        if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
         let mut bytes = vec![0u8; PAGE].into_boxed_slice();
@@ -530,20 +572,24 @@ impl Tracked {
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
+            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
         }
     }
 
     /// Page `page` (a page number) needs no saving any more: its copy-back
     /// is under way.
     pub(crate) fn unarm(&self, page: usize) {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.armed(page) {
+            saved.unarmed.insert(page);
+        }
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
         saved.armed.clear();
+        saved.unarmed.clear();
         saved.bytes.clear();
     }
 
@@ -1013,6 +1059,95 @@ pub(crate) mod tests {
         assert!(t.clean());
         drop(t);
         free(p);
+    }
+
+    /// Pages of the ranges armed keep their bytes from before the first
+    /// write after they were taken, whichever overlapping ranges armed
+    /// them; a page unarmed keeps none until it is armed again, and none
+    /// does once the tracker is disarmed.
+    #[test]
+    fn armed_ranges_keep_their_pages_bytes_from_before_the_first_write() {
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("pool memory is tracked");
+        let all = || t.take(p, p + 4 * PAGE);
+        // SAFETY: (every write below) a byte of our pool; a guarded page
+        // faults into the handler, which saves it first where it is armed.
+        let write = |page: usize, value: u8| unsafe { ((p + page * PAGE + 8) as *mut u8).write_volatile(value) };
+        let saved = |page: usize| t.saved(p / PAGE + page).map(|bytes| bytes[8]);
+        all();
+        write(0, 1);
+        assert_eq!(saved(0), None, "nothing armed yet");
+        all();
+        // Bytes 100 of page 0 to 1 of page 2: pages 0 to 2, page 3 not.
+        t.arm(p + 100, p + 2 * PAGE + 1);
+        t.arm(p + PAGE, p + 2 * PAGE);
+        t.arm(p + PAGE + 5, p + 2 * PAGE + 1);
+        t.unarm(p / PAGE + 1);
+        for page in 0..4 {
+            write(page, 2);
+        }
+        assert_eq!([saved(0), saved(1), saved(2), saved(3)], [Some(1), None, Some(0), None]);
+        assert_eq!(saved(0), None, "handed out once");
+        all();
+        // Armed again by a range holding it.
+        t.arm(p + PAGE, p + 2 * PAGE);
+        write(1, 3);
+        write(1, 4);
+        assert_eq!(saved(1), Some(2), "from before the first write");
+        t.disarm();
+        all();
+        write(2, 5);
+        assert_eq!(saved(2), None, "disarmed");
+        drop(t);
+        free(p);
+    }
+
+    /// Runs armed that touch or overlap merge into one, so a page's check
+    /// stays a search however many sub-ranges are armed; pages unarmed in
+    /// them stay unarmed until a range holding them is armed again.
+    #[test]
+    fn adjacent_and_overlapping_armed_runs_coalesce() {
+        let mut s = Saved::default();
+        // Adjacent: [2k, 2k + 2) end to end, in order and out of it.
+        for k in 0..200 {
+            s.arm(2 * k, 2 * k + 2);
+        }
+        assert_eq!(s.armed, [(0, 400)]);
+        let mut s = Saved::default();
+        for k in (0..200).rev() {
+            s.arm(2 * k, 2 * k + 2);
+        }
+        assert_eq!(s.armed, [(0, 400)]);
+        // Overlapping, nested and disjoint.
+        let mut s = Saved::default();
+        s.arm(10, 20);
+        s.arm(15, 25);
+        assert_eq!(s.armed, [(10, 25)]);
+        s.arm(12, 14);
+        assert_eq!(s.armed, [(10, 25)], "nested");
+        s.arm(40, 50);
+        s.arm(0, 5);
+        assert_eq!(s.armed, [(0, 5), (10, 25), (40, 50)], "disjoint, sorted");
+        s.arm(5, 10);
+        assert_eq!(s.armed, [(0, 25), (40, 50)], "touching both sides");
+        s.arm(30, 35);
+        s.arm(20, 45);
+        assert_eq!(s.armed, [(0, 50)], "spanning several");
+        s.arm(60, 70);
+        s.arm(55, 55);
+        assert_eq!(s.armed, [(0, 50), (60, 70)], "an empty run arms nothing");
+        assert!(s.armed(0) && s.armed(49) && !s.armed(50) && !s.armed(59));
+        assert!(s.armed(60) && s.armed(69) && !s.armed(70) && !s.armed(1000));
+        // Unarmed pages stay out of a merged run until armed again.
+        s.unarmed.insert(45);
+        s.unarmed.insert(65);
+        s.arm(50, 60);
+        assert_eq!(s.armed, [(0, 70)]);
+        assert!(!s.armed(45) && !s.armed(65) && s.armed(55));
+        s.arm(44, 46);
+        assert!(s.armed(45) && !s.armed(65));
+        s.arm(0, 70);
+        assert!(s.armed(65) && s.unarmed.is_empty());
     }
 
     /// Plain committed memory (the C heap) is not tracked; reserved memory
