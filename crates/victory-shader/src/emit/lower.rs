@@ -5206,6 +5206,8 @@ impl<'a> Lower<'a> {
     /// every lane put millions of atomics a frame on a few bitmap dwords
     /// (every pixel of every draw reading a texture from the heap), and the
     /// GPU time of a world frame grew several times over with the scene.
+    /// A marking lane first loads the dword, and does the atomic only where
+    /// the bit is still clear (as buffer write marks do).
     ///
     /// The bitmap is a root view, which has no bounds, so the other lanes
     /// branch around the atomic instead of being sent out of bounds.
@@ -5232,8 +5234,16 @@ impl<'a> Lower<'a> {
         let differ = self.s.m.bin(c, Bin::Xor, equal, t);
         let marks = self.s.m.bin(c, Bin::Or, first, differ);
         let at = self.begin_guarded(Some(marks));
+        // Most reads find their slot marked: a load, not an atomic (the
+        // bitmap is in system memory, so each atomic crosses the bus).
         let c = self.cur;
-        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        let zero = k(self, 0);
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let inner = self.begin_guarded(Some(clear));
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(inner, &[]);
         self.end_guarded(at, &[]);
     }
 
