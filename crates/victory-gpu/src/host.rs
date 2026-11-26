@@ -1434,7 +1434,14 @@ impl Host {
         // What shaders wrote into copies in video memory, for the copy-backs
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
-        crate::shadow::pull(&snapshots);
+        // Withheld ranges need nothing more for copies whose system memory
+        // side stays current (`VICTORY_VRAM_COPIES`, `crate::vram`): those
+        // declared unmarked have snapshots (`snapshots` takes every list's,
+        // withheld or not), and `copy_back_marks` pulled the marked pages of
+        // the others, withheld ones too. Brought back whole once more, they
+        // cost a GPU copy of every withheld range, marked ones included, per
+        // submission.
+        crate::shadow::pull(&snapshots, crate::vram::Pulled::Declared);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -3376,6 +3383,7 @@ impl Meter {
                 crate::copystat::log(window);
                 crate::bindless::log(window);
                 crate::shadow::log_views(window);
+                crate::vram::log(window);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -3866,6 +3874,18 @@ impl Host {
                 ..Default::default()
             }
         };
+        self.mapped_in(size, &heap, upload)
+    }
+
+    /// A buffer of `size` bytes in `heap`, mapped, that shaders read and
+    /// write (`upload`: counted as in a GPU upload heap). Starts in the
+    /// common state.
+    pub(crate) fn mapped_in(
+        &self,
+        size: u64,
+        heap: &D3D12_HEAP_PROPERTIES,
+        upload: bool,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -3886,7 +3906,7 @@ impl Host {
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
-                    &heap,
+                    heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
