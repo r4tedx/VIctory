@@ -1,6 +1,7 @@
-//! Host copies of title buffers in video memory (opt-in:
-//! `VICTORY_VRAM_COPIES=1` for buffers the title made without unordered
-//! access, `=2` for those shaders may write too).
+//! Host copies of title buffers in video memory (opt-in,
+//! `VICTORY_VRAM_COPIES`: `=1` for buffers the title made without
+//! unordered access, `=2` for those shaders may write too; unset or `=0`
+//! for none).
 //!
 //! A title buffer's host copy ([`crate::shadow`]) is a buffer in system
 //! memory that the CPU maps and shaders read across the bus. Here a copy
@@ -49,15 +50,21 @@ pub(crate) enum Class {
     VramWritten = 2,
 }
 
-/// What the switch lets go to video memory: 0 nothing, 1 copies of
-/// read-only buffers, 2 every buffer copy. Read once.
-fn level() -> u8 {
+/// What `VICTORY_VRAM_COPIES` lets go to video memory: 0 nothing, 1
+/// copies of read-only buffers, 2 every buffer copy. Read once.
+pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| match std::env::var("VICTORY_VRAM_COPIES").as_deref() {
-        Ok("2") => 2,
-        _ if crate::switch::on("VICTORY_VRAM_COPIES") => 1,
+    *LEVEL.get_or_init(|| level_of(std::env::var_os("VICTORY_VRAM_COPIES").as_deref()))
+}
+
+/// [`level`] from the switch's value: unset or `0` none, `1` read-only
+/// copies, `2` every copy; any other value means 1, as `=1` did before.
+fn level_of(value: Option<&std::ffi::OsStr>) -> u8 {
+    match value {
+        Some(v) if v == "2" => 2,
+        v if crate::switch::value_is_on(v) => 1,
         _ => 0,
-    })
+    }
 }
 
 /// The class a new copy of a title buffer asks for (`read_only`: made
@@ -426,6 +433,17 @@ pub(crate) fn log(frames: f64) {
 pub(crate) mod tests {
     use super::*;
 
+    /// `VICTORY_VRAM_COPIES` is opt-in: unset or `0` none, `1` read-only
+    /// copies, `2` every copy; any other value 1, as before.
+    #[test]
+    fn vram_copies_are_opt_in() {
+        use std::ffi::OsStr;
+        assert_eq!(level_of(None), 0, "unset");
+        for (value, want) in [("0", 0), ("1", 1), ("2", 2), ("yes", 1), ("", 1)] {
+            assert_eq!(level_of(Some(OsStr::new(value))), want, "{value:?}");
+        }
+    }
+
     /// A test's budget and use by others than the copies, in bytes, in
     /// place of DXGI's.
     pub(crate) static FAKE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
@@ -440,7 +458,7 @@ pub(crate) mod tests {
     /// child, where the test does its work; false in the parent once the
     /// child passed, which it must have run. The child runs with the GPU
     /// upload heaps off (`VICTORY_GPU_UPLOAD=0`, `VICTORY_GPU_UPLOAD_WRITES=0`,
-    /// both on by default): these tests are of video memory copies alone,
+    /// stated whatever their defaults): these tests are of video memory copies alone,
     /// with what they refuse in system memory. The order with both on is
     /// `shadow::tests::copies_try_video_memory_then_upload_heaps_then_system_memory`.
     // The pattern is #2120's (0xkn0wh3r3).

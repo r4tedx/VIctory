@@ -3422,25 +3422,31 @@ void main(uint lane : SV_GroupIndex) {
     /// A copy in a GPU upload heap (`VICTORY_GPU_UPLOAD`: each copy its own
     /// placed buffer) takes the dynamic slots a copy in system memory takes,
     /// which is its own committed buffer too: one root view per copy and
-    /// list. Run with the default placement (copies in GPU upload heaps
-    /// where the host has them), then in a child process with
-    /// `VICTORY_GPU_UPLOAD=0` (every copy in system memory).
+    /// list. The test runs in two child processes, each with its switches
+    /// stated: `VICTORY_GPU_UPLOAD=1` (copies in GPU upload heaps where the
+    /// host has them) and `VICTORY_GPU_UPLOAD=0` (every copy in system
+    /// memory), both with `VICTORY_VRAM_COPIES=0` (no copy in P-0a's video
+    /// memory, stated whatever its default).
     #[test]
     fn copies_in_upload_heaps_take_the_slots_system_memory_copies_do() {
         const CHILD: &str = "VICTORY_TEST_DRAW_UPLOAD_CHILD";
         const NAME: &str = "draw::tests::copies_in_upload_heaps_take_the_slots_system_memory_copies_do";
-        let child = std::env::var_os(CHILD).is_some();
-        if !child {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
-                .env(CHILD, "1")
-                .env("VICTORY_GPU_UPLOAD", "0")
-                .output()
-                .unwrap();
-            let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-            assert!(out.status.success() && text.contains("1 passed"), "with VICTORY_GPU_UPLOAD=0:\n{text}");
-            eprintln!("{text}");
-        }
+        let Some(upload) = std::env::var_os(CHILD) else {
+            for upload in ["1", "0"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, upload)
+                    .env("VICTORY_GPU_UPLOAD", upload)
+                    .env("VICTORY_VRAM_COPIES", "0")
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+                assert!(out.status.success() && text.contains("1 passed"), "with VICTORY_GPU_UPLOAD={upload}:\n{text}");
+                eprintln!("{text}");
+            }
+            return;
+        };
+        let upload = upload == "1";
         let Some(gpu) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -3471,7 +3477,7 @@ void main(uint lane : SV_GroupIndex) {
         state.close();
         let used = before - host.dynamic_free().0;
         eprintln!("{placed} of {N} copies in GPU upload heaps; their root views took {used} dynamic slots");
-        if child {
+        if !upload {
             assert!(!gpu.gpu_upload(), "VICTORY_GPU_UPLOAD=0 turns it off");
             assert_eq!(placed, 0, "VICTORY_GPU_UPLOAD=0: every copy in system memory");
         } else if gpu.gpu_upload() {

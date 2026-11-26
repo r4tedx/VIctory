@@ -328,14 +328,14 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
-    /// Host copies go to GPU upload heaps by default where the host has
-    /// them; `VICTORY_GPU_UPLOAD=0` keeps every copy in system memory (the
-    /// old placement), `VICTORY_GPU_UPLOAD_WRITES=0` only the written ones;
-    /// without the heaps nothing moves.
+    /// Host copies go to GPU upload heaps only when asked
+    /// (`VICTORY_GPU_UPLOAD=1`, and `VICTORY_GPU_UPLOAD_WRITES=1` for the
+    /// written ones too) and the host has them: unset or `=0` keeps them
+    /// in system memory (or P-0a's video memory, `crate::vram`, if asked).
     #[test]
     fn upload_placement_follows_the_switches_and_the_heaps() {
         use super::placement;
-        use crate::switch::value_is_on_by_default as on;
+        use crate::switch::value_is_on as on;
         use std::ffi::OsStr;
 
         // Unset, =0 and =1.
@@ -343,11 +343,13 @@ mod tests {
         let u = on(None);
         // (VICTORY_GPU_UPLOAD, VICTORY_GPU_UPLOAD_WRITES, heaps) -> placement.
         let cases = [
-            ((u, u, true), (true, true), "both unset"),
+            ((u, u, true), (false, false), "both unset"),
             ((o, o, true), (true, true), "both =1"),
-            ((z, u, true), (false, false), "UPLOAD=0"),
+            ((z, z, true), (false, false), "both =0"),
+            ((o, u, true), (true, false), "UPLOAD=1 alone"),
+            ((u, o, true), (false, false), "WRITES=1 alone"),
             ((z, o, true), (false, false), "UPLOAD=0, WRITES=1"),
-            ((u, z, true), (true, false), "WRITES=0"),
+            ((o, z, true), (true, false), "WRITES=0"),
             ((u, u, false), (false, false), "no heaps, both unset"),
             ((o, o, false), (false, false), "no heaps, both =1"),
             ((z, z, false), (false, false), "no heaps, both =0"),
@@ -3621,11 +3623,10 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 /// Where host copies go from the two switches' values (`upload`:
-/// `VICTORY_GPU_UPLOAD`, `writes`: `VICTORY_GPU_UPLOAD_WRITES`, each on
-/// unless `=0`) and whether the host has GPU upload heaps: (copies shaders
-/// only read in GPU upload heaps, copies shaders write there too). Without
-/// the heaps, or with `VICTORY_GPU_UPLOAD=0`, every copy stays in system
-/// memory: the placement from before both switches were on by default.
+/// `VICTORY_GPU_UPLOAD`, `writes`: `VICTORY_GPU_UPLOAD_WRITES`, each off
+/// unless set, `=1`) and whether the host has GPU upload heaps: (copies
+/// shaders only read in GPU upload heaps, copies shaders write there too).
+/// Without the heaps, or without `VICTORY_GPU_UPLOAD`, no copy goes there.
 fn placement(upload: bool, writes: bool, heaps: bool) -> (bool, bool) {
     let read_only = upload && heaps;
     (read_only, read_only && writes)
@@ -3743,28 +3744,29 @@ impl Host {
     }
 
     /// Whether host copies that shaders only read go to GPU upload heaps:
-    /// on by default where the host has them, off with
-    /// `VICTORY_GPU_UPLOAD=0` ([`placement`]). Asked once.
+    /// `VICTORY_GPU_UPLOAD=1` (off by default) where the host has them
+    /// ([`placement`]). Asked once.
     pub(crate) fn gpu_upload(&self) -> bool {
         self.upload_placement().0
     }
 
     /// Whether host copies that shaders write go to GPU upload heaps too,
-    /// with a system memory mirror for the CPU (`crate::shadow`): on by
-    /// default with [`Host::gpu_upload`], off with
-    /// `VICTORY_GPU_UPLOAD_WRITES=0` ([`placement`]). Asked once.
+    /// with a system memory mirror for the CPU (`crate::shadow`):
+    /// `VICTORY_GPU_UPLOAD_WRITES=1` (off by default) with
+    /// [`Host::gpu_upload`] ([`placement`]). Asked once.
     pub(crate) fn gpu_upload_writes(&self) -> bool {
         self.upload_placement().1
     }
 
-    /// Where host copies of title buffers go, decided once and logged once
+    /// Where host copies of title buffers go in GPU upload heaps, decided
+    /// once; logged once with P-0a's level (`crate::vram`)
     /// (at the host's creation, [`host`]): (copies shaders only read in GPU
     /// upload heaps, copies shaders write there too).
     fn upload_placement(&self) -> (bool, bool) {
         static PLACEMENT: OnceLock<(bool, bool)> = OnceLock::new();
         *PLACEMENT.get_or_init(|| {
-            let upload = crate::switch::on_by_default("VICTORY_GPU_UPLOAD");
-            let writes = crate::switch::on_by_default("VICTORY_GPU_UPLOAD_WRITES");
+            let upload = crate::switch::on("VICTORY_GPU_UPLOAD");
+            let writes = crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: a feature query writing the structure of its size.
             let known = unsafe {
@@ -3778,12 +3780,15 @@ impl Host {
             let heaps = known && o.GPUUploadHeapSupported.as_bool();
             let (read_only, written) = placement(upload, writes, heaps);
             tracing::info!(
-                read_only,
-                written,
+                vram_copies = crate::vram::level(),
+                upload_read_only = read_only,
+                upload_written = written,
                 gpu_upload_heaps = heaps,
-                "host copies of title buffers in GPU upload heaps: those shaders only read \
-                 (VICTORY_GPU_UPLOAD, on unless =0), those shaders write, with a mirror \
-                 (VICTORY_GPU_UPLOAD_WRITES, on unless =0); system memory otherwise"
+                "host copies of title buffers: in video memory under its budget first \
+                 (VICTORY_VRAM_COPIES=2 every copy, =1 read-only ones; off by \
+                 default), then in GPU upload heaps (VICTORY_GPU_UPLOAD=1 for read-only \
+                 copies, VICTORY_GPU_UPLOAD_WRITES=1 for written ones; off by default), \
+                 then system memory"
             );
             (read_only, written)
         })

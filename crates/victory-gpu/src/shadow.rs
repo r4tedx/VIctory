@@ -1818,6 +1818,9 @@ mod tests {
             .env(CHILD, "1")
             .env("VICTORY_GPU_UPLOAD", "1")
             .env("VICTORY_GPU_UPLOAD_WRITES", if writes { "1" } else { "0" })
+            // These tests are of GPU upload heaps alone, not after P-0a's
+            // video memory (stated whatever its default).
+            .env("VICTORY_VRAM_COPIES", "0")
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
