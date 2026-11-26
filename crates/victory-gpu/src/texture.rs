@@ -760,6 +760,8 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualQuery.record(0);
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         let unreadable = info.Protect == 0

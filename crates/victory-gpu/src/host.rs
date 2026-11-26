@@ -2543,10 +2543,15 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let copied = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::ReadProcessMemory.record_timed(done, started);
+    copied != 0
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -3060,6 +3065,8 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        #[cfg(feature = "diagnostics")]
+        let syscalls = victory_core::memory_syscalls::take(frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -3067,7 +3074,12 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        let log_frame = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        #[cfg(feature = "diagnostics")]
+        if !log_frame {
+            tracing::info!("memory syscalls per frame ({frames:.0} frames): {syscalls}");
+        }
+        if log_frame {
             self.logged = std::time::Instant::now();
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
@@ -3081,6 +3093,8 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            #[cfg(feature = "diagnostics")]
+            tracing::info!("memory syscalls per frame ({frames:.0} frames): {syscalls}");
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

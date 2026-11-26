@@ -8,6 +8,8 @@
 pub mod config;
 pub mod logging;
 pub mod policy;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod memory_syscalls;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};

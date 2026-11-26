@@ -326,6 +326,7 @@ pub(crate) fn log(frames: f64) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        victory_core::memory_syscalls::Call::VirtualQuery.record(0);
         // SAFETY: a valid out pointer of the right size.
         unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
         let kind = info.Type;

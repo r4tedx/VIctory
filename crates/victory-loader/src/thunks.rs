@@ -135,6 +135,8 @@ impl ThunkBlock {
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualProtect.record(self.len);
         // SAFETY: `base..base+len` is the allocation made in `new`.
         let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
         if ok == 0 {

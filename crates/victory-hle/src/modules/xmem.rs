@@ -205,6 +205,8 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualQueryEx.record(0);
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
