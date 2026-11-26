@@ -510,6 +510,7 @@ pub(crate) fn test_compute_pipeline(host: victory_shader::emit::HostShader) -> T
         stage: "compute",
         hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
         container: Vec::new(),
+        threads: OnceLock::new(),
         translated: OnceLock::from(Some(Translated {
             host,
             used: Vec::new(),

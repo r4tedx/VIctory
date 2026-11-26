@@ -238,7 +238,7 @@ fn execute_indirect_preserves_two_384_lane_reference_cases() {
         unsafe { mapped.write_bytes(0, LANES * 4) };
         bind_output(host, &list, buffer, LANES);
         state.heaps_bound_by_caller();
-        assert!(state.execute_indirect(&list, (2, 16, 2), address + 16, Some(address + 4)));
+        assert!(state.execute_indirect(&list, (2, 16, 2), address + 16, Some(address + 4), 0));
     }
     // A writer later in the same list exercises restoration of UAV state.
     add_one(&list, &worker, shadow.gpu(address + 16));
@@ -297,7 +297,7 @@ fn execute_indirect_runs_both_counted_records() {
         let mut state = State::default();
         state.reset(pipeline);
         state.heaps_bound_by_caller();
-        assert!(state.execute_indirect(&list, (2, 16, 3), arguments.address, Some(count.address)));
+        assert!(state.execute_indirect(&list, (2, 16, 3), arguments.address, Some(count.address), 0));
         list.close();
         host.execute_checked(&list);
         release_pipeline(pipeline);
@@ -340,7 +340,7 @@ fn drops_a_dispatch_without_a_pipeline_before_the_clamp() {
     let list = host.new_list().unwrap();
     #[cfg(feature = "diagnostics")]
     drop(crate::pipeline::take_drops());
-    assert!(!State::default().execute_indirect(&list, (2, 12, 1), arguments.address, None));
+    assert!(!State::default().execute_indirect(&list, (2, 12, 1), arguments.address, None, 0));
     #[cfg(feature = "diagnostics")]
     assert!(
         crate::pipeline::take_drops()

@@ -4232,10 +4232,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.dispatch(&list, 1, 1, 1);
         assert_eq!(crate::ambient::filled() - filled, 2, "both views of the direct program's rules");
         state.set_pipeline(indirect);
-        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None), "the indirect dispatch does not run");
+        assert!(!state.execute_indirect(&list, (2, 12, 1), 0, None, 0), "the indirect dispatch does not run");
         assert_eq!(crate::ambient::filled() - filled, 3, "the view of the indirect program's rule");
         state.set_pipeline(direct);
-        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None));
+        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None, 0));
         state.set_pipeline(unnamed);
         state.dispatch(&list, 1, 1, 1);
         assert_eq!(crate::ambient::filled() - filled, 3, "nothing for an indirect draw or a program no rule names");
