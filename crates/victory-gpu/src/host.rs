@@ -3329,7 +3329,8 @@ impl Meter {
             );
             let table_slots = crate::draw::take_table_slots();
             let in_place = crate::draw::TABLES_IN_PLACE.take_text();
-            let [made, duplicate, unchanged, distinct, distinct_slots, ns] = crate::draw::take_fresh_census();
+            let [made, duplicate, unchanged, distinct, distinct_slots, ns, views_made, views_copied] =
+                crate::draw::take_fresh_census();
             if pool.total > 0 && pool.total < (1 << 18) {
                 let per = |n: u64| n as f64 / logged_frames.max(1) as f64;
                 tracing::info!(
@@ -3339,12 +3340,15 @@ impl Meter {
                      fresh tables made {made} ({:.0}/frame), {duplicate} of them the same as one another list \
                      made that frame, {unchanged} with the records of the last one made of that table; \
                      distinct tables used fresh {:.0}/frame ({:.0} slots/frame); fresh-table path {:.1} ms/frame \
-                     (slots taken, views made); tables used in place, by their first slot {in_place}",
+                     (slots taken, views made); fresh tables' views made {:.0}/frame, copied from the overflow \
+                     heap {:.0}/frame; tables used in place, by their first slot {in_place}",
                     per(table_slots),
                     per(made),
                     per(distinct),
                     per(distinct_slots),
                     per(ns) / 1e6,
+                    per(views_made),
+                    per(views_copied),
                 );
             }
             let [clear_slots, clears_shared, clears_dropped] = crate::draw::take_clear_slots();
@@ -4022,6 +4026,13 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+/// [`retire`] of several under one lock.
+pub(crate) fn retire_all(resources: Vec<ID3D12Resource>) {
+    if !resources.is_empty() {
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(resources);
+    }
 }
 
 /// After a submission has run, with none running: the retired resources go.
