@@ -438,7 +438,11 @@ pub(crate) mod tests {
     /// Runs this binary's test `name` again in a child process with
     /// `VICTORY_VRAM_COPIES=level` (read once per process): true in the
     /// child, where the test does its work; false in the parent once the
-    /// child passed, which it must have run.
+    /// child passed, which it must have run. The child runs with the GPU
+    /// upload heaps off (`VICTORY_GPU_UPLOAD=0`, `VICTORY_GPU_UPLOAD_WRITES=0`,
+    /// both on by default): these tests are of video memory copies alone,
+    /// with what they refuse in system memory. The order with both on is
+    /// `shadow::tests::copies_try_video_memory_then_upload_heaps_then_system_memory`.
     // The pattern is #2120's (0xkn0wh3r3).
     pub(crate) fn in_child(name: &str, level: &str) -> bool {
         const CHILD: &str = "VICTORY_TEST_VRAM_CHILD";
@@ -449,6 +453,8 @@ pub(crate) mod tests {
             .args([name, "--exact", "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
             .env("VICTORY_VRAM_COPIES", level)
+            .env("VICTORY_GPU_UPLOAD", "0")
+            .env("VICTORY_GPU_UPLOAD_WRITES", "0")
             .env_remove("VICTORY_VRAM_COPIES_MB")
             .output()
             .unwrap();
