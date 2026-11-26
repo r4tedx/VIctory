@@ -110,9 +110,73 @@ None of them has a title run yet.
 
 | Variant | Adds | Switch | Evidence and risk |
 |---------|------|--------|-------------------|
-| `play/main-tables-vram` | fork `gpu/tables-in-vram` 2a2a602c (F1): the host lookup tables shaders read on memory accesses (page tables, view strides, view marks, view addresses) in video memory | `VICTORY_TABLES_VRAM=1` (a GPU upload heap where the host has one, else as `=copy`) or `=copy` (default heap, with copies at submissions); unset: system memory as before | Head c49ef675 on play/main aeeaed59 (first forms 001945dc, on 75b3f75b, and 46d71b97, on 99d3e306; neither built). F1 only, a cherry-pick of 2a2a602c, ported to layer 4's view-address layout (8 bytes for every title and dynamic slot, as play/main's shaders read them). Not merged with its base, upstream main da82e444: that would bring 81 upstream commits and a new shader cache key. victory-shader is unchanged, so the cache hits. Build, tests and runs: built into `targets\play-main-tables-vram` (fresh seed, workspace fingerprints cleared, recompiled; clippy clean): `diag\victory-c49ef675.exe`, sha256 `8ca1fda0ea58bec602aa6db5e202c844074c443b14e6dcc7bde60b0267d4afdb`. The first port missed four layer 4 uses of the old (buffer, mapping) tuples; c49ef675 ports them, with test-only `Table::read` and `Table::mapped`. WARP tests: `tables::`, `memory::` and `descriptor::host::` (22 tests) pass in each mode, `VICTORY_TABLES_VRAM` unset, `=1` and `=copy`: 22 / 0 / 0 each, `tables::tests::shaders_read_what_the_cpu_wrote_in_every_mode` among them. WARP has no GPU upload heaps, so `=1` runs as `=copy` there; the upload-heap form is untested until a run on the RTX 5070. |
+| `play/main-tables-vram` | fork `gpu/tables-in-vram` 2a2a602c (F1): the host lookup tables shaders read on memory accesses (page tables, view strides, view marks, view addresses) in video memory | `VICTORY_TABLES_VRAM=1` (a GPU upload heap where the host has one, else as `=copy`) or `=copy` (default heap, with copies at submissions); unset: system memory as before | Head c49ef675 on play/main aeeaed59 (first forms 001945dc, on 75b3f75b, and 46d71b97, on 99d3e306; neither built). F1 only, a cherry-pick of 2a2a602c, ported to layer 4's view-address layout (8 bytes for every title and dynamic slot, as play/main's shaders read them). Not merged with its base, upstream main da82e444: that would bring 81 upstream commits and a new shader cache key. victory-shader is unchanged, so the cache hits. Build, tests and runs: built into `targets\play-main-tables-vram` (fresh seed, workspace fingerprints cleared, recompiled; clippy clean): `diag\victory-c49ef675.exe`, sha256 `8ca1fda0ea58bec602aa6db5e202c844074c443b14e6dcc7bde60b0267d4afdb`. The first port missed four layer 4 uses of the old (buffer, mapping) tuples; c49ef675 ports them, with test-only `Table::read` and `Table::mapped`. WARP tests: `tables::`, `memory::` and `descriptor::host::` (22 tests) pass in each mode, `VICTORY_TABLES_VRAM` unset, `=1` and `=copy`: 22 / 0 / 0 each, `tables::tests::shaders_read_what_the_cpu_wrote_in_every_mode` among them. Correction (play/main-next): WARP on this PC does report GPU upload heaps (`GPUUploadHeapSupported`: a play/main-next test placed 32 of 32 copies in them), and `tables::` makes the same check, so `=1` most likely ran in its upload-heap form there, not as `=copy`. Which mode those test runs took was not logged. The RTX 5070 form is still untested. |
 | `play/main-shaders` | two merges: fork `shader/wave64-lds-groups` fa2dcfdd (a compute group of several console waves sharing LDS runs as one host group of 32-lane wave pairs), then fork `shader/implicit-sample-optin` 780fc968 (compute samples with implicit derivatives in the console flow in halves, at a level) | groups: none, on hosts without 64-lane waves; implicit samples: `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1` | Heads 122182dd (after the groups merge) and f965f807 (after implicit-optin), on play/main 99d3e306; each merge reverts alone. Groups: offline 32-32 listing 25,725 -> 25,734 validated (+9 / -0), including all 7 remaining cascade-shadow programs. Implicit-optin: 32-32 +13 validated, 0 lost. victory-gpu `shader_cache::` and `pipeline::library` on WARP: 22 passed / 0 failed / 1 ignored (a measurement), `implicit_sample_changes_the_key_only_when_enabled` among them. Both change victory-shader, so the shader cache key changes (a new cache pass). Neither has run on hardware: WARP cannot run 32-lane waves, so whether LDS is seen across waves is unproven. With `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`, multi-wave LDS groups may take implicit samples too: the guard is one check. That combination is untested. `translate --cache --host-lanes` (a3fee8e2) is in. Build and tests: built into `targets\play-main-shaders` (fresh seed, workspace fingerprints cleared, every crate from victory-shader up recompiled; clippy clean for victory, victory-gpu and victory-shader with `host`): `diag\victory-f965f807.exe`, sha256 `2215a877adc6250e595ceaa24270b7a7e3ec6516f7b01dcda11ba2832c268692`. victory-shader `--features host --lib` on WARP: 325 passed / 2 failed / 3 ignored at 99d3e306, 331 / 2 / 3 at f965f807. The same 2 fail at both heads, both WARP-only: `gathers_at_a_level_match_the_hardware` (WARP's gather differs by 1) and `permutes_read_the_lane_named_and_zero_from_lanes_left_out` (no pipeline for a 32-lane wave on WARP). The 6 new tests pass: three groups split tests, `compute_samples_with_implicit_derivatives_are_at_a_level`, and two in emit::tests. `groups_sharing_lds_match_the_console_on_every_adapter` passes trivially on WARP (no hardware adapter is listed), so cross-wave LDS is still unproven. `translate --help` lists `--cache` and `--host-lanes`. `translate --cache --host-lanes 32-32` on an empty directory, with a scratch cache, exits 0 ("host waves 32-32 lanes ... 0 containers"). |
 | `play/main-copyback` | fork `play/layer4-copy-back-spans` e6f9c522: copy-backs write their spans with plain stores (`rep movsb`, watch::store) instead of a kernel copy each (#2242's per-span cost, about 73 us a page in game); plus a fix of ours for pages with `PAGE_GUARD` | none | Head a4ed2b0e on play/main aeeaed59; one commit. Its safety argument holds: a faulting `rep movsb` can be restarted, and the handler skips it only for a write inside the stored range at that instruction; the kernel copy writes the rest, as before. The one gap, a guard page, raised STATUS_GUARD_PAGE_VIOLATION, which e6f9c522 did not take (a crash where the kernel copy failed quietly). It now puts the guard bit back and lets the kernel copy go on (test `stores_leave_guard_pages_as_the_kernel_copy_does`). The branch's later 513a525c is not taken. Built into `targets\play-main-copyback` (fresh seed, fingerprints cleared; clippy clean): `diag\victory-a4ed2b0e.exe`, sha256 `f01388f7ac87adeef37dbfa592db17b8c4f3d61113062a80b1099f43eb3d166e`. victory-gpu only, so the cache hits. WARP tests: `shadow::` and `watch::` 31 passed / 0 failed / 2 ignored, both store tests among them (`stores_leave_unmapped_and_read_only_pages_alone`, `stores_leave_guard_pages_as_the_kernel_copy_does`); the whole lib 278 / 0 / 10 (play/main's 276 plus the two). |
+
+## play/main-next (the next play/main)
+
+`play/main-next` is play/main 6fb49264 with every variant above merged in,
+one merge commit each, plus the GPU upload heaps on by default. The GPU
+thread tests it, then play/main fast-forwards to it. Pushed to fork only.
+
+| # | Merge or commit | Ingredient @ head | Switch and default | Conflicts |
+|---|-----------------|-------------------|--------------------|-----------|
+| 1 | 873876e3 | `play/main-shaders` @ f965f807 (multi-wave LDS groups fa2dcfdd, implicit samples 780fc968) | `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1` to turn implicit samples on; unset = off (already opt-in on that branch) | none |
+| 2 | 925f98ff | `play/main-dynamic-pool` @ b65d2013 (4c003067: slots of lists that ran are taken back; b65d2013: aeeaed59's test through the lease) | none | draw.rs, test `clears_of_one_view_in_a_list_share_a_dynamic_slot`: aeeaed59's counter against b65d2013's lease form; took dynamic-pool's (the file is then identical to dynamic-pool's draw.rs) |
+| 3 | f12eb00b | `play/main-copyback` @ a4ed2b0e (plain-store copy-backs, PAGE_GUARD restore) | none | none |
+| 4 | 42506cfe | `play/main-tables-vram` @ c49ef675 | `VICTORY_TABLES_VRAM=1` / `=copy`; unset = system memory, as before (TV1: no measurable gain) | none |
+| 5 | 6ec0adea | `play/main-bounded-mem` @ 72853aed (clamp window tables in their own pool with give-back; scratch trimmed at reset to the busiest of the last 8 recordings) | none | none (indirect.rs's one `scratch_in` caller became `table`) |
+| 6 | e5e2e251 | ours: GPU upload heaps on by default | `VICTORY_GPU_UPLOAD` and `VICTORY_GPU_UPLOAD_WRITES` on unless `=0`. `VICTORY_GPU_UPLOAD=0` gives the old placement (every copy in system memory); `VICTORY_GPU_UPLOAD_WRITES=0` keeps only written copies there. No GPU upload heaps: system memory, as before. One log line at device creation (`read_only`, `written`, `gpu_upload_heaps`). | n/a |
+| 7 | a30a50f1 | ours: test fix for 6 | none | n/a |
+
+Why 6: in the GPU thread's in-game runs with both switches on, noted GPU
+time fell from 224-238 to 107-114 ms a frame for the same work. The
+ingredients' own runs: DP1 (dynamic-pool) lost no draws to dynamic slots;
+BM1 (bounded-mem) ran the full 10 minutes with frames 14% faster; TV1
+(tables-vram) showed no measurable gain, so its switch stays unset.
+
+Merges git made without conflicts that touch the same files (host.rs,
+descriptor/host.rs, shadow.rs, indirect.rs): all built and passed clippy
+(below). victory-shader changes (merge 1), so the shader cache needs a
+new pass.
+
+**Build:** `targets\play-main-next` (seeded from `targets\play-main`,
+workspace fingerprints cleared; all ten victory crates recompiled):
+`diagictory-e5e2e251.exe`, sha256
+`f2f5a756185d6338f0a26512dc8d3ce63ed0daf1f342596cf04c5627723f8c94`
+(differs from every ingredient's). a30a50f1 changes only a test.
+`victory translate --help` lists `--cache` and `--host-lanes`.
+
+**Clippy** at e5e2e251, `-D warnings`, victory and victory-gpu, all
+targets: clean without and with `--features diagnostics`.
+
+**Tests** at e5e2e251 (WARP, through heavy-run):
+- victory-gpu `--features diagnostics --lib --test-threads=1`: 288
+  passed, 1 failed, 10 ignored (benchmarks). The failure was
+  `draw::tests::copies_in_upload_heaps_take_the_slots_system_memory_copies_do`
+  (left 32, right 0): it took unset to mean system memory. WARP has GPU
+  upload heaps, so with the new default all 32 copies went there.
+  a30a50f1 fixes the test: the parent checks the default placement, and a
+  child with `VICTORY_GPU_UPLOAD=0` checks the old one. So the rest of
+  the suite already ran with both switches on. The new tests pass:
+  `switch::tests::switches_on_by_default_turn_off_only_at_zero`,
+  `host::tests::upload_placement_follows_the_switches_and_the_heaps`,
+  and the ingredients' own tests (`tables_of_two_lists_come_back_as_one_run`,
+  `stores_leave_guard_pages_as_the_kernel_copy_does`,
+  `stores_leave_unmapped_and_read_only_pages_alone`,
+  `shaders_read_what_the_cpu_wrote_in_every_mode`,
+  `list_upload_memory_stays_bounded_over_recordings`).
+- victory-shader `--features host --lib` (`--skip split_tests --skip
+  lane_read_loop_tests --skip on_every_adapter`): 288 passed, 2 failed,
+  3 ignored. The 2 are the known WARP-only failures
+  (`gathers_at_a_level_match_the_hardware`,
+  `permutes_read_the_lane_named_and_zero_from_lanes_left_out`).
+
+Not verified: the upload heaps on by default against everything else on
+the RTX 5070, until the GPU thread's runs; cross-wave LDS on hardware (as
+for play/main-shaders). The later heads on this branch (dynamic-pool-2,
+P-0a) are listed in their own merge commits.
 
 ## Merge notes
 
