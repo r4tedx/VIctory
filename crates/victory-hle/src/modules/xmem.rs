@@ -91,6 +91,8 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    #[cfg(feature = "diagnostics")]
+    let (asked_kind, asked_protect) = (kind, protect);
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -172,6 +174,33 @@ pub extern "system" fn XMemVirtualAlloc(
                 "XMemVirtualAlloc refused"
             );
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() && kind & MEM_RESERVE != 0 {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // A fresh reservation is homogeneous. Query its extent to include
+        // rounding, including when the title specified an unaligned base.
+        // SAFETY: the query fills the local descriptor only.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                at,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let len = if queried != 0 && info.BaseAddress == at {
+            info.RegionSize
+        } else {
+            size
+        };
+        victory_gpu::copyback_census::title_memory_reserved(
+            at as usize,
+            len,
+            asked_kind,
+            flags,
+            asked_protect,
+        );
     }
     if base.is_null() {
         tracing::debug!(
@@ -339,6 +368,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            #[cfg(feature = "diagnostics")]
+            victory_gpu::copyback_census::release_title_reservation(address as usize, || {
+                VirtualFree(address, 0, MEM_RELEASE) != 0
+            });
+            #[cfg(not(feature = "diagnostics"))]
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
