@@ -3190,12 +3190,23 @@ impl Meter {
                 crate::draw::FRESH_TABLES.take_text(),
             );
             let table_slots = crate::draw::take_table_slots();
+            let in_place = crate::draw::TABLES_IN_PLACE.take_text();
+            let [made, duplicate, unchanged, distinct, distinct_slots, ns] = crate::draw::take_fresh_census();
             if pool.total > 0 && pool.total < (1 << 18) {
+                let per = |n: u64| n as f64 / logged_frames.max(1) as f64;
                 tracing::info!(
                     "view heap census (64 Ki bands from slot 0, since the last line): title writes {writes}; \
                      shader reads (per list) {reads}; fresh tables' slots, by their title table {fresh}; \
-                     {table_slots} dynamic slots taken for fresh tables in {logged_frames} frames ({:.0}/frame)",
-                    table_slots as f64 / logged_frames.max(1) as f64,
+                     {table_slots} dynamic slots taken for fresh tables in {logged_frames} frames ({:.0}/frame); \
+                     fresh tables made {made} ({:.0}/frame), {duplicate} of them the same as one another list \
+                     made that frame, {unchanged} with the records of the last one made of that table; \
+                     distinct tables used fresh {:.0}/frame ({:.0} slots/frame); fresh-table path {:.1} ms/frame \
+                     (slots taken, views made); tables used in place, by their first slot {in_place}",
+                    per(table_slots),
+                    per(made),
+                    per(distinct),
+                    per(distinct_slots),
+                    per(ns) / 1e6,
                 );
             }
             let [clear_slots, clears_shared, clears_dropped] = crate::draw::take_clear_slots();
