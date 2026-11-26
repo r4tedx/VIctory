@@ -191,7 +191,7 @@ Not verified: the upload heaps on by default against everything else on
 the RTX 5070, until the GPU thread's runs; cross-wave LDS on hardware (as
 for play/main-shaders).
 
-### play/main-next-2 (head 8808b245; `play/main-next` points here too)
+### play/main-next-2 (head 8808b245, docs deeb5939)
 
 | # | Merge or commit | Ingredient @ head | Switch and default | Conflicts |
 |---|-----------------|-------------------|--------------------|-----------|
@@ -245,6 +245,75 @@ The 10 ignored are benchmarks and measurements. Among the passing tests:
 `draw::tests::lists_the_title_runs_again_keep_their_slots` (dynamic-pool-2)
 and P-0a's own tests. victory-shader was not run again: it is unchanged
 since e5e2e251 (288 / 2 known WARP-only / 3 above).
+
+### play/main-next-3 (head 9fc427ad; `play/main-next` points here too)
+
+On play/main-next-2 deeb5939, in order, each its own commit:
+
+| # | Commit | What | Switch and default | Conflicts |
+|---|--------|------|--------------------|-----------|
+| 14 | 863aba04 | defaults: GPU upload heaps off again; P-0a stays opt-in; tests state their switches | `VICTORY_GPU_UPLOAD`, `VICTORY_GPU_UPLOAD_WRITES`: off unless `=1`. `VICTORY_VRAM_COPIES`: off unless `=1` (read-only copies) or `=2` (every copy) | n/a |
+| 15 | 29eb6bcb | merge `play/main-dynamic-pool-3` 093c4918: the view heap census counts what a shared cache of fresh tables would save, and the fresh-table path's time (diagnostics only) | none | none |
+| 16 | 82949b73 | merge `shader/wave64-lds-groups-2` f7a85cfc: groups of console waves that part run as one control flow; +7 validated offline at 32-32, and the whole BVH builder validates (53 of 53) | none. **victory-shader changes: a new shader cache pass** | none |
+| 17 | 1f5a2bb9 | tests that fail if the BVH builder's 32-lane guard or #2118's gate goes (`pipeline::builder::decide`, `WIDE_FOR_TESTS`); the rule above | none | n/a |
+| 18 | 8cacd789 | merge `play/main-bounded-loose` 238592f0: unused loose title-memory windows retired; copies hidden on every page get no table entry | none (A/B by exe, below) | host.rs, Meter: P-0a's `vram::log` and the loose-window line both kept. memory.rs `bind()`: P-0a's pull of video memory copies (withheld or not) kept over 238592f0's `Option` copies, with `filter_map` |
+| 19 | 9fc427ad | port of fork `mem/loose-windows` 10916c39: covering lookup bounded to the span a window can reach (8.63 -> 0.39 ms in its WARP bench); retiring map-only windows no longer rewrites the page tables; per-frame counts of windows made, recreated, retired and merged (diagnostics); an ignored WARP benchmark | none | shadow.rs as is; host.rs: its log line becomes `shadow::log_loose(window)`. Its memory.rs part is not taken: it folds the used-copy scan into upstream's `write_table`, which this tree does not have (238592f0's scan does the same here) |
+
+- **Why 14:** the GPU thread's runs (10 min each, no device removals):
+  N2P (`VICTORY_VRAM_COPIES=2`, upload heaps off) against N2U (upload
+  heaps on): median frame 50 to 96 ms shorter, p95 930 against 1,399
+  ms; against BM1: median 7 to 36 ms shorter, GPU 123 against 227 ms.
+  P-0a was to become the default, but stays opt-in: with
+  `VICTORY_VRAM_COPIES=2` (and `=1`) five WARP tests read zeros,
+  `bindless::tests::heap_views_are_current`,
+  `heap_views_follow_writes_through_another_mapping`,
+  `raw_reads_of_structured_views_are_right`,
+  `structured_views_made_raw_keep_the_titles_bytes` and
+  `draw::tests::root_views_reach_their_copy_and_read_zeros_past_it`.
+  They read the GPU's results from a copy's system memory side
+  (`Shadow::read_host`), without write marks. Being traced (58b27ef3's
+  delegate; interim reading: a test harness issue). Until it is
+  understood, P-0a is opt-in; the GPU thread sets `VICTORY_VRAM_COPIES=2`
+  for its arm.
+- **Order with more than one on:** P-0a's video memory under its budget
+  first, then GPU upload heaps if asked, then system memory
+  (`shadow::tries`, 250703c2). One start-up line logs `vram_copies`,
+  `upload_read_only`, `upload_written` and `gpu_upload_heaps`.
+
+**Builds** (`targets\play-main-next-2`, workspace fingerprints cleared;
+all ten victory crates recompiled for 1f5a2bb9, then victory-gpu,
+victory-hle and victory for 9fc427ad). The loose-window A/B is these two
+exes, which differ only by commits 18 and 19:
+
+| Head | Exe | sha256 |
+|------|-----|--------|
+| 1f5a2bb9 (without loose windows) | `diag\victory-1f5a2bb9.exe` | `a8dd1b4b4be227c3b3fb8e4499cd7f57c62858dd504c6ad4074307ea6a1998e7` |
+| 9fc427ad (with them) | `diag\victory-9fc427ad.exe` | `78769e9afe0480a75f2c2a7dc3e47792a0b948c4a2341af8e6984957b0930ea3` |
+
+Clippy at 9fc427ad (`-D warnings`, victory and victory-gpu, all
+targets): clean without and with `--features diagnostics`. `cargo xtask
+policy` at 9fc427ad: 207 files ok.
+
+**Tests** (WARP):
+
+| Head | Suite | Switches | Passed | Failed | Ignored |
+|------|-------|----------|--------|--------|---------|
+| 9fc427ad | victory-gpu lib | defaults | 306 | 0 | 11 |
+| 9fc427ad | victory-gpu lib | `VICTORY_VRAM_COPIES=2` | 301 | 5 (the five above) | 11 |
+| 1f5a2bb9 | victory-gpu lib | defaults | 304 | 0 | 10 |
+| 9fc427ad | victory-shader lib (`--features host`, skips as above) | | 297 | 2 (known WARP-only: `gathers_at_a_level_match_the_hardware`, `permutes_read_the_lane_named_and_zero_from_lanes_left_out`) | 3 |
+
+9fc427ad's two more tests and one more ignored (a benchmark) are the
+loose-window commits'. The guard tests pass at both heads
+(`the_builder_stays_held_back_on_hosts_without_64_lane_waves`,
+`runs_consults_the_32_lane_guard`), as do
+`vram_copies_are_opt_in`, `upload_placement_follows_the_switches_and_the_heaps`,
+`copies_in_upload_heaps_take_the_slots_system_memory_copies_do` and
+`copies_try_video_memory_then_upload_heaps_then_system_memory`.
+
+Not verified: anything on the RTX 5070; that the builder log reads
+"held back: the host has no 64-lane waves" with made=53 in a title run
+(the GPU thread's next run checks it); the P-0a zeros (above).
 
 ## Merge notes
 
