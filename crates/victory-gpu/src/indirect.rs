@@ -31,9 +31,11 @@ use crate::host::{HostList, host, transition};
 // The title's shadow buffers stay UAVs, including when arguments and count
 // are in the same buffer. Only the packed destination is written here.
 const DISPATCH: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=7, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+// threads: records are thread counts in groups of this size (x, y, z in 11,
+// 11 and 10 bits; the console's USE_THREAD_DIMENSIONS); 0: group counts.
 cbuffer Dispatch : register(b0) {
-    uint stride; uint records; uint waves; uint has_count; uint first; uint phase;
+    uint stride; uint records; uint waves; uint has_count; uint first; uint phase; uint threads;
 };
 RWByteAddressBuffer source : register(u0);
 RWByteAddressBuffer count : register(u1);
@@ -65,7 +67,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (record == 0) args.Store(records * 12, active);
     uint3 g = 0;
     if (record < active) {
-        g = min(source.Load3(record * stride), uint3(65535, 65535, 65535));
+        g = source.Load3(record * stride);
+        if (threads != 0) {
+            // Whole groups for thread counts.
+            uint3 size = uint3(threads & 0x7ff, threads >> 11 & 0x7ff, threads >> 22);
+            g = g / size + (uint3)(g % size != 0);
+        }
+        g = min(g, uint3(65535, 65535, 65535));
         g.x = g.x <= 65535u / waves ? g.x * waves : 0;
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = 0;
@@ -302,16 +310,23 @@ pub(crate) fn bound(
 /// Bounds and scales dispatches into a list-owned buffer of packed records,
 /// followed by one word containing the effective count.
 /// The source and count remain usable by later GPU writers.
+/// Records are thread counts in groups of the size `threads` packs
+/// ([`crate::threads::packed`]; 0: group counts): the packed records are
+/// whole groups. With thread counts a single-wave dispatch is rewritten
+/// too (the in-place clamp, [`bound`], would divide the title's records
+/// again at every execution).
 pub(crate) fn dispatch(
     list: &HostList,
     source: u64,
     count: Option<u64>,
     (stride, records, waves): (u32, u32, u32),
+    threads: u32,
 ) -> Option<ID3D12Resource> {
     let groups = records.div_ceil(64);
     if groups == 0
         || groups > 65535
-        || waves < 2
+        || waves == 0
+        || (waves < 2 && threads == 0)
         || !source.is_multiple_of(4)
         || count.is_some_and(|at| !at.is_multiple_of(4))
         || stride < 12
@@ -330,7 +345,7 @@ pub(crate) fn dispatch(
         .as_ref()?;
     let (_, budget) = list.budget()?;
     let output = list.dispatch_args(u64::from(records) * 12 + 4)?;
-    let mut constants = [stride, records, waves, u32::from(count.is_some()), 0, 0];
+    let mut constants = [stride, records, waves, u32::from(count.is_some()), 0, 0, threads];
     // At most 2^21 groups carried in and 2^20 per record, even if every
     // refusal is still awaiting its refund. Each batch stays below 2^32.
     const BATCH_GROUPS: u32 = 63;
@@ -345,8 +360,8 @@ pub(crate) fn dispatch(
         l.SetComputeRootUnorderedAccessView(2, count.unwrap_or(source));
         l.SetComputeRootUnorderedAccessView(3, output.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, budget);
-        let launch = |constants: &[u32; 6], groups| {
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        let launch = |constants: &[u32; 7], groups| {
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
             l.Dispatch(groups, 1, 1);
             l.ResourceBarrier(&[uav_barrier()]);
         };
