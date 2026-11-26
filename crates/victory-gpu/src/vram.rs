@@ -10,14 +10,18 @@
 //! goes there and then into video memory, the CPU reads only it, and what
 //! shaders wrote comes back into it by a GPU copy before the CPU reads it
 //! (`crate::shadow::pull`, `crate::shadow::pull_current`). A CPU read of the BAR runs at ~50 MB/s
-//! (#2120's measurement), so the mapping is a [`WriteOnly`], which cannot
-//! be read.
+//! (#2120's measurement), so the mapping is a [`WriteOnly`], read only
+//! when such a GPU copy failed ([`WriteOnly::read_back`]): then no copy is
+//! admitted any more.
 //!
 //! Admission: copies in video memory hold at most a share of the budget
 //! the system gives this process (DXGI): a quarter of it, and never more
 //! than what the rest of the process leaves under 85 % of it, so the cap
 //! shrinks as textures, render targets and depth buffers take the card.
 //! Once use passes 85 %, no copy is admitted until it is back under 75 %.
+//! The margin is approximate: a reading is kept up to 250 ms, and what the
+//! title's textures and targets take meanwhile shows only at the next one;
+//! a copy that would take use past 75 % on the kept reading asks again.
 //! A copy refused stays in system memory, as without the switch. Without
 //! that budget, copies took 19 GB of a 10.5 GB budget on an RTX 5070 and
 //! the device was removed (#693).
@@ -30,7 +34,7 @@
 //! read them across the bus, as they read a copy in system memory.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -70,8 +74,9 @@ pub(crate) fn wanted(read_only: bool) -> Class {
     }
 }
 
-/// A CPU mapping of video memory, which the CPU only writes. It has no way
-/// to read what it maps.
+/// A CPU mapping of video memory, which the CPU only writes, but for one
+/// case: when the GPU copy that brings shaders' writes back failed
+/// ([`WriteOnly::read_back`]).
 pub(crate) struct WriteOnly {
     at: *mut u8,
     len: usize,
@@ -89,6 +94,37 @@ impl WriteOnly {
         let n = bytes.len().min(self.len.saturating_sub(at));
         // SAFETY: inside the mapping (cut above); nothing reads through it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.add(at), n) };
+    }
+
+    /// Reads `out.len()` bytes at offset `at` (cut to the mapping) across
+    /// the bus (~50 MB/s): only where the GPU copy that brings shaders'
+    /// writes back did not run ([`stop`]), so that what they wrote is not
+    /// lost. Returns the bytes read.
+    pub(crate) fn read_back(&self, at: usize, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.len.saturating_sub(at));
+        // SAFETY: inside the mapping (cut above); the GPU is done writing
+        // it (the submission's fence was seen).
+        unsafe { std::ptr::copy_nonoverlapping(self.at.add(at), out.as_mut_ptr(), n) };
+        READ_BACK.fetch_add(n as u64, Relaxed);
+        n
+    }
+}
+
+/// Bytes read through the mappings after a failed GPU copy
+/// ([`WriteOnly::read_back`]).
+pub(crate) static READ_BACK: AtomicU64 = AtomicU64::new(0);
+
+/// No copy is admitted any more ([`stop`]).
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// A GPU copy that brings shaders' writes back failed: no copy goes to
+/// video memory from now on (copies already there stay, their writes read
+/// back through their mappings).
+pub(crate) fn stop() {
+    if !STOPPED.swap(true, Relaxed) {
+        tracing::error!(
+            "a GPU copy of shaders' writes out of video memory failed: host copies made from now on stay in system memory"
+        );
     }
 }
 
@@ -204,8 +240,9 @@ static LAST: Mutex<Last> = Mutex::new(Last {
 /// How old a reading may be.
 const MAX_AGE: Duration = Duration::from_millis(250);
 
-/// The budget and use now, with what copies took since DXGI was asked.
-fn reading(last: &mut Last) -> Option<Reading> {
+/// The budget and use now, with what copies took since DXGI was asked
+/// (asked again with `again`, else when the reading is [`MAX_AGE`] old).
+fn reading(last: &mut Last, again: bool) -> Option<Reading> {
     #[cfg(test)]
     if let Some((budget, others)) = *tests::FAKE.lock().unwrap_or_else(|e| e.into_inner()) {
         return Some(Reading {
@@ -213,9 +250,14 @@ fn reading(last: &mut Last) -> Option<Reading> {
             usage: others + own(),
         });
     }
-    if last.at.is_none_or(|at| at.elapsed() >= MAX_AGE) {
-        last.reading =
-            crate::host::video_memory().map(|(budget, usage)| Reading { budget, usage });
+    if again || last.at.is_none_or(|at| at.elapsed() >= MAX_AGE) {
+        #[cfg(test)]
+        let asked = *tests::QUERY.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(not(test))]
+        let asked = None;
+        last.reading = asked.or_else(|| {
+            crate::host::video_memory().map(|(budget, usage)| Reading { budget, usage })
+        });
         last.at = Some(Instant::now());
         last.charged = 0;
     }
@@ -304,11 +346,21 @@ unsafe extern "system" fn given_back(data: *mut std::ffi::c_void) {
 /// host has no GPU upload heaps or the budget does not admit it.
 pub(crate) fn make(host: &Host, size: u64, class: Class) -> Option<(ID3D12Resource, WriteOnly)> {
     debug_assert!(class != Class::System && size.is_multiple_of(1 << 16));
+    // With no copier, what shaders write could not come back by a GPU copy.
+    if STOPPED.load(Relaxed) || host.copier().is_none() {
+        return None;
+    }
     let heap = heap(host)?;
     // Admission and charge under one lock: copies made on two threads at
     // once must not both pass on the same room.
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let now = reading(&mut last);
+    let asked = last.at;
+    let mut now = reading(&mut last, false);
+    // Near the line, a kept reading misses what textures and targets took
+    // since: asked again (a copy is made once per title buffer).
+    if last.at == asked && now.is_some_and(|r| r.usage + size > of(r.budget, RESUME)) {
+        now = reading(&mut last, true);
+    }
     if !admits(now, own(), size, cap(), &mut last.full) {
         REFUSED[0].fetch_add(1, Relaxed);
         REFUSED[1].fetch_add(size, Relaxed);
@@ -391,7 +443,7 @@ pub(crate) fn log(frames: f64) {
     let by = [0, 1, 2].map(|i| PULLED_BY[i].swap(0, Relaxed));
     let (reading, full) = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        (reading(&mut last), last.full)
+        (reading(&mut last, false), last.full)
     };
     tracing::info!(
         "host copies in video memory: {} of read-only buffers ({:.0} MB), {} of written ones ({:.0} MB), {:.0} MB in all \
@@ -430,6 +482,10 @@ pub(crate) mod tests {
     /// place of DXGI's.
     pub(crate) static FAKE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 
+    /// What DXGI's query answers in a test, in place of DXGI (the reading
+    /// is kept as DXGI's is).
+    pub(crate) static QUERY: Mutex<Option<Reading>> = Mutex::new(None);
+
     /// Whether copies go to a stand-in for GPU upload heaps here.
     pub(crate) fn stand_in(host: &Host) -> bool {
         !gpu_upload_heaps(host) || tests_stand_in()
@@ -441,6 +497,12 @@ pub(crate) mod tests {
     /// child passed, which it must have run.
     // The pattern is #2120's (0xkn0wh3r3).
     pub(crate) fn in_child(name: &str, level: &str) -> bool {
+        in_child_with(name, level, &[])
+    }
+
+    /// [`in_child`] with `env` set in the child too (main's
+    /// `VICTORY_COPIES_IN_VIDEO_MEMORY` is unset there unless it is named).
+    pub(crate) fn in_child_with(name: &str, level: &str, env: &[(&str, &str)]) -> bool {
         const CHILD: &str = "VICTORY_TEST_VRAM_CHILD";
         if std::env::var_os(CHILD).is_some() {
             return true;
@@ -450,6 +512,8 @@ pub(crate) mod tests {
             .env(CHILD, "1")
             .env("VICTORY_VRAM_COPIES", level)
             .env_remove("VICTORY_VRAM_COPIES_MB")
+            .env_remove("VICTORY_COPIES_IN_VIDEO_MEMORY")
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -461,6 +525,44 @@ pub(crate) mod tests {
         assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
         eprintln!("{text}");
         false
+    }
+
+    /// A kept reading near the line is taken again (review of #2993): far
+    /// from it, a copy is admitted on the reading of up to 250 ms ago, which
+    /// misses what others took since (the margin is approximate there);
+    /// past 75 % of the budget on the kept reading, DXGI is asked again,
+    /// and what others took meanwhile refuses the copy.
+    #[test]
+    fn a_kept_reading_near_the_line_is_taken_again() {
+        if !in_child(
+            "vram::tests::a_kept_reading_near_the_line_is_taken_again",
+            "2",
+        ) {
+            return;
+        }
+        let host = crate::host::host().expect("a host GPU");
+        const MB: u64 = 1 << 20;
+        let query = |usage: u64| {
+            *QUERY.lock().unwrap() = Some(Reading {
+                budget: 1000 * MB,
+                usage: usage * MB,
+            });
+        };
+        query(700);
+        let a = make(host, MB, Class::VramRead).expect("70 %: admitted");
+        query(900);
+        let b = make(host, MB, Class::VramRead).expect("on the kept reading (70 %): admitted");
+        std::thread::sleep(MAX_AGE);
+        query(760);
+        let c = make(host, MB, Class::VramRead).expect("a new reading, 76 %: admitted");
+        query(900);
+        let refused = REFUSED[0].load(Relaxed);
+        assert!(
+            make(host, MB, Class::VramRead).is_none(),
+            "past 75 % on the kept reading: asked again, 90 %"
+        );
+        assert_eq!(REFUSED[0].load(Relaxed), refused + 1);
+        drop((a, b, c));
     }
 
     /// The admission rule: within the cap and under 85 % of the budget,

@@ -3373,6 +3373,7 @@ void main(uint lane : SV_GroupIndex) {
                 .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
                 .env("VICTORY_GPU_UPLOAD", "1")
+                .env_remove("VICTORY_VRAM_COPIES")
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
