@@ -3139,18 +3139,15 @@ impl State {
         // Counted in threads: whole groups of them, and the program is told
         // how many of the last one run, where it asks (its `bind` set that to
         // all of them).
-        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-            .then(|| p.stages.first().and_then(|s| s.translated().threads))
-            .flatten();
-        let threads = [x, y, z];
-        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
-        if size.is_some() {
+        let ([x, y, z], told) =
+            direct_launch(flags, || p.stages.first().and_then(|s| s.translated().threads), [x, y, z]);
+        if let Some(told) = told {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
             }
             if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
                 // SAFETY: an open list; the root signature has the word.
-                unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+                unsafe { list.list.SetComputeRoot32BitConstant(param, told, word) };
             }
         }
         // SAFETY: an open list with everything set.
@@ -4409,6 +4406,18 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+/// A direct dispatch of `counts` with the console's dispatch `flags`, to a
+/// program of `size` threads a group (asked only if the counts are threads;
+/// `None`: not known): the groups the host launches, and, when the counts
+/// are threads, the count in X the program is told
+/// (`USER_DISPATCH_THREADS_X`, by which its lanes past the count leave).
+fn direct_launch(flags: u32, size: impl FnOnce() -> Option<[u32; 3]>, counts: [u32; 3]) -> ([u32; 3], Option<u32>) {
+    match (flags & THREAD_DIMENSIONS != 0 && thread_dimensions()).then(size).flatten() {
+        Some(size) => (dispatch_groups(counts, size), Some(counts[0])),
+        None => (counts, None),
+    }
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -4428,6 +4437,99 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+
+    /// `DispatchX(100, 1, 1)` with the console flag 0x20 (counts are
+    /// threads) to a program of 64-thread groups, on the host (WARP for
+    /// these tests), through the direct path's [`direct_launch`]: 2 groups
+    /// launch, the program is told 100 threads, and a program whose lanes
+    /// past the told count leave (as the translator's counted programs do,
+    /// `lower_counted`) stores exactly 100 times. Without the flag the
+    /// counts are groups: 100 groups, 6,400 stores, and nothing told.
+    #[test]
+    fn dispatch_x_of_100_threads_with_flag_0x20_stores_100_times() {
+        assert_eq!(direct_launch(0x20, || Some([64, 1, 1]), [100, 1, 1]), ([2, 1, 1], Some(100)));
+        assert_eq!(direct_launch(0, || Some([64, 1, 1]), [100, 1, 1]), ([100, 1, 1], None));
+        assert_eq!(direct_launch(0x20, || None, [100, 1, 1]), ([100, 1, 1], None), "no group size known");
+        let Some(flagged) = stores_of(0x20, [100, 1, 1]) else {
+            return; // no host GPU here
+        };
+        assert_eq!(flagged, [2, 100], "DispatchX(100,1,1,0x20): groups, stores");
+        assert_eq!(stores_of(0, [100, 1, 1]).unwrap(), [100, 6400], "the same counts as groups");
+    }
+
+    /// A direct dispatch of `counts` with the console `flags` to a program
+    /// of 64-thread groups that leaves its lanes past the count it is told
+    /// (0: all run): the groups that ran and the lanes that stored.
+    fn stores_of(flags: u32, counts: [u32; 3]) -> Option<[u32; 2]> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const STORES: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+RWByteAddressBuffer marks : register(u0);
+cbuffer Told : register(b0) { uint told; };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint x = group.x * 64 + lane;
+    if (told != 0 && x >= told) {
+        return;
+    }
+    uint ignored;
+    if (lane == 0) {
+        marks.InterlockedAdd(0, 1, ignored);
+    }
+    marks.InterlockedAdd(4, 1, ignored);
+}
+"#;
+        let host = crate::host::host()?;
+        let ([x, y, z], told) = direct_launch(flags, || Some([64, 1, 1]), counts);
+        let (marks, data) = host.shared_buffer(256)?;
+        let list = host.new_list().ok()?;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call; our mapped buffer
+        // is written before the list runs and read after it has; an open
+        // list with everything set.
+        unsafe {
+            D3DCompile(
+                STORES.as_ptr().cast(),
+                STORES.len(),
+                s!("stores"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .expect("the fixture compiles");
+            let code = code.expect("compiled code");
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).expect("root signature");
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("compute pipeline");
+            data.cast::<[u32; 2]>().write_volatile([0, 0]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+            list.list.SetComputeRoot32BitConstant(1, told.unwrap_or(0), 0);
+            list.list.Dispatch(x, y, z);
+            list.close();
+            host.execute(&[&list]);
+            Some(data.cast::<[u32; 2]>().read_volatile())
+        }
     }
 }
 
