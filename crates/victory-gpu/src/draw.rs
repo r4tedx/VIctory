@@ -309,6 +309,22 @@ const SLOTS_TAKEN_BACK: usize = 3;
 static TABLE_SLOTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FRESH_TABLES: crate::descriptor::host::Bands = crate::descriptor::host::Bands::new();
 
+/// Fresh-table slots whose views were made one by one, not copied from the
+/// overflow heap, by why: no overflow heap (`VICTORY_OVERFLOW_VIEWS=0`, or
+/// an uncapped heap), the table starts below the host's title slots (it
+/// reaches past them), or past the overflow heap's end; and the
+/// nanoseconds spent making them.
+static OLD_PATH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const OLD_NO_OVERFLOW: usize = 0;
+const OLD_BELOW_CAP: usize = 1;
+const OLD_PAST_END: usize = 2;
+const OLD_NS: usize = 3;
+
+/// [`OLD_PATH`] since the last call.
+pub(crate) fn take_old_path() -> [u64; 4] {
+    OLD_PATH.each_ref().map(|a| a.swap(0, Ordering::Relaxed))
+}
+
 /// Title tables used in place (below the host's title slots), by the
 /// slot they start at: once per table and draw.
 pub(crate) static TABLES_IN_PLACE: crate::descriptor::host::Bands = crate::descriptor::host::Bands::new();
@@ -1932,6 +1948,17 @@ impl State {
             let made_views = copied.as_ref().map_or(n, |(made, _)| *made);
             FRESH_CENSUS[FRESH_VIEWS_MADE].fetch_add(u64::from(made_views), Ordering::Relaxed);
             FRESH_CENSUS[FRESH_VIEWS_COPIED].fetch_add(u64::from(n - made_views), Ordering::Relaxed);
+            if copied.is_none() {
+                // Why the views are made one by one here.
+                let why = if host.overflow_len() == 0 {
+                    OLD_NO_OVERFLOW
+                } else if heap.index(table).is_some_and(|first| first < host.count()) {
+                    OLD_BELOW_CAP
+                } else {
+                    OLD_PAST_END
+                };
+                OLD_PATH[why].fetch_add(u64::from(n), Ordering::Relaxed);
+            }
             let mut copied = copied.map(|(_, views)| views.into_iter());
             for k in 0..n {
                 let index = first + k;
@@ -1944,7 +1971,9 @@ impl State {
                 match view {
                     Some(view) => {
                         if copied.is_none() {
+                            let made = std::time::Instant::now();
                             host.make_at(index, &view);
+                            OLD_PATH[OLD_NS].fetch_add(made.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                         if let Some(u) = used {
                             readable(list, u, &view, true);
