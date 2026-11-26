@@ -669,6 +669,9 @@ fn lane_uniform(
                             && v.sdwa.is_none()
                             && !name.starts_with("v_mbcnt")
                             && !name.starts_with("v_cmpx")
+                            && !name.starts_with("v_movrel")
+                            && !name.starts_with("v_swaprel")
+                            && !name.starts_with("v_div_fmas")
                             && !name.contains("lane") =>
                     {
                         v.src.as_slice()
@@ -688,9 +691,18 @@ fn lane_uniform(
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
-                let alike = ops.iter().all(|op| match *op {
+                // Implicit VGPR inputs include accumulators and the other side of a swap.
+                let implicit_alike = inst
+                    .reads
+                    .iter()
+                    .all(|(reg, value)| !matches!(reg, Reg::V(_)) || known(&next, value));
+                let mask_alike = name != "v_cndmask_b32"
+                    || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
+                        if inst.read(Reg::S(*code))
+                            .and_then(|v| st.masks.get(&v))
+                            .is_some_and(|&b| alike_bool(&same, b)));
+                let operands_alike = ops.iter().all(|op| match *op {
                     Operand::Vector { reg, dwords } => {
-                        // Only the explicit operand, not a preserved destination in `reads`.
                         (0..dwords).all(|i| {
                             reg.checked_add(i)
                                 .and_then(|r| inst.read(Reg::V(r)))
@@ -708,7 +720,7 @@ fn lane_uniform(
                     Operand::Const(251..=254) | Operand::Attr { .. } => false,
                     _ => true,
                 });
-                if alike {
+                if implicit_alike && mask_alike && operands_alike {
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                 }
             }
@@ -12947,6 +12959,25 @@ mod tests {
             let expected = (0..64u32).all(|lane| lane.wrapping_shr(shift) == 0);
             assert_eq!(uniform.contains(&shifted), expected, "inline shift {shift}");
         }
+    }
+
+    #[test]
+    fn a_swap_also_depends_on_its_old_destination() {
+        use crate::ir::Reg;
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E00_CB01, // v_swap_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, true, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let swap = &p.blocks[0].insts[1];
+        assert_eq!(swap.name(), "v_swap_b32");
+        let old_v0 = swap.read(Reg::V(0)).unwrap();
+        let new_v1 = swap.write(Reg::V(1)).unwrap();
+        let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0), true);
+        assert!(!uniform.contains(&new_v1));
     }
 
     #[test]
