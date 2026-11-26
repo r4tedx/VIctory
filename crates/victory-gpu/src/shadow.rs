@@ -17,7 +17,8 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -90,6 +91,16 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    last_use: AtomicU64,
+    /// Remaps affecting a copy still held by a list, view or page table.
+    remaps: OnceLock<Mutex<Remaps>>,
+}
+
+#[derive(Default)]
+struct Remaps {
+    detached: Option<(usize, usize)>,
+    // Partial remaps preserve unaffected pages of a pinned window.
+    recent: (u64, Vec<(usize, usize)>),
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -139,6 +150,40 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    fn touch(&self) {
+        self.last_use.fetch_max(SUBMISSION.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    pub(crate) fn was_remapped(&self) -> bool {
+        self.remaps.get().is_some_and(|remaps| {
+            remaps.lock().unwrap_or_else(|e| e.into_inner()).detached.is_some()
+        })
+    }
+
+    fn invalidate(&self, at: usize, end: usize, detached: bool) {
+        let mut remaps = self.remaps.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner());
+        if detached {
+            remaps.detached = Some((at, end));
+            return;
+        }
+        let now = SUBMISSION.load(Ordering::Relaxed);
+        if remaps.recent.0 != now {
+            remaps.recent.0 = now;
+            remaps.recent.1.clear();
+        }
+        remaps.recent.1.push((at, end));
+    }
+
+    fn remapped(&self, at: usize, len: usize) -> bool {
+        let Some(remaps) = self.remaps.get() else {
+            return false;
+        };
+        let remaps = remaps.lock().unwrap_or_else(|e| e.into_inner());
+        let overlaps = |&(start, end): &(usize, usize)| at < end && start < at + len;
+        remaps.detached.as_ref().is_some_and(overlaps)
+            || (remaps.recent.0 == SUBMISSION.load(Ordering::Relaxed) && remaps.recent.1.iter().any(overlaps))
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -219,6 +264,9 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        if self.remapped(from, n) {
+            return 0;
+        }
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
         let mut title = vec![0u8; n];
@@ -264,6 +312,8 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            last_use: AtomicU64::new(SUBMISSION.load(Ordering::Relaxed)),
+            remaps: OnceLock::new(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -440,7 +490,10 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                if host != old
+                    && !self.remapped(start + at, n)
+                    && crate::host::read_into((start + at) as *const u8, title)
+                {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     if merge_writeback(title, host, old) {
@@ -506,6 +559,9 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        if self.remapped(from, n) {
+            return 0;
+        }
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
         let mut title = vec![0u8; n];
@@ -1050,33 +1106,112 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// Copies of title memory outside buffers, in aligned windows.
 const WINDOW: u64 = 4 << 20;
-
-/// Copies of title memory outside buffers, by (start, length).
+const LOOSE_IDLE_SUBMISSIONS: u64 = 8;
+static SUBMISSION: AtomicU64 = AtomicU64::new(0);
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static REMOVED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) static REUSES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    (map.len(), map.keys().map(|&(_, len)| len).sum())
+}
+
+/// The previous submission's fence and all its copy-backs have completed.
+/// A recorded list or a cached descriptor pins its copy. Page-table layouts
+/// also pin copies because shaders can read their ranges without CPU lookups.
+pub(crate) fn reap_loose() -> bool {
+    let now = SUBMISSION.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let old_count = map.len();
+    map.retain(|_, copy| {
+        now.saturating_sub(copy.last_use.load(Ordering::Relaxed)) < LOOSE_IDLE_SUBMISSIONS
+            || Arc::strong_count(copy) > 1
+    });
+    if old_count != map.len() {
+        changed();
+    }
+    REMOVED.swap(false, Ordering::Relaxed)
+}
+
+pub(crate) fn remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let overlaps = |start: u64, size: u64| start < end as u64 && (at as u64) < start + size;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let old_count = map.len();
+    map.retain(|&(start, size), copy| {
+        if !overlaps(start, size) {
+            return true;
+        }
+        // A partial remap must preserve the other pages of a bound range:
+        // the next submission may read them by computed address.
+        if Arc::strong_count(copy) > 1 && ((at as u64) > start || (end as u64) < start + size) {
+            copy.invalidate(at, end, false);
+            return true;
+        }
+        copy.invalidate(at, end, true);
+        false
+    });
+    if old_count != map.len() {
+        REMOVED.store(true, Ordering::Relaxed);
+        changed();
+    }
+    drop(map);
+    EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.retain(|&(start, size, _), copy| {
+        if !overlaps(start, size) {
+            return true;
+        }
+        if let Some(copy) = copy.upgrade() {
+            copy.invalidate(at, end, true);
+        }
+        false
+    });
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let mut start = address & !(WINDOW - 1);
+    let mut end = end.checked_next_multiple_of(WINDOW)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    if let Some(copy) = map.get(&(start, end - start)) {
+        copy.touch();
+        return Some(copy.clone());
     }
+    // A larger copy already holding the range is safe to use at its offset.
+    if let Some((_, copy)) = map.range(..=(start, u64::MAX)).rev().find(|((at, len), _)| at + len >= end) {
+        #[cfg(feature = "diagnostics")]
+        REUSES.fetch_add(1, Ordering::Relaxed);
+        copy.touch();
+        return Some(copy.clone());
+    }
+    // Pair adjacent single windows when the old address is no longer bound.
+    // Limit speculative growth to one window so a streaming walk cannot
+    // build an ever larger union. Published page-table copies are pinned.
+    let neighbor = (end - start == WINDOW)
+        .then(|| start.checked_sub(WINDOW).into_iter().chain([end]).find(|&at| {
+            map.get(&(at, WINDOW)).is_some_and(|copy| Arc::strong_count(copy) == 1)
+        }))
+        .flatten();
+    if let Some(at) = neighbor {
+        start = start.min(at);
+        end = end.max(at.checked_add(WINDOW)?);
+    }
+    let len = end - start;
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    if let Some(at) = neighbor {
+        map.remove(&(at, WINDOW));
+    }
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1188,7 +1323,7 @@ struct Slice {
 #[derive(Default)]
 struct Arena {
     /// Each buffer, its mapping and host address, and its free runs
-    /// (offset → bytes).
+    /// (offset â†’ bytes).
     chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
 }
 
@@ -1413,6 +1548,91 @@ pub(crate) mod tests {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn moving_loose_windows_stay_bounded_after_submissions() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        const SUBMISSIONS: u64 = 32;
+        let host = host().expect("WARP host");
+        let len = ((SUBMISSIONS + 1) * WINDOW) as usize;
+        // SAFETY: this test owns the reservation until the final submission.
+        let pool = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!pool.is_null());
+        let start = (pool as u64).next_multiple_of(WINDOW);
+        let bytes = || {
+            LOOSE.lock().unwrap_or_else(|e| e.into_inner()).keys()
+                .filter(|&&(at, _)| (start..start + SUBMISSIONS * WINDOW).contains(&at))
+                .map(|&(_, len)| len).sum::<u64>()
+        };
+        for i in 0..SUBMISSIONS {
+            let at = start + i * WINDOW;
+            let list = host.new_list().expect("host command list");
+            let copy = find(at, 4).expect("loose window");
+            copy.refresh(&list, at, 4);
+            list.close();
+            host.execute(&[&list]);
+        }
+        let live = bytes();
+        crate::watch::title_memory_remapped(pool as usize, len);
+        // SAFETY: the test's reservation; every submission has completed.
+        assert_ne!(unsafe { VirtualFree(pool, 0, MEM_RELEASE) }, 0);
+        assert!(live <= 8 * WINDOW, "moving ranges retain {live} loose bytes");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn loose_windows_merge_and_stay_live_while_in_a_page_table() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let host = host().expect("WARP host");
+        let len = (3 * WINDOW) as usize;
+        let pool = (0..16u64)
+            .map(|i| 0x60_0000_0000 + (i << 28))
+            // SAFETY: a fresh allocation at a free address inside the table's 40-bit range.
+            .map(|at| unsafe { VirtualAlloc(at as *const _, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) })
+            .find(|p| !p.is_null())
+            .expect("test memory below 2^40");
+        let start = pool as u64;
+        drop(find(start, 4).expect("first window"));
+        let wide = find(start + WINDOW, 4).expect("adjacent window");
+        assert_eq!(wide.range(), (start, 2 * WINDOW));
+        assert!(Arc::ptr_eq(&wide, &find(start, 4).expect("covered window")));
+
+        let list = host.new_list().expect("host command list");
+        let _map = crate::memory::bind(&list, crate::memory::OURS).expect("page table");
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        let pinned = Arc::downgrade(&wide);
+        drop(wide);
+        let empty = host.new_list().expect("empty command list");
+        empty.close();
+        for _ in 0..2 * LOOSE_IDLE_SUBMISSIONS {
+            host.execute(&[&empty]);
+        }
+        assert!(pinned.upgrade().is_some(), "published range must survive idle submissions");
+
+        crate::watch::title_memory_remapped(start as usize, PAGE);
+        host.execute(&[&empty]);
+        assert!(
+            pinned.upgrade().is_some(),
+            "a partial remap keeps the other pages in the page table"
+        );
+
+        crate::watch::title_memory_remapped(pool as usize, len);
+        host.execute(&[&empty]);
+        assert!(pinned.upgrade().is_none(), "remap releases the published window");
+        // SAFETY: the test's reservation; every submission has completed.
+        assert_ne!(unsafe { VirtualFree(pool, 0, MEM_RELEASE) }, 0);
     }
 
     /// Runs of the shared buffers start a whole number of elements (and of

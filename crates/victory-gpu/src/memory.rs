@@ -94,9 +94,9 @@ impl Map {
 
 /// What a heap's page table names: the copies, the level-1 index of each
 /// block (block 0 is the null one), and the copy each entry names (or [`NO_OWNER`]).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Layout {
-    copies: Vec<Arc<Shadow>>,
+    copies: Vec<Option<Arc<Shadow>>>,
     /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
@@ -539,14 +539,60 @@ impl Shared {
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        // Copies hidden by another copy on every page have no live entry.
+        let mut used = vec![false; named.len()];
+        for &k in &owner {
+            if k != NO_OWNER {
+                used[k as usize] = true;
+            }
+        }
+        let copies: Vec<_> = named.into_iter().zip(used).map(|(copy, used)| {
+            if used {
+                return Some(copy);
+            }
+            let slot = self.pairs.remove(&(Arc::as_ptr(&copy) as usize)).expect("copy has a pair");
+            heap.raw_pair_at(slot, None, 0);
+            heap.free_pair(slot);
+            None
+        }).collect();
         self.layout = Arc::new(Layout {
-            bits: named.iter().map(|c| c.dirty_bit()).collect(),
-            copies: named,
+            bits: copies.iter().map(|c| c.as_ref().and_then(|c| c.dirty_bit())).collect(),
+            copies,
             blocks,
             owner,
         });
         self.generation = now;
         stats(|s| s.tables += 1);
+    }
+}
+
+/// Reclaim idle windows between submissions. A remap can also detach a
+/// window still named by a page table. Null its views and keep the other
+/// copies pinned until the next preparation rewrites that table.
+pub(crate) fn reap_loose() {
+    if !crate::shadow::reap_loose() {
+        return;
+    }
+    let keys: Vec<_> = shared().iter().map(|(key, _)| *key).collect();
+    for key in keys {
+        with_heap(key, |heap| {
+            let mut tables = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            let Some((_, state)) = tables.iter_mut().find(|(k, s)| *k == key && s.host == host) else {
+                return;
+            };
+            for slot in &mut Arc::make_mut(&mut state.layout).copies {
+                if !slot.as_ref().is_some_and(|copy| copy.was_remapped()) {
+                    continue;
+                }
+                let copy = slot.take().expect("remapped copy");
+                if let Some(pair) = state.pairs.remove(&(Arc::as_ptr(&copy) as usize)) {
+                    heap.raw_pair_at(pair, None, 0);
+                    heap.free_pair(pair);
+                }
+                state.generation = u64::MAX;
+            }
+        });
     }
 }
 
@@ -580,7 +626,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
+            if let Some(c) = c
+                && !crate::watch::clean_bit(*bit)
+            {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
             }
@@ -687,10 +735,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let Some(copy) = copies[k].as_ref() else { continue };
+            let n = copy.copy_back_page(at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
-                copy = format_args!("{:#x?}", copies[k].range()),
+                copy = format_args!("{:#x?}", copy.range()),
                 bytes = n,
                 "title memory page written back"
             );
