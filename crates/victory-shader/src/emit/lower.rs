@@ -1362,8 +1362,7 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
                 }
-                // Its sum, ballot and lane `hi` are the host wave's.
-                if self.split {
+                if self.split && !self.console_cf {
                     return Err("a wave reduction in a wave64 program split in halves");
                 }
                 let c = self.cur;
@@ -1394,24 +1393,28 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                let r = if self.split {
+                    let bits = self.as_int(r);
+                    let (lo, hi) = self.exchange(c, bits);
+                    let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+                    self.s.m.bin(c, Bin::Add, lo, hi)
+                } else {
+                    r
+                };
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let b = self
-                    .s
-                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
+                let (lo, upper) = self.console_ballot(c, on);
+                let word = if hi < 32 { lo } else { upper };
                 let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
                 let lane = self.s.m.i32(hi);
-                let at = self.read_lane(x, lane);
+                let at = self.console_read_lane(x, lane);
                 let top = self.s.m.select(c, there, at, id);
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);

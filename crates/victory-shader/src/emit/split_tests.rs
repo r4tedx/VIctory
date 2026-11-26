@@ -576,13 +576,19 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
 /// in the test above, then a read of lane 63: the reduction over the whole
 /// console wave, left in s10. It uses v1 to v3 as scratch in every lane.
 fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
-    reduction_scan_of(opcode, ident, None)
+    reduction_scan_of(opcode, ident, None, false)
 }
 
 /// [`reduction_scan`] with the identity as a literal when `literal` gives
-/// one (`ident` is then the literal operand, 0xFF).
-fn reduction_scan_of(opcode: u32, ident: u32, literal: Option<u32>) -> Vec<u32> {
+/// one (`ident` is then the literal operand, 0xFF). The final combine can
+/// write the low half and read lane 31, or write the high half and read 63.
+fn reduction_scan_of(opcode: u32, ident: u32, literal: Option<u32>, finish_low: bool) -> Vec<u32> {
     let op = opcode << 25;
+    let (other_lane, result_lane, exec_lo, exec_hi) = if finish_low {
+        (63, 31, 0xC1, 0x80)
+    } else {
+        (31, 63, 0x80, 0xC1)
+    };
     let mut words = vec![
         0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
         0xD501_0001,
@@ -608,12 +614,12 @@ fn reduction_scan_of(opcode: u32, ident: u32, literal: Option<u32>) -> Vec<u32> 
         0xAF00_E402,      // v_mov_b32 v3, v2 row_mask:0xa
         op | 0x0002_0701, // v_<op> v1, v1, v3
         0xD760_0009,
-        0x0001_3F01,      // v_readlane_b32 s9, v1, 31
-        0xBEFE_0380,      // s_mov_b32 exec_lo, 0
-        0xBEFF_03C1,      // s_mov_b32 exec_hi, -1
+        0x0001_0101 | (other_lane << 9), // v_readlane_b32 s9, v1, other_lane
+        0xBEFE_0300 | exec_lo, // s_mov_b32 exec_lo
+        0xBEFF_0300 | exec_hi, // s_mov_b32 exec_hi
         op | 0x0002_0209, // v_<op> v1, s9, v1
         0xD760_000A,
-        0x0001_7F01, // v_readlane_b32 s10, v1, 63
+        0x0001_0101 | (result_lane << 9), // v_readlane_b32 s10, v1, result_lane
         0xBEFE_0400, // s_mov_b64 exec, s[0:1]
     ]);
     words
@@ -634,6 +640,42 @@ fn whole_wave_reductions_join_both_host_waves() {
         let mut body = reduction_scan(opcode, ident);
         body.push(0x7E04_020A); // v_mov_b32 v2, s10
         console_flow_case(&format!("whole-wave {label}"), &body, 64, |_| want);
+    }
+}
+
+/// Each low half is 1.0h; the high half tags the lane that supplied the
+/// packed word. Exercise the upper lane's data and the saved EXEC bit.
+#[test]
+fn half_sum_and_packed_lane_cross_host_halves() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    for (name, compare, sum_bits, tag31, tag63) in [
+        ("all", 0x7D88_00C0, 0x5400, 31, 63),    // 64 > tid: 64.0h
+        ("first40", 0x7D88_00A8, 0x5100, 31, 0), // 40 > tid: 40.0h
+        ("upper", 0x7D82_009F, 0x5000, 0, 63),   // 31 < tid: 32.0h
+    ] {
+        for (finish_low, tag) in [(true, tag31), (false, tag63)] {
+            let mut body = vec![
+                0x7E0A_0300, // v_mov_b32 v5, v0
+                compare,
+                0x3408_0090, // v_lshlrev_b32 v4, 16, v0
+                0x3800_08FF,
+                0x3C00,      // v_or_b32 v0, 1.0h, v4
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            ];
+            body.extend(reduction_scan_of(0x32, 0x80, None, finish_low));
+            body.extend([
+                0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+                0x7E00_0305, // v_mov_b32 v0, v5 (restore the output index)
+                0x7E04_020A, // v_mov_b32 v2, s10
+            ]);
+            let p = program(&body, 64);
+            emit_for(&p, nvidia).unwrap();
+            let label = format!("{name}_tag{}", if finish_low { 31 } else { 63 });
+            program_case(&label, &p, |_| tag << 16 | sum_bits, true);
+        }
     }
 }
 
@@ -880,7 +922,7 @@ fn float_whole_wave_reductions_join_both_host_waves() {
         ("v_min_f32", 15, 0xFF, Some(0x7F80_0000), 0),
     ] {
         let mut body = vec![0x7E00_0D00]; // v_cvt_f32_u32 v0, v0
-        body.extend(reduction_scan_of(opcode, ident, literal));
+        body.extend(reduction_scan_of(opcode, ident, literal, false));
         body.extend([
             0x7E00_0F00, // v_cvt_u32_f32 v0, v0
             0x7E04_020A, // v_mov_b32 v2, s10
