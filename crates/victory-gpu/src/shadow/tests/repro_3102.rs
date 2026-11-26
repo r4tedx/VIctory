@@ -127,6 +127,38 @@ fn mirror(copy: &Shadow, at: usize) -> u8 {
     unsafe { copy.data.add(at - copy.start as usize).read_volatile() }
 }
 
+/// A copy of `pages` pages of title memory filled with a pattern, current:
+/// a buffer's copy (`mirrored_buffer`), or (`loose`) the copy of the 4 MiB
+/// window of title memory no buffer holds (`loose`, placed as a written
+/// buffer's copy since aab00070). Returns the pool, its length and the copy.
+fn copy_of(loose: bool, pages: usize) -> (usize, usize, Arc<Shadow>) {
+    if !loose {
+        return mirrored_buffer(pages);
+    }
+    let p = crate::watch::tests::pool(pages);
+    let len = pages * PAGE;
+    for i in 0..len {
+        write_title(p + i, (i % 251) as u8);
+    }
+    let copy = find(p as u64, len as u64).expect("a copy of the window");
+    assert!(copy.range().1 >= WINDOW, "the window's copy");
+    copy.update(p, len);
+    (p, len, copy)
+}
+
+/// Brings the mirror of `[p, p + len)` up to date (the CPU read it).
+fn fresh(copy: &Shadow, p: usize, len: usize) {
+    let at = p - copy.start as usize;
+    copy.freshen(at, at + len);
+}
+
+/// Ends a test's copy: a buffer is unregistered; a window's copy stays.
+fn done(loose: bool, p: usize) {
+    if !loose {
+        unregister(p, p as u64);
+    }
+}
+
 /// The shaders' mark for the page of title address `at` (a GPU copy sets
 /// none), as in #3102's `gpu_writes_reach_title_memory`.
 fn mark(copy: &Shadow, at: usize) {
@@ -141,14 +173,19 @@ fn mark(copy: &Shadow, at: usize) {
 /// that bring the writes back to the mirror after it do not run. `current`:
 /// the mirror was current before (read by the CPU since its refresh).
 /// Adapted from #2993's `a_failed_gpu_copy_of_shaders_writes_loses_none_of_them`.
-fn failed_bring_back(current: bool) {
+fn failed_bring_back(current: bool, loose: bool) {
     on_warp(true);
     let host = host().unwrap();
     assert!(bitmap(false).is_some(), "write marks here");
-    let (p, len, copy) = mirrored_buffer(2);
+    let (p, len, copy) = copy_of(loose, 2);
     assert!(copy.mirrored());
+    let marks = copy.marked();
+    eprintln!(
+        "REPRO-3102 (e) loose {loose}: copy {:#x?}, write marks {marks}",
+        copy.range()
+    );
     if current {
-        copy.freshen(0, len);
+        fresh(&copy, p, len);
     }
     let (at, byte) = (8, 0x5au8);
     let list = host.new_list().unwrap();
@@ -160,7 +197,9 @@ fn failed_bring_back(current: bool) {
     // From here on (after the submission's snapshots), the GPU copies fail.
     list.defer_host(|| FAIL_COPIES.store(true, Relaxed));
     list.close();
-    mark(&copy, p + at);
+    if marks {
+        mark(&copy, p + at);
+    }
     host.execute(&[&list]);
     FAIL_COPIES.store(false, Relaxed);
     let sides = |a: usize| (title(a), mirror(&copy, a), gpu_bytes(&copy, a, 1)[0]);
@@ -173,7 +212,7 @@ fn failed_bring_back(current: bool) {
             .count()
     };
     eprintln!(
-        "REPRO-3102 (e) current {current}: (title, mirror, video) marked {marked:#04x?} declared {declared:#04x?}, \
+        "REPRO-3102 (e) current {current} loose {loose}: (title, mirror, video) marked {marked:#04x?} declared {declared:#04x?}, \
          pattern there {:#04x}, stale pages after {stale:?}, title bytes off the pattern elsewhere: page 0 {} page 1 {}",
         (at % 251) as u8,
         changed(0),
@@ -182,17 +221,17 @@ fn failed_bring_back(current: bool) {
     assert_eq!(
         (marked, declared),
         ((byte, byte, byte), (byte, byte, byte)),
-        "(title, mirror, video memory) at the marked page and the declared range: the shader's byte \
+        "loose {loose}: (title, mirror, video memory) at the marked page and the declared range: the shader's byte \
          should survive a failed bring-back (pattern byte there {:#04x}; stale pages after {stale:?})",
         (at % 251) as u8
     );
-    unregister(p, p as u64);
+    done(loose, p);
 }
 
 #[test]
 fn e_a_failed_bring_back_keeps_the_shaders_writes() {
     if in_child("e_a_failed_bring_back_keeps_the_shaders_writes", MIRRORS) {
-        failed_bring_back(true);
+        failed_bring_back(true, false);
     }
 }
 
@@ -202,7 +241,27 @@ fn e_a_failed_bring_back_keeps_the_shaders_writes_stale_mirror() {
         "e_a_failed_bring_back_keeps_the_shaders_writes_stale_mirror",
         MIRRORS,
     ) {
-        failed_bring_back(false);
+        failed_bring_back(false, false);
+    }
+}
+
+#[test]
+fn e_loose_a_failed_bring_back_keeps_the_shaders_writes() {
+    if in_child(
+        "e_loose_a_failed_bring_back_keeps_the_shaders_writes",
+        MIRRORS,
+    ) {
+        failed_bring_back(true, true);
+    }
+}
+
+#[test]
+fn e_loose_a_failed_bring_back_keeps_the_shaders_writes_stale_mirror() {
+    if in_child(
+        "e_loose_a_failed_bring_back_keeps_the_shaders_writes_stale_mirror",
+        MIRRORS,
+    ) {
+        failed_bring_back(false, true);
     }
 }
 
@@ -214,12 +273,12 @@ fn e_a_failed_bring_back_keeps_the_shaders_writes_stale_mirror() {
 /// holds the earlier shader's byte. The mirror was current before (read by
 /// the CPU since its refresh). Adapted from #2993's
 /// `an_old_unmarked_write_does_not_reach_title_memory_late_at_2` and `_at_0`.
-fn old_unmarked_write(mirrors: bool) {
+fn old_unmarked_write(mirrors: bool, loose: bool) {
     on_warp(mirrors);
     let host = host().unwrap();
-    let (p, len, copy) = mirrored_buffer(2);
+    let (p, len, copy) = copy_of(loose, 2);
     assert_eq!(copy.mirrored(), mirrors);
-    copy.freshen(0, len);
+    fresh(&copy, p, len);
     // The earlier shader's write: on the GPU side only, nothing declared.
     let list = host.new_list().unwrap();
     gpu_store(&list, &copy, p + 10, &[0xaa]);
@@ -235,14 +294,14 @@ fn old_unmarked_write(mirrors: bool) {
     list.close();
     host.execute(&[&list]);
     let got = (title(p + 10), title(p + 20));
-    eprintln!("REPRO-3102 (h) mirrors {mirrors}: title (p+10, p+20) = {got:#04x?}");
+    eprintln!("REPRO-3102 (h) mirrors {mirrors} loose {loose}: title (p+10, p+20) = {got:#04x?}");
     assert_eq!(
         got,
         (0x77, 0xbb),
-        "mirrors {mirrors}: title memory at p+10 keeps the title's byte (0x77, not the old shader's 0xaa), \
+        "mirrors {mirrors} loose {loose}: title memory at p+10 keeps the title's byte (0x77, not the old shader's 0xaa), \
          p+20 gets this submission's 0xbb"
     );
-    unregister(p, p as u64);
+    done(loose, p);
 }
 
 #[test]
@@ -251,7 +310,27 @@ fn h_an_old_unmarked_write_does_not_reach_title_memory_late_with_mirrors() {
         "h_an_old_unmarked_write_does_not_reach_title_memory_late_with_mirrors",
         MIRRORS,
     ) {
-        old_unmarked_write(true);
+        old_unmarked_write(true, false);
+    }
+}
+
+#[test]
+fn h_loose_an_old_unmarked_write_does_not_reach_title_memory_late_with_mirrors() {
+    if in_child(
+        "h_loose_an_old_unmarked_write_does_not_reach_title_memory_late_with_mirrors",
+        MIRRORS,
+    ) {
+        old_unmarked_write(true, true);
+    }
+}
+
+#[test]
+fn h_loose_an_old_unmarked_write_does_not_reach_title_memory_late_in_system_memory() {
+    if in_child(
+        "h_loose_an_old_unmarked_write_does_not_reach_title_memory_late_in_system_memory",
+        SYSTEM,
+    ) {
+        old_unmarked_write(false, true);
     }
 }
 
@@ -261,7 +340,7 @@ fn h_an_old_unmarked_write_does_not_reach_title_memory_late_in_system_memory() {
         "h_an_old_unmarked_write_does_not_reach_title_memory_late_in_system_memory",
         SYSTEM,
     ) {
-        old_unmarked_write(false);
+        old_unmarked_write(false, false);
     }
 }
 
@@ -409,7 +488,7 @@ fn d_a_write_of_the_mirror_alone_is_seen_by_read_host_not_the_gpu() {
 /// takes) are in system memory (CUSTOM, write-back), not in GPU upload heaps
 /// outside the budget. Adapted from #2993's
 /// `with_both_switches_the_cpu_sides_stay_in_system_memory`.
-fn cpu_sides_with_both_switches(mirrors: bool) {
+fn cpu_sides_with_both_switches(mirrors: bool, loose: bool) {
     on_warp(mirrors);
     let heap = |b: &ID3D12Resource| {
         let mut props = D3D12_HEAP_PROPERTIES::default();
@@ -421,7 +500,7 @@ fn cpu_sides_with_both_switches(mirrors: bool) {
         D3D12_HEAP_TYPE_CUSTOM.0,
         D3D12_CPU_PAGE_PROPERTY_WRITE_BACK.0,
     );
-    let (p, _, copy) = mirrored_buffer(1);
+    let (p, _, copy) = copy_of(loose, 1);
     assert_eq!(copy.mirrored(), mirrors);
     let cpu_side = match &copy.vram {
         Some(v) => heap(&v.mirror),
@@ -429,18 +508,18 @@ fn cpu_sides_with_both_switches(mirrors: bool) {
     };
     let marks = heap(&bitmap(false).expect("the marks bitmap")._buffer);
     eprintln!(
-        "REPRO-3102 (f) mirrors {mirrors}: (heap type, CPU page property) copy's CPU side {cpu_side:?} \
+        "REPRO-3102 (f) mirrors {mirrors} loose {loose}: (heap type, CPU page property) copy's CPU side {cpu_side:?} \
          marks bitmap {marks:?}; system memory is {system:?}, GPU upload heap type {}",
         D3D12_HEAP_TYPE_GPU_UPLOAD.0
     );
     assert_eq!(
         (cpu_side, marks),
         (system, system),
-        "mirrors {mirrors}: the CPU side of the copy and the marks bitmap are in system memory \
+        "mirrors {mirrors} loose {loose}: the CPU side of the copy and the marks bitmap are in system memory \
          (heap type {} is a GPU upload heap)",
         D3D12_HEAP_TYPE_GPU_UPLOAD.0
     );
-    unregister(p, p as u64);
+    done(loose, p);
 }
 
 #[test]
@@ -451,7 +530,7 @@ fn f_with_both_switches_the_cpu_sides_stay_in_system_memory_mirror() {
         "f_with_both_switches_the_cpu_sides_stay_in_system_memory_mirror",
         &env,
     ) {
-        cpu_sides_with_both_switches(true);
+        cpu_sides_with_both_switches(true, false);
     }
 }
 
@@ -463,6 +542,18 @@ fn f_with_both_switches_the_cpu_sides_stay_in_system_memory_kept_copy() {
         "f_with_both_switches_the_cpu_sides_stay_in_system_memory_kept_copy",
         &env,
     ) {
-        cpu_sides_with_both_switches(false);
+        cpu_sides_with_both_switches(false, false);
+    }
+}
+
+#[test]
+fn f_loose_with_both_switches_the_cpu_sides_stay_in_system_memory_mirror() {
+    let mut env = MIRRORS.to_vec();
+    env.push(("VICTORY_COPIES_IN_VIDEO_MEMORY", "1"));
+    if in_child(
+        "f_loose_with_both_switches_the_cpu_sides_stay_in_system_memory_mirror",
+        &env,
+    ) {
+        cpu_sides_with_both_switches(true, true);
     }
 }
