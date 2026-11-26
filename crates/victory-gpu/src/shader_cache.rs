@@ -98,6 +98,7 @@ fn build() -> &'static [u8; 32] {
                 limit,
                 cap,
                 victory_shader::emit::heap_usage_marks(),
+                victory_shader::emit::implicit_sample_compute(),
             ),
             rays_miss,
         )
@@ -129,13 +130,21 @@ fn with_rays_miss(key: [u8; 32], rays_miss: bool) -> [u8; 32] {
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, cap: u32, heap_usage: bool) -> [u8; 32] {
+fn key(
+    translator: &str,
+    encoding: &[u8],
+    limit: u32,
+    cap: u32,
+    heap_usage: bool,
+    implicit_sample: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     h.update(&cap.to_le_bytes());
     hash_heap_usage(&mut h, heap_usage);
+    hash_implicit_sample(&mut h, implicit_sample);
     *h.finalize().as_bytes()
 }
 
@@ -143,6 +152,15 @@ fn key(translator: &str, encoding: &[u8], limit: u32, cap: u32, heap_usage: bool
 pub(crate) fn hash_heap_usage(h: &mut blake3::Hasher, enabled: bool) {
     if !enabled {
         h.update(b"VICTORY_HEAP_USAGE=0");
+    }
+}
+
+/// The default adds no key bytes. `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`
+/// translates programs the default refuses and changes the DXIL of others
+/// (`victory_shader::emit::implicit_sample_compute`).
+pub(crate) fn hash_implicit_sample(h: &mut blake3::Hasher, enabled: bool) {
+    if enabled {
+        h.update(b"VICTORY_IMPLICIT_SAMPLE_COMPUTE=1");
     }
 }
 
@@ -531,12 +549,34 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, 0, true);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 0, true));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 0, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 0, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 0, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1_000_000, true));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 0, true, false);
+        assert_eq!(
+            k,
+            key("0123456789abcdef", b"encoding", 1 << 20, 0, true, false)
+        );
+        assert_ne!(
+            k,
+            key("0123456789abcdee", b"encoding", 1 << 20, 0, true, false)
+        );
+        assert_ne!(
+            k,
+            key("0123456789abcdef", b"encoding.", 1 << 20, 0, true, false)
+        );
+        assert_ne!(
+            k,
+            key("0123456789abcdef", b"encoding", 1 << 19, 0, true, false)
+        );
+        assert_ne!(
+            k,
+            key(
+                "0123456789abcdef",
+                b"encoding",
+                1 << 20,
+                1_000_000,
+                true,
+                false
+            )
+        );
         assert_eq!(
             *build(),
             with_rays_miss(
@@ -546,6 +586,7 @@ mod tests {
                     victory_shader::emit::loop_limit(),
                     victory_shader::emit::view_heap_limit().unwrap_or(0),
                     victory_shader::emit::heap_usage_marks(),
+                    victory_shader::emit::implicit_sample_compute(),
                 ),
                 rays_miss()
             )
@@ -590,9 +631,31 @@ mod tests {
         before.update(blake3::hash(encoding).as_bytes());
         before.update(&limit.to_le_bytes());
         before.update(&0u32.to_le_bytes());
-        let default = key(translator, encoding, limit, 0, true);
+        let default = key(translator, encoding, limit, 0, true, false);
         assert_eq!(&default, before.finalize().as_bytes());
-        assert_ne!(default, key(translator, encoding, limit, 0, false));
+        assert_ne!(default, key(translator, encoding, limit, 0, false, false));
+    }
+
+    /// `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1` changes the DXIL, so it makes
+    /// another key; without it the key is the one from before the switch.
+    #[test]
+    fn implicit_sample_changes_the_key_only_when_enabled() {
+        let translator = "0123456789abcdef";
+        let encoding = b"encoding";
+        let limit = victory_shader::emit::DEFAULT_LOOP_LIMIT;
+        let mut before = blake3::Hasher::new();
+        before.update(translator.as_bytes());
+        before.update(blake3::hash(encoding).as_bytes());
+        before.update(&limit.to_le_bytes());
+        before.update(&0u32.to_le_bytes());
+        let default = key(translator, encoding, limit, 0, true, false);
+        assert_eq!(&default, before.finalize().as_bytes());
+        let on = key(translator, encoding, limit, 0, true, true);
+        assert_ne!(default, on);
+        assert_ne!(on, key(translator, encoding, limit, 0, false, true));
+        let mut tag = blake3::Hasher::new();
+        hash_implicit_sample(&mut tag, false);
+        assert_eq!(tag.finalize(), blake3::Hasher::new().finalize());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

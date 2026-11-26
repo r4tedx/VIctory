@@ -387,6 +387,10 @@ fn tag(blob: &[u8]) -> String {
         h.update(b"VICTORY_RT_MISS");
     }
     crate::shader_cache::hash_heap_usage(&mut h, victory_shader::emit::heap_usage_marks());
+    crate::shader_cache::hash_implicit_sample(
+        &mut h,
+        victory_shader::emit::implicit_sample_compute(),
+    );
     h.finalize().to_hex().to_string()
 }
 

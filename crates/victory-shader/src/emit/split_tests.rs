@@ -305,10 +305,12 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// The console flow is for one console wave per host group. A group of
-/// several console waves that share no LDS is emitted as that many host
-/// groups of 64 threads; one whose waves share LDS, or meet at an
-/// `s_barrier`, or whose size is no multiple of 64, still stops.
+/// The console flow is for one console wave per host group, or one
+/// control flow for a whole group. A group of several console waves that
+/// share no LDS is emitted as that many host groups of 64 threads; one
+/// whose waves share LDS or meet at an `s_barrier` as one host group of
+/// 32-lane waves (`lower::groups`); one whose size is no multiple of 64
+/// still stops.
 #[test]
 fn console_flow_is_for_one_console_wave_per_group() {
     let body = [
@@ -345,10 +347,13 @@ fn console_flow_is_for_one_console_wave_per_group() {
         );
     };
     stops(&program(&body, 96));
-    stops(&program_lds(&body, 128));
     let mut with_barrier = body.to_vec();
     with_barrier.push(0xBF8A_0000); // s_barrier
-    stops(&program(&with_barrier, 128));
+    for p in [program_lds(&body, 128), program(&with_barrier, 128)] {
+        let one = emit_for(&p, nvidia).unwrap();
+        assert_eq!(one.group_waves, 1);
+        assert_eq!(wave_size(&one.dxil), Some(32));
+    }
 }
 
 /// Groups of two and four console waves as host groups of one wave each,
@@ -1475,4 +1480,256 @@ fn wave32_loop_exit_mask_counts_a_partial_second_wave() {
             eprintln!("{name}: native Wave32 support not reported; skipped");
         }
     }
+}
+
+// ---- groups of several console waves sharing LDS (`lower::groups`) ----
+
+/// [`program`] with `granules` of 512 bytes of LDS.
+fn program_lds_of(body: &[u32], threads: u32, granules: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= granules << 15;
+    p
+}
+
+const NVIDIA: super::Target = super::Target {
+    lanes_min: 32,
+    lanes_max: 32,
+};
+
+/// Emitted for a 32-lane host as one host group of 32-lane waves, and
+/// valid where a validator is installed.
+fn one_host_group(p: &crate::NativeProgram, label: &str) {
+    let cs = emit_for(p, NVIDIA).unwrap_or_else(|e| panic!("{label}: {e}"));
+    assert_eq!(cs.group_waves, 1, "{label}");
+    assert_eq!(wave_size(&cs.dxil), Some(32), "{label}");
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut cs.dxil.clone())
+            .unwrap_or_else(|e| panic!("{label}: validation: {e}"));
+    }
+}
+
+/// Lane t writes t to dword t; after an `s_barrier` it reads the dword of
+/// the same lane in the other console wave (t ^ 64) and adds what lane 40
+/// of its own console wave holds (`v_readlane`, the other half).
+const LDS_ACROSS_WAVES: &[u32] = &[
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0xD834_0000,
+    0x0000_0004, // ds_write_b32 v4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x3A0A_00C0, // v_xor_b32 v5, 64, v0
+    0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+    0xD8D8_0000,
+    0x0600_0005, // ds_read_b32 v6, v5
+    0xD760_0009,
+    0x0001_5100, // v_readlane_b32 s9, v0, 40
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x4A04_0C09, // v_add_nc_u32 v2, s9, v6
+];
+
+/// Waves above the first end at once (EXEC empty: `s_cbranch_execz` to
+/// `s_endpgm`), before the first wave's `s_barrier`; the first wave
+/// shares LDS between its halves across it: lane t writes t + 1 to dword
+/// t and reads dword t ^ 32, then adds lane 40's id. The branch skips the
+/// rest of the body and the store [`program`] appends.
+fn early_end() -> Vec<u32> {
+    let rest: &[u32] = &[
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+        0xD834_0000,
+        0x0000_0704, // ds_write_b32 v4, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x3A0A_00A0, // v_xor_b32 v5, 32, v0
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0xD8D8_0000,
+        0x0200_0005, // ds_read_b32 v2, v5
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    // Past the rest, then [`program`]'s address arithmetic (2) and store (2).
+    let skip = rest.len() as u32 + 4;
+    let mut w = vec![
+        0x7D88_00C0,        // v_cmp_gt_u32 vcc, 64, v0
+        0xBE8A_246A,        // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0000 | skip, // s_cbranch_execz s_endpgm
+    ];
+    w.extend_from_slice(rest);
+    w
+}
+
+/// Thread 0 clears dword 0; after an `s_barrier`, lanes below 20 of the
+/// group (all in the first console wave: the others skip the region, EXEC
+/// empty) add 1 to it with an LDS atomic; after another, every lane reads
+/// it and adds lane 40's id in its console wave.
+const SKIPPED_BY_SOME_WAVES: &[u32] = &[
+    0xD760_0009,
+    0x0001_5100, // v_readlane_b32 s9, v0, 40
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xD834_0000,
+    0x0000_0707, // ds_write_b32 v7, v7
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xBF88_0003, // s_cbranch_execz +3
+    0x7E10_0281, // v_mov_b32 v8, 1
+    0xD800_0000,
+    0x0000_0807, // ds_add_u32 v7, v8
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0xD8D8_0000,
+    0x0200_0007, // ds_read_b32 v2, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+];
+
+/// A branch each console wave takes by its own count of lanes below 20
+/// (`s_bcnt1`, SCC): the first wave goes in and writes its count to its
+/// dword (1 + wave), the second does not, its EXEC full. Thread 0 first
+/// puts 7 in both dwords; after an `s_barrier` each lane reads the other
+/// wave's dword: the second wave's 7 is still there.
+const OWN_COUNT_REGION: &[u32] = &[
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7E12_0287, // v_mov_b32 v9, 7
+    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xD838_0201,
+    0x0009_0907, // ds_write2_b32 v7, v9, v9 offset0:1 offset1:2
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+    0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+    0xBF84_0006, // s_cbranch_scc0 +6
+    0x2C14_0086, // v_lshrrev_b32 v10, 6, v0
+    0x4A14_1481, // v_add_nc_u32 v10, 1, v10
+    0x3414_1482, // v_lshlrev_b32 v10, 2, v10
+    0x7E16_0209, // v_mov_b32 v11, s9
+    0xD834_0000,
+    0x0000_0B0A, // ds_write_b32 v10, v11
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x2C18_0086, // v_lshrrev_b32 v12, 6, v0
+    0x3A18_1881, // v_xor_b32 v12, 1, v12
+    0x4A18_1881, // v_add_nc_u32 v12, 1, v12
+    0x3418_1882, // v_lshlrev_b32 v12, 2, v12
+    0xD8D8_0000,
+    0x0200_000C, // ds_read_b32 v2, v12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// Groups of two and four console waves sharing LDS across an `s_barrier`
+/// emit for a 32-lane host as one host group, valid: the waves exchange
+/// through LDS, a wave reads a lane of its other half, waves end before
+/// the barrier, skip a region by EXEC or by a count of their own.
+#[test]
+fn groups_sharing_lds_emit_as_one_host_group() {
+    one_host_group(
+        &program_lds_of(LDS_ACROSS_WAVES, 128, 1),
+        "across waves, 128",
+    );
+    one_host_group(
+        &program_lds_of(LDS_ACROSS_WAVES, 256, 2),
+        "across waves, 256",
+    );
+    one_host_group(&program_lds_of(&early_end(), 128, 1), "early end");
+    one_host_group(
+        &program_lds_of(SKIPPED_BY_SOME_WAVES, 256, 1),
+        "skipped region",
+    );
+    one_host_group(&program_lds_of(OWN_COUNT_REGION, 128, 1), "own count");
+}
+
+/// What a group of several console waves cannot run as one control flow
+/// stops with its reason: a loop its waves may leave at different
+/// iterations, an `s_barrier` in a region only some waves run, a branch
+/// with code on both sides that the waves may take differently.
+#[test]
+fn groups_sharing_lds_stop_where_waves_part() {
+    let read = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+    ];
+    let why = |body: &[u32]| {
+        let mut w = read.to_vec();
+        w.extend_from_slice(body);
+        match emit_for(&program_lds_of(&w, 128, 1), NVIDIA) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("emitted"),
+        }
+    };
+    let lane_loop = [
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x4A04_0481, // loop: v_add_nc_u32 v2, 1, v2
+        0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFC, // s_cbranch_execnz loop
+    ];
+    assert_eq!(why(&lane_loop), super::lower::groups::LOOP_LEFT_APART);
+    let barrier_inside = [
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0001, // s_cbranch_execz +1
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    ];
+    assert_eq!(
+        why(&barrier_inside),
+        super::lower::groups::BARRIER_IN_REGION
+    );
+    let both_sides = [
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        0xBF86_0002, // s_cbranch_vccz else
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xBF82_0001, // s_branch end
+        0x7E04_0282, // else: v_mov_b32 v2, 2
+    ];
+    assert_eq!(why(&both_sides), super::lower::groups::BRANCH_APART);
+}
+
+/// The same programs dispatched on every 32-lane hardware adapter
+/// (none under `VICTORY_WARP=1`), two console groups each, checked lane
+/// by lane against the console.
+#[test]
+fn groups_sharing_lds_match_the_console_on_every_adapter() {
+    for (threads, granules) in [(128, 1), (256, 2)] {
+        program_case(
+            "LDS across console waves",
+            &program_lds_of(LDS_ACROSS_WAVES, threads, granules),
+            |t| (t ^ 64) + (t & !63) + 40,
+            true,
+        );
+        program_case(
+            "a region some console waves skip",
+            &program_lds_of(SKIPPED_BY_SOME_WAVES, threads, granules),
+            |t| 20 + (t & !63) + 40,
+            true,
+        );
+    }
+    program_case(
+        "waves that end before the barrier",
+        &program_lds_of(&early_end(), 128, 1),
+        |t| if t < 64 { (t ^ 32) + 1 + 40 } else { 0 },
+        true,
+    );
+    program_case(
+        "a region by each wave's own count",
+        &program_lds_of(OWN_COUNT_REGION, 128, 1),
+        |t| if t < 64 { 7 } else { 20 },
+        true,
+    );
 }

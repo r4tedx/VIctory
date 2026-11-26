@@ -374,6 +374,135 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     }
 }
 
+/// Per lane (32, wave32): the record [bias, u, v, -] at entry 1 of the
+/// table at s0 (a texture at entry 0, a raw UAV at entry 2). Samples red with
+/// that bias (`image_sample_b`) and with implicit derivatives
+/// (`image_sample`) into 8 dwords at lane × 32.
+const BIASED_AND_IMPLICIT: [u32; 30] = [
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF40C_0302,
+    0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+    0xF408_0502,
+    0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    // The sampler of the gathers above: levels 0-12, linear filters.
+    0xB008_01B6, // s_movk_i32 s8, 0x1b6
+    0xBE89_03FF,
+    0x00C0_0000, // s_mov_b32 s9, 0xc00000
+    0xBE8A_03FF,
+    0x1850_0000, // s_mov_b32 s10, 0x18500000
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0x3420_0084, // v_lshlrev_b32 v16, 4, v0
+    0x3428_0085, // v_lshlrev_b32 v20, 5, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE038_1000,
+    0x8005_0C10, // buffer_load_dwordx4 v[12:15], v16, s[20:23], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xF094_0F08,
+    0x0043_040C, // image_sample_b v[4:7], v[12:14], s[12:19], s[8:11] dmask:0xf 2D
+    0xF080_0F08,
+    0x0043_080D, // image_sample v[8:11], v[13:14], s[12:19], s[8:11] dmask:0xf 2D
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_1000,
+    0x800A_0414, // buffer_store_dwordx4 v[4:7], v20, s[40:43], 0 offen
+    0xE078_1010,
+    0x800A_0814, // buffer_store_dwordx4 v[8:11], v20, s[40:43], 0 offen offset:16
+    0xBF81_0000, // s_endpgm
+];
+
+/// `VICTORY_IMPLICIT_SAMPLE_COMPUTE=1`: a compute program's biased sample is
+/// at the bias as a level, clamped to the console's bias range (a NaN at
+/// the low end), and its implicit sample at level 0, on WARP; the module
+/// validates. Without the switch the biased sample stays `sampleBias`, which
+/// the validator refuses in compute.
+#[test]
+fn compute_samples_with_implicit_derivatives_are_at_a_level() {
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            lower::set_implicit_sample_compute(false);
+        }
+    }
+    let _off = Off;
+    let validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    if let Some(mut v) = validator {
+        lower::set_implicit_sample_compute(false);
+        let off = build(&BIASED_AND_IMPLICIT).expect("lower without the switch");
+        assert!(
+            v.validate(&mut off.dxil.clone()).is_err(),
+            "a biased compute sample validated without the switch"
+        );
+    }
+    lower::set_implicit_sample_compute(true);
+    let shader = build(&BIASED_AND_IMPLICIT).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    // Bias, then the level the sample reads (of 4: 8×8 to 1×1).
+    let cases: [(f32, f32); 10] = [
+        (0.0, 0.0),
+        (1.0, 1.0),
+        (2.0, 2.0),
+        (3.0, 3.0),
+        (-3.0, 0.0),
+        (-100.0, 0.0),
+        (100.0, 3.0),
+        (f32::INFINITY, 3.0),
+        (f32::NEG_INFINITY, 0.0),
+        (f32::NAN, 0.0),
+    ];
+    // Every texel of level n is n; the centre of the texture.
+    let input: Vec<u32> = (0..32)
+        .flat_map(|l| {
+            [
+                cases[l % cases.len()].0.to_bits(),
+                0.5f32.to_bits(),
+                0.5f32.to_bits(),
+                0,
+            ]
+        })
+        .collect();
+    let views = [
+        View::Levels(8, 4),
+        View::Buffer {
+            data: &input,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32 * 8),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("warp: dispatch failed: {e}"));
+    for lane in 0..32 {
+        let (bias, level) = cases[lane % cases.len()];
+        let red = |k: usize| f32::from_bits(out[0][lane * 8 + 4 * k]);
+        assert_eq!(red(0), level, "lane {lane}: bias {bias}");
+        assert_eq!(red(1), 0.0, "lane {lane}: implicit");
+    }
+}
+
 /// A pixel program the console runs after the depth test
 /// (`DEPTH_BEFORE_SHADER`) runs after it on the host too
 /// (`[earlydepthstencil]`): it writes an unordered view, so without the flag
