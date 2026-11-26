@@ -13,12 +13,17 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+#[cfg(feature = "diagnostics")]
+mod overflow;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
+    #[cfg(feature = "diagnostics")]
+    overflow: Option<overflow::OverflowWrites>,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
@@ -99,6 +104,8 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        #[cfg(feature = "diagnostics")]
+        let title_count = count;
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -190,6 +197,8 @@ impl HostHeap {
             cpu,
             step,
             count,
+            #[cfg(feature = "diagnostics")]
+            overflow: overflow::OverflowWrites::new(count, title_count),
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
@@ -638,6 +647,10 @@ impl HostHeap {
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
+        #[cfg(feature = "diagnostics")]
+        if let Some(overflow) = &self.overflow {
+            overflow.observe_sync(first, &records);
+        }
         let current = views_current(&records);
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -653,6 +666,27 @@ impl HostHeap {
         };
         for i in stale {
             self.mirror(i, at(i), false);
+        }
+    }
+
+    /// Counts a title view creation or descriptor copy, including queued writes.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn note_title_write(&self, index: u32, handle: u64) {
+        if let Some(overflow) = &self.overflow
+            && overflow.contains(index)
+        {
+            // A queued slot may have been unmapped before host heap creation.
+            let mut bytes = [[0; 4]; 3];
+            let record = crate::host::read_into(handle as *const u8, bytes.as_flattened_mut())
+                .then(|| bytes.map(u32::from_ne_bytes));
+            overflow.observe_write(index, record);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn report_overflow(&self, start: u64) {
+        if let Some(overflow) = &self.overflow {
+            overflow.report(start, std::time::Instant::now());
         }
     }
 

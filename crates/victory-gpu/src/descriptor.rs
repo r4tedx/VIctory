@@ -96,7 +96,10 @@ impl Heap {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                    let handle = self.start + u64::from(i) * step;
+                    #[cfg(feature = "diagnostics")]
+                    h.note_title_write(i, handle);
+                    h.mirror(i, handle, false);
                 }
                 Some(h)
             })
@@ -149,6 +152,8 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
+                #[cfg(feature = "diagnostics")]
+                host.note_title_write(index, handle);
                 host.mirror(index, handle, false);
             }
         }
@@ -172,6 +177,10 @@ pub(crate) fn sync_heaps() {
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
+            #[cfg(feature = "diagnostics")]
+            if let Some(Some(host)) = heap.host.get() {
+                host.report_overflow(start);
+            }
             continue;
         };
         let step = u64::from(step);
@@ -193,6 +202,8 @@ pub(crate) fn sync_heaps() {
                 host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        host.report_overflow(start);
     }
 }
 
