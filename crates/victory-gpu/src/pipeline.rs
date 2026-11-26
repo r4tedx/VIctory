@@ -333,12 +333,20 @@ pub(crate) fn builder_runs() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
+    let wide = wide_waves();
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    builder_runs_with(&mut b, wide)
+}
+
+/// [`builder_runs`] past its switch, on the builder's state `b` and whether
+/// the host runs 64-lane waves.
+#[cfg(windows)]
+fn builder_runs_with(b: &mut Builder, wide: bool) -> bool {
     if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
-        return true;
+        return decide(true, wide).0;
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
@@ -352,12 +360,41 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     b.off = 0;
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
     b.whole = true;
-    true
+    let (open, why) = decide(true, wide);
+    if open {
+        tracing::info!(pipelines = b.pipelines.len(), "the ray-tracing structure builder {why}");
+    } else {
+        tracing::warn!(pipelines = b.pipelines.len(), "the ray-tracing structure builder {why}");
+    }
+    open
+}
+
+/// Whether the builder runs, and why (the log's words), from whether all
+/// of its programs have host pipelines and whether the host runs 64-lane
+/// waves. Two gates, both needed; never ship without either:
+/// - all or none (see [`Builder`]): one program without a host pipeline
+///   keeps the whole builder off.
+/// - the 32-lane guard (our 4087079c): on a host without 64-lane waves the
+///   builder stays held back even with every program made. Its wave64
+///   programs then run as 32-lane halves (the wave32 lowering makes all
+///   of them), and the whole builder run that way removed an RTX 4070
+///   SUPER's device within two minutes (VIctory #2118 thread).
+#[cfg(windows)]
+fn decide(all_made: bool, wide: bool) -> (bool, &'static str) {
+    match (all_made, wide) {
+        (true, true) => (true, "runs: all of its programs have host pipelines"),
+        (true, false) => (false, "held back: the host has no 64-lane waves"),
+        (false, _) => (false, "stays off: not all of its programs have a host pipeline"),
+    }
+}
+
+/// Whether the host runs 64-lane waves, from the device's own count
+/// ([`crate::host::Host::runs_wave64`]), not the translator's setting. No
+/// host device: assumed so (nothing runs anyway).
+#[cfg(windows)]
+fn wide_waves() -> bool {
+    crate::host::host().is_none_or(crate::host::Host::runs_wave64)
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -805,6 +842,43 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The 32-lane guard and the all-or-none gate both hold: with every
+    /// builder program made, a host without 64-lane waves keeps the
+    /// builder held back, with that reason; a program not made keeps it
+    /// off on any host. Fails if either gate is removed.
+    #[cfg(windows)]
+    #[test]
+    fn the_builder_stays_held_back_on_hosts_without_64_lane_waves() {
+        assert_eq!(decide(true, false), (false, "held back: the host has no 64-lane waves"));
+        assert_eq!(decide(true, true), (true, "runs: all of its programs have host pipelines"));
+        for wide in [false, true] {
+            assert_eq!(
+                decide(false, wide),
+                (false, "stays off: not all of its programs have a host pipeline"),
+                "wide={wide}"
+            );
+        }
+    }
+
+    /// [`builder_runs_with`] asks the guard, also once the builder is
+    /// whole: on a host without 64-lane waves it does not run with every
+    /// program made (53, as the whole builder); with them it does. Fails if
+    /// it stops consulting the guard. ([`builder_runs`] passes it
+    /// [`wide_waves`], the device's own lane count.)
+    #[cfg(windows)]
+    #[test]
+    fn runs_consults_the_32_lane_guard() {
+        let mut b = Builder {
+            pipelines: (0..53).map(|_| Arc::new(make::Pending::new(Vec::new(), None))).collect(),
+            whole: true,
+            off: 0,
+            rests: 0,
+        };
+        assert!(!builder_runs_with(&mut b, false), "a host without 64-lane waves: held back");
+        assert!(builder_runs_with(&mut b, true), "a host with 64-lane waves, all made: runs");
+        assert!(!builder_runs_with(&mut b, false), "and held back again on a narrow host");
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

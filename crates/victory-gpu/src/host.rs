@@ -61,6 +61,10 @@ pub(crate) struct Host {
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    /// The widest wave the device runs (`WaveLaneCountMax`; 0 if the
+    /// driver does not say). The structure builder's 32-lane guard reads
+    /// it here, so the guard needs no translator change.
+    wave_lanes: u32,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -930,12 +934,14 @@ fn create() -> windows::core::Result<Host> {
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let mut wave_lanes = 0;
         if device
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            wave_lanes = o1.WaveLaneCountMax;
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
@@ -984,11 +990,18 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            wave_lanes,
         })
     }
 }
 
 impl Host {
+    /// Whether the device runs 64-lane waves (`false` if the driver does
+    /// not say).
+    pub(crate) fn runs_wave64(&self) -> bool {
+        self.wave_lanes >= 64
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
