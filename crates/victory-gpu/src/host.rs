@@ -138,7 +138,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // Logs where host copies go, once, at the start.
+            host.gpu_upload_writes();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -324,6 +328,35 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Host copies go to GPU upload heaps by default where the host has
+    /// them; `VICTORY_GPU_UPLOAD=0` keeps every copy in system memory (the
+    /// old placement), `VICTORY_GPU_UPLOAD_WRITES=0` only the written ones;
+    /// without the heaps nothing moves.
+    #[test]
+    fn upload_placement_follows_the_switches_and_the_heaps() {
+        use super::placement;
+        use crate::switch::value_is_on_by_default as on;
+        use std::ffi::OsStr;
+
+        // Unset, =0 and =1.
+        let (z, o) = (on(Some(OsStr::new("0"))), on(Some(OsStr::new("1"))));
+        let u = on(None);
+        // (VICTORY_GPU_UPLOAD, VICTORY_GPU_UPLOAD_WRITES, heaps) -> placement.
+        let cases = [
+            ((u, u, true), (true, true), "both unset"),
+            ((o, o, true), (true, true), "both =1"),
+            ((z, u, true), (false, false), "UPLOAD=0"),
+            ((z, o, true), (false, false), "UPLOAD=0, WRITES=1"),
+            ((u, z, true), (true, false), "WRITES=0"),
+            ((u, u, false), (false, false), "no heaps, both unset"),
+            ((o, o, false), (false, false), "no heaps, both =1"),
+            ((z, z, false), (false, false), "no heaps, both =0"),
+        ];
+        for ((upload, writes, heaps), want, what) in cases {
+            assert_eq!(placement(upload, writes, heaps), want, "{what}");
+        }
+    }
+
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
@@ -3562,6 +3595,17 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Where host copies go from the two switches' values (`upload`:
+/// `VICTORY_GPU_UPLOAD`, `writes`: `VICTORY_GPU_UPLOAD_WRITES`, each on
+/// unless `=0`) and whether the host has GPU upload heaps: (copies shaders
+/// only read in GPU upload heaps, copies shaders write there too). Without
+/// the heaps, or with `VICTORY_GPU_UPLOAD=0`, every copy stays in system
+/// memory: the placement from before both switches were on by default.
+fn placement(upload: bool, writes: bool, heaps: bool) -> (bool, bool) {
+    let read_only = upload && heaps;
+    (read_only, read_only && writes)
+}
+
 /// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
 /// charged when one is made, given back when D3D12 destroys it
 /// ([`give_back_upload`]).
@@ -3674,14 +3718,28 @@ impl Host {
     }
 
     /// Whether host copies that shaders only read go to GPU upload heaps:
-    /// `VICTORY_GPU_UPLOAD=1` (a prototype, off by default) and a host that
-    /// has them. Asked once.
+    /// on by default where the host has them, off with
+    /// `VICTORY_GPU_UPLOAD=0` ([`placement`]). Asked once.
     pub(crate) fn gpu_upload(&self) -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            if !crate::switch::on("VICTORY_GPU_UPLOAD") {
-                return false;
-            }
+        self.upload_placement().0
+    }
+
+    /// Whether host copies that shaders write go to GPU upload heaps too,
+    /// with a system memory mirror for the CPU (`crate::shadow`): on by
+    /// default with [`Host::gpu_upload`], off with
+    /// `VICTORY_GPU_UPLOAD_WRITES=0` ([`placement`]). Asked once.
+    pub(crate) fn gpu_upload_writes(&self) -> bool {
+        self.upload_placement().1
+    }
+
+    /// Where host copies of title buffers go, decided once and logged once
+    /// (at the host's creation, [`host`]): (copies shaders only read in GPU
+    /// upload heaps, copies shaders write there too).
+    fn upload_placement(&self) -> (bool, bool) {
+        static PLACEMENT: OnceLock<(bool, bool)> = OnceLock::new();
+        *PLACEMENT.get_or_init(|| {
+            let upload = crate::switch::on_by_default("VICTORY_GPU_UPLOAD");
+            let writes = crate::switch::on_by_default("VICTORY_GPU_UPLOAD_WRITES");
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: a feature query writing the structure of its size.
             let known = unsafe {
@@ -3692,27 +3750,17 @@ impl Host {
                 )
             }
             .is_ok();
-            let on = known && o.GPUUploadHeapSupported.as_bool();
+            let heaps = known && o.GPUUploadHeapSupported.as_bool();
+            let (read_only, written) = placement(upload, writes, heaps);
             tracing::info!(
-                on,
-                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+                read_only,
+                written,
+                gpu_upload_heaps = heaps,
+                "host copies of title buffers in GPU upload heaps: those shaders only read \
+                 (VICTORY_GPU_UPLOAD, on unless =0), those shaders write, with a mirror \
+                 (VICTORY_GPU_UPLOAD_WRITES, on unless =0); system memory otherwise"
             );
-            on
-        })
-    }
-
-    /// Whether host copies that shaders write go to GPU upload heaps too,
-    /// with a system memory mirror for the CPU (`crate::shadow`):
-    /// `VICTORY_GPU_UPLOAD_WRITES=1` with [`Host::gpu_upload`] on. Asked once.
-    pub(crate) fn gpu_upload_writes(&self) -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            let on = self.gpu_upload() && crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
-            tracing::info!(
-                on,
-                "host copies that shaders write in GPU upload heaps (VICTORY_GPU_UPLOAD_WRITES)"
-            );
-            on
+            (read_only, written)
         })
     }
 

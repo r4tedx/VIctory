@@ -104,12 +104,15 @@ xychart-beta
 ```
 
 So a copy shaders use heavily belongs in video memory, but the CPU must
-never read it there. Two opt-in switches act on that:
+never read it there. Two switches act on that. Both are on by default
+(unset or `=1`); `=0` turns one off. `VICTORY_GPU_UPLOAD=0` keeps every
+copy in system memory, the placement from before they were on by default.
+The chosen placement is logged once when the host device is made.
 
 | switch | copies moved to a GPU upload heap | what the CPU reads |
 |---|---|---|
-| `VICTORY_GPU_UPLOAD=1` | buffers made without unordered access (shaders only read them) | nothing: the CPU only writes these copies |
-| `VICTORY_GPU_UPLOAD_WRITES=1` (with the one above) | buffers shaders may write | a **mirror** in system memory |
+| `VICTORY_GPU_UPLOAD` (off with `=0`) | buffers made without unordered access (shaders only read them) | nothing: the CPU only writes these copies |
+| `VICTORY_GPU_UPLOAD_WRITES` (off with `=0`; needs the one above) | buffers shaders may write | a **mirror** in system memory |
 
 Both switches fall back to system memory when the GPU has no GPU upload
 heaps, and past these copies' share of the video memory budget

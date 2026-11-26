@@ -15,9 +15,21 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a switch that is on by default is on: it is unset, or set to
+/// anything but `0` (`0` switches it off).
+pub(crate) fn value_is_on_by_default(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether the environment variable `name`, a switch on by default, is on:
+/// only `name=0` turns it off.
+pub(crate) fn on_by_default(name: &str) -> bool {
+    value_is_on_by_default(std::env::var_os(name).as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{value_is_on, value_is_on_by_default};
     use std::ffi::OsStr;
 
     #[test]
@@ -40,6 +52,18 @@ mod tests {
         // Documented as `=1`; anything else that was on before stays on: only `0` is new.
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
+        }
+    }
+
+    /// `VICTORY_GPU_UPLOAD` and `VICTORY_GPU_UPLOAD_WRITES` are on by
+    /// default: unset is on, `0` off, `1` on.
+    #[test]
+    fn switches_on_by_default_turn_off_only_at_zero() {
+        assert!(value_is_on_by_default(None), "unset");
+        assert!(!value_is_on_by_default(Some(OsStr::new("0"))), "0");
+        assert!(value_is_on_by_default(Some(OsStr::new("1"))), "1");
+        for value in ["", "true", "2", "00", " 0"] {
+            assert!(value_is_on_by_default(Some(OsStr::new(value))), "{value:?}");
         }
     }
 }
