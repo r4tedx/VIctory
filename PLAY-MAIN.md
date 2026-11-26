@@ -116,7 +116,8 @@ None of them has a title run yet.
 
 ## play/main-next (the next play/main)
 
-`play/main-next` is play/main 6fb49264 with every variant above merged in,
+`play/main-next` is play/main 6fb49264 with every variant above merged in
+(and, from play/main-next-2 on, dynamic-pool-2 and P-0a),
 one merge commit each, plus the GPU upload heaps on by default. The GPU
 thread tests it, then play/main fast-forwards to it. Pushed to fork only.
 
@@ -175,8 +176,62 @@ targets: clean without and with `--features diagnostics`.
 
 Not verified: the upload heaps on by default against everything else on
 the RTX 5070, until the GPU thread's runs; cross-wave LDS on hardware (as
-for play/main-shaders). The later heads on this branch (dynamic-pool-2,
-P-0a) are listed in their own merge commits.
+for play/main-shaders).
+
+### play/main-next-2 (head 8808b245; `play/main-next` points here too)
+
+| # | Merge or commit | Ingredient @ head | Switch and default | Conflicts |
+|---|-----------------|-------------------|--------------------|-----------|
+| 8 | b0e81df4 | this file | none | n/a |
+| 9 | f86b53a7 | `play/main-dynamic-pool-2` @ 78599326 (a safety fix: a list the title submits again without a reset is never taken back, so its dynamic slots cannot be reused while it runs again; a view heap census line) | `VICTORY_DYNAMIC_SLOTS=<n>`: unset = 2^16 dynamic slots on a capped heap, as before | none |
+| 10 | e61135a7 | `play/main-vram` @ 82c8382b (P-0a: 705d3dc0 and 20d32fb6, host copies of title buffers in video memory under a DXGI budget; its dynamic-pool merge is already in, so it merged as identical) | `VICTORY_VRAM_COPIES=1` (read-only buffers) or `=2` (written too); unset = off | none |
+| 11 | 250703c2 | ours: the order when P-0a and the upload heaps are both on | as 6 and 10 | n/a |
+| 12 | 8808b245 | ours: P-0a's tests run with the upload heaps off (test only) | none | n/a |
+
+- **Both on** (`VICTORY_VRAM_COPIES` set, upload heaps on, the
+  default): a new copy tries P-0a's video memory under its budget first.
+  What that refuses goes to a GPU upload heap: read-only copies with
+  `VICTORY_GPU_UPLOAD`, written ones with a mirror with
+  `VICTORY_GPU_UPLOAD_WRITES`. The rest stays in system memory.
+  `shadow::tries` holds the order, which P-0a's copy path already had,
+  and one line says so in the log. Test:
+  `shadow::tests::copies_try_video_memory_then_upload_heaps_then_system_memory`.
+- **One exe, two arms:** P-0a with `VICTORY_VRAM_COPIES=2
+  VICTORY_GPU_UPLOAD=0 VICTORY_GPU_UPLOAD_WRITES=0`; the upload heaps
+  with all three unset.
+- **Test fix 12:** at 250703c2, with default switches,
+  `shadow::tests::copies_past_the_cap_stay_in_system_memory_and_lose_no_writes`
+  failed ("refused copies are plain system memory copies"): a written
+  copy that video memory refused went to an upload heap with a mirror.
+  `vram::tests::in_child` now runs P-0a's child tests with both upload
+  switches at 0, as in the P-0a arm.
+- **Shader cache:** victory-shader, `shader_cache.rs` and `pipeline/` are
+  unchanged since e5e2e251, so its cache key and cache still apply (not
+  checked in a run).
+
+**Build:** `targets\play-main-next-2` (seeded from `targets\play-main-next`,
+workspace fingerprints cleared; all ten victory crates recompiled), at
+250703c2: `diag\victory-8808b245.exe` (also `victory-250703c2.exe`;
+8808b245 changes only a test), sha256
+`ef210190e2623cca9329c41e9811ab4cd2ad6c7314ffec1ad9bb1eea57d1a87b`.
+
+**Clippy** at 250703c2 (`-D warnings`, victory and victory-gpu, all
+targets): clean without and with `--features diagnostics`.
+
+**Tests** (WARP, victory-gpu `--features diagnostics --lib
+--test-threads=1`):
+
+| Head | Switches | Passed | Failed | Ignored |
+|------|----------|--------|--------|---------|
+| 250703c2 | default | 300 | 1 (above) | 10 |
+| 250703c2 | `VICTORY_GPU_UPLOAD=0`, `_WRITES=0` | 301 | 0 | 10 |
+| 8808b245 | default | 301 | 0 | 10 |
+| 8808b245 | `VICTORY_GPU_UPLOAD=0`, `_WRITES=0` | 301 | 0 | 10 |
+
+The 10 ignored are benchmarks and measurements. Among the passing tests:
+`draw::tests::lists_the_title_runs_again_keep_their_slots` (dynamic-pool-2)
+and P-0a's own tests. victory-shader was not run again: it is unchanged
+since e5e2e251 (288 / 2 known WARP-only / 3 above).
 
 ## Merge notes
 
