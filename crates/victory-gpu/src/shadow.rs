@@ -1434,6 +1434,42 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Where a new copy's GPU side can go ([`tries`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Video memory under the DXGI budget (`VICTORY_VRAM_COPIES`,
+    /// [`crate::vram`]), the system memory buffer the CPU's side.
+    Vram,
+    /// A GPU upload heap, for a copy shaders only read
+    /// (`VICTORY_GPU_UPLOAD`).
+    Upload,
+    /// A GPU upload heap with a mirror in system memory, for a copy shaders
+    /// write (`VICTORY_GPU_UPLOAD_WRITES`).
+    UploadMirrored,
+    /// System memory.
+    System,
+}
+
+/// The places a new copy is tried in, in order, the first that has room
+/// taken: P-0a's video memory first when `VICTORY_VRAM_COPIES` asks for
+/// it (`class`), then a GPU upload heap (`upload`, `writes`: the two
+/// switches with the heaps there), then system memory, which always has
+/// room. With both kinds on, the upload heaps take what the video memory
+/// budget refuses.
+fn tries(class: crate::vram::Class, read_only: bool, upload: bool, writes: bool) -> Vec<Place> {
+    let mut order = Vec::with_capacity(3);
+    if class != crate::vram::Class::System {
+        order.push(Place::Vram);
+    }
+    if read_only && upload {
+        order.push(Place::Upload);
+    } else if !read_only && writes {
+        order.push(Place::UploadMirrored);
+    }
+    order.push(Place::System);
+    order
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
@@ -1461,7 +1497,22 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // if the DXGI budget has room, with the system memory buffer as the
         // CPU's side, always current. Refused, the copy is made as below.
         let class = crate::vram::wanted(entry.read_only);
-        let current = (class != crate::vram::Class::System)
+        let order = tries(
+            class,
+            entry.read_only,
+            host.gpu_upload(),
+            host.gpu_upload_writes(),
+        );
+        if order.len() > 2 {
+            static BOTH: std::sync::Once = std::sync::Once::new();
+            BOTH.call_once(|| {
+                tracing::info!(
+                    "VICTORY_VRAM_COPIES with GPU upload heaps on: copies go to video memory                      under its budget first; those it refuses go to GPU upload heaps                      (VICTORY_GPU_UPLOAD, VICTORY_GPU_UPLOAD_WRITES), then system memory"
+                )
+            });
+        }
+        let current = order
+            .contains(&Place::Vram)
             .then(|| {
                 // Admitted first: a refused copy makes no second buffer.
                 let (video, bar) = crate::vram::make(host, size, class)?;
@@ -1477,7 +1528,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 Some((video, home, home_data, bar))
             })
             .flatten();
-        let upload = (current.is_none() && entry.read_only)
+        let upload = (current.is_none() && order.contains(&Place::Upload))
             .then(|| host.gpu_upload_buffer(size))
             .flatten();
         let in_upload = upload.is_some();
@@ -1496,7 +1547,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             (None, Some(made)) => made,
             (None, None) => {
                 let mirror = host.shared_buffer(size)?;
-                match (!entry.read_only && host.gpu_upload_writes())
+                match order
+                    .contains(&Place::UploadMirrored)
                     .then(|| host.gpu_upload_buffer(size))
                     .flatten()
                 {
@@ -1702,6 +1754,33 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// With `VICTORY_VRAM_COPIES` and the GPU upload heaps both on, a copy
+    /// tries video memory under the budget first, then a GPU upload heap,
+    /// then system memory; with either alone, as before.
+    #[test]
+    fn copies_try_video_memory_then_upload_heaps_then_system_memory() {
+        use super::Place::{System, Upload, UploadMirrored as Mirrored, Vram};
+        use super::tries;
+        use crate::vram::Class::{System as Sys, VramRead as Read, VramWritten as Written};
+        // (class, read_only, upload, writes) -> order.
+        let cases = [
+            ((Read, true, true, true), vec![Vram, Upload, System]),
+            ((Written, false, true, true), vec![Vram, Mirrored, System]),
+            ((Read, true, false, false), vec![Vram, System]),
+            ((Written, false, false, false), vec![Vram, System]),
+            ((Sys, true, true, true), vec![Upload, System]),
+            ((Sys, false, true, true), vec![Mirrored, System]),
+            ((Sys, false, true, false), vec![System]),
+            ((Sys, true, false, false), vec![System]),
+            // VICTORY_VRAM_COPIES=1 leaves written buffers to the rest.
+            ((Sys, false, false, false), vec![System]),
+        ];
+        for ((class, read_only, upload, writes), want) in cases {
+            let what = format!("{class:?} read_only={read_only} upload={upload} writes={writes}");
+            assert_eq!(tries(class, read_only, upload, writes), want, "{what}");
+        }
+    }
+
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
 
