@@ -10691,3 +10691,65 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod bounded_list_memory_tests {
+    use super::*;
+
+    /// A list's upload memory stays bounded over many recordings (our
+    /// 72853aed's test, on this tree's own scratch pool and batched
+    /// clamps): 201 recordings of 50 short batches each, the first one also
+    /// busy (eight 3 MiB pieces of scratch, 5 MiB of its own, an upload),
+    /// every one submitted and reset. After each reset the list holds no
+    /// more than 2 MiB of scratch (none while lists share their chunks),
+    /// the kept chunks stay under the pool's cap, and the batches' places
+    /// stop growing once the busiest recording made them.
+    #[test]
+    fn list_upload_memory_stays_bounded_over_recordings() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((source, _)) = host.shared_buffer(1024) else {
+            return;
+        };
+        let cap = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
+        let mut places = Vec::new();
+        for round in 0..201 {
+            // Short batches: one execution each.
+            for _ in 0..50 {
+                let (mut table, _scratch) =
+                    crate::indirect::open_batch(&list, (1, &source), &[]).expect("the batched clamp is available");
+                assert!(table.place(1, 0, 2).is_some(), "a batch has room for its first job");
+            }
+            list.scratch(4096).unwrap();
+            if round == 0 {
+                for _ in 0..8 {
+                    list.scratch(3 << 20).unwrap();
+                }
+                list.scratch(5 << 20).unwrap();
+                list.upload(host, 1 << 20).unwrap();
+                assert!(list.scratch_kept() >= 24 << 20, "the busy recording holds {} bytes", list.scratch_kept());
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            let kept = list.scratch_kept();
+            assert!(kept <= 2 << 20, "round {round}: the list holds {kept} bytes of scratch after its reset");
+            if scratch_pool() {
+                assert_eq!(kept, 0, "round {round}: shared chunks go back at the reset");
+            }
+            let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+            assert!(spare <= cap, "round {round}: {spare} bytes of chunks kept, past the cap of {cap}");
+            places.push(list.batch_args.lock().unwrap_or_else(|e| e.into_inner()).0.len());
+        }
+        list.close();
+        assert!(
+            places.iter().all(|&n| n == places[0]),
+            "the batches' places grew after the first recording: {:?}",
+            &places[..places.len().min(10)]
+        );
+    }
+}
