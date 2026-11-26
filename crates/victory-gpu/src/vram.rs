@@ -209,11 +209,16 @@ pub(crate) enum Pulled {
     Marked = 1,
     /// Pages written at computed addresses (`crate::memory`).
     Computed = 2,
+    /// Ranges declared unmarked of copies whose mirror stays current,
+    /// before their snapshot (`crate::shadow::snapshots_ahead`): what
+    /// earlier shaders wrote there unmarked and undeclared is in the
+    /// snapshot, as where both sides are one buffer.
+    Snapshot = 3,
 }
 
 /// Bytes brought back by [`Pulled`], before runs of a copy that meet are
 /// joined (diagnostics).
-pub(crate) static PULLED_BY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static PULLED_BY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Bytes of copies in video memory now.
 pub(crate) fn own() -> u64 {
@@ -440,7 +445,7 @@ pub(crate) fn log(frames: f64) {
     let mb = |b: u64| b as f64 / 1e6;
     let [refused, refused_bytes] = [0, 1].map(|i| REFUSED[i].swap(0, Relaxed));
     let [pulled, copies] = [0, 1].map(|i| PULLED[i].swap(0, Relaxed));
-    let by = [0, 1, 2].map(|i| PULLED_BY[i].swap(0, Relaxed));
+    let by = [0, 1, 2, 3].map(|i| PULLED_BY[i].swap(0, Relaxed));
     let (reading, full) = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         (reading(&mut last, false), last.full)
@@ -449,7 +454,7 @@ pub(crate) fn log(frames: f64) {
         "host copies in video memory: {} of read-only buffers ({:.0} MB), {} of written ones ({:.0} MB), {:.0} MB in all \
          (cap now {:.0} MB; card {:.0} of {:.0} MB{}); refused for the budget {refused} ({:.0} MB); \
          shaders' writes brought back {:.2} MB/frame in {:.1} GPU copies/frame \
-         (declared ranges {:.2}, marked pages {:.2}, computed-address pages {:.2} MB/frame); \
+         (declared ranges {:.2}, marked pages {:.2}, computed-address pages {:.2}, before snapshots {:.2} MB/frame); \
          system commit they add: about the MB in all (a GPU upload heap is charged about its size; \
          the system memory sides are the copies made without the switch)",
         LIVE[1].load(Relaxed),
@@ -471,6 +476,7 @@ pub(crate) fn log(frames: f64) {
         mb(by[0]) / frames,
         mb(by[1]) / frames,
         mb(by[2]) / frames,
+        mb(by[3]) / frames,
     );
 }
 
