@@ -31,6 +31,12 @@ It was built in two stages:
   2026-11-26 03:54:30. The seeded exe was play/main's `aa3689e9…`.
   victory-shader, victory-gpu, victory-hle and victory were recompiled
   (victory-shader rlib 03:54:08).
+- At `c2fbf277` (#2629 on top, victory crates cleaned first, and victory-shader,
+  victory-gpu, victory-hle and victory recompiled): `diagictory.exe` (copy
+  `victory-c2fbf277.exe`), sha256
+  `5711e32beda7a33b6ed378d0058c74b1530157fcb6210f60dd4d2b3d6febdb1f`, built
+  04:39:07. This exe adds only the opt-in VICTORY_STALE_CHECK diagnostics over
+  `victory-77093be0.exe`.
 - `cargo clippy --locked -p victory -p victory-gpu -p victory-shader --all-targets
   --features victory/diagnostics,victory-gpu/diagnostics -- -D warnings`: clean at
   `bc0685f8` and at `77093be0`.
@@ -189,6 +195,21 @@ Each failure was run again alone (`--exact`, WARP):
 None of these was run on hardware. play/main's own suite results were never
 recorded (PLAY-MAIN.md: "to follow").
 
+## #2629 stale check (c2fbf277)
+
+fork mem/stale-check bba19981 (upstream #2629, VICTORY_STALE_CHECK,
+diagnostics builds only, off unless set) is taken as a **cherry-pick**, not a
+merge. Its base, upstream f3578e38, is 24 commits past this line's 781e846d,
+and a merge would bring those in. It needs none of them: on 781e846d it
+builds, clippy is clean, and its WARP tests pass (`stale`: 2 passed;
+`shadow::`: 23 passed). One conflict, in shadow.rs: #2130's test helper of the
+same name is renamed `mirror_stale_pages`.
+
+Two of those 24 upstream commits are main's own versions of fixes this line
+has: #2455 (a page whose alias cannot be guarded stays changed) and #2239
+(save a page's old bytes before any guard is opened). Both match bc0685f8's
+port of #2136's f85763e0. They come in with the next retarget.
+
 ## Not in this branch yet
 
 The follow-up PRs for main's new code are not merged yet:
@@ -198,7 +219,6 @@ The follow-up PRs for main's new code are not merged yet:
 - #2639, #2612;
 - the texture worker pool #2786;
 - extras: #2634, Belobug ff920f22;
-- the #2629 stale-check merge.
 
 Their review findings, as read for this branch:
 - #2601: the pin race is fixed in its head 883db7ad.
