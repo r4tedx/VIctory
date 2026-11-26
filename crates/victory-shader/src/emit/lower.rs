@@ -353,6 +353,7 @@ struct Lower<'a> {
     /// console wave's own way (into the region, on) and its vote (that,
     /// where it runs the block for itself).
     group_votes: HashMap<usize, (V, V)>,
+    gs: groups::State,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -823,7 +824,7 @@ impl<'a> Lower<'a> {
                             .filter(|(_, i)| matches!(i, Input::GroupId(_)))
                             .map(|&(v, _)| v),
                     );
-                    groups::plan(p, &same, n, cs.lds_bytes())
+                    groups::plan(p, &same, cs.threads, cs.lds_bytes(), &x.io.inputs)
                 });
                 no_console_flow = if group_waves == 1 && n > 64 && !matches!(many, Some(Ok(_))) {
                     Some(match &many {
@@ -1018,6 +1019,7 @@ impl<'a> Lower<'a> {
             groups: group_plan,
             here: vec![None; p.blocks.len()],
             group_votes: HashMap::new(),
+            gs: Default::default(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1761,20 +1763,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
-            // A group of several console waves: a block a branch's vote
-            // goes into holds for the waves that voted; any other block as
-            // its dominator does.
-            if self.console_cf
-                && let Some(g) = &self.groups
-            {
-                self.here[b] = match g.entered_from.get(&b) {
-                    Some(x) => self.group_votes.get(x).map(|v| v.1),
-                    None => match g.idom[b] {
-                        d if d == b || d == usize::MAX => None,
-                        d => self.here[d],
-                    },
-                };
-            }
+            self.group_enter(b);
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -1824,6 +1813,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            self.group_leave(b);
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -2086,6 +2076,9 @@ impl<'a> Lower<'a> {
 
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
+        if let Some(x) = self.group_value(v)? {
+            return Ok(x);
+        }
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
@@ -2976,6 +2969,9 @@ impl<'a> Lower<'a> {
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
+        if let Atom::Lane(v) | Atom::Opaque(v) | Atom::Phi(v) = atom {
+            self.group_mask(v)?;
+        }
         match atom {
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
@@ -7073,6 +7069,7 @@ impl<'a> Lower<'a> {
                 let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
                 let first = self.s.m.select(c, some_lo, flo, fhi);
                 let r = self.console_read_lane(a, first);
+                let r = self.group_first(inst, r);
                 int(self, r)
             }
             "v_readfirstlane_b32" => {
@@ -10446,25 +10443,7 @@ impl<'a> Lower<'a> {
                 taken, not_taken, ..
             } if self.console_cf => {
                 let cond = self.console_branch(b).map_err(|w| unsupported(offset, w))?;
-                let form = self
-                    .groups
-                    .as_ref()
-                    .and_then(|g| g.branches.get(&b))
-                    .copied();
-                match form {
-                    // The group's vote: in if some wave goes in, on if some
-                    // wave goes on ([`groups`]).
-                    Some(groups::Branch::Skip { region, join }) => {
-                        let g = self.group_vote(b, cond, region == taken);
-                        self.branch_term(b, g, region, join)
-                    }
-                    Some(groups::Branch::Exit { go_on }) => {
-                        let end = if go_on == taken { not_taken } else { taken };
-                        let g = self.group_vote(b, cond, go_on == taken);
-                        self.branch_term(b, g, go_on, end)
-                    }
-                    _ => self.branch_term(b, cond, taken, not_taken),
-                }
+                self.group_branch(b, cond, taken, not_taken)
             }
             LaneExit::Branch {
                 when,
@@ -10741,11 +10720,12 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+        self.group_edge(from, to, via, false);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -10762,6 +10742,7 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
+        self.group_edge(self.cur_ir, to, c, true);
         self.s.m.cmp(c, p, next, limit)
     }
 
@@ -11186,12 +11167,16 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             let bypass: Vec<Option<V>> = incoming.iter().map(|x| Some(x.0)).collect();
-            let incoming = self.group_fix(b, &from, &bypass, incoming);
+            let used = (0..phi.args.len()).any(|n| live.contains(&(phi.value, n)));
+            let incoming = self
+                .group_fix((b, i), false, used, &from, &bypass, incoming)
+                .map_err(|w| unsupported(p.blocks[b].offset, w))?;
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        self.group_phis();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -11244,7 +11229,9 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
-            let incoming = self.group_fix(b, &from, &bypass, incoming);
+            let incoming = self
+                .group_fix((b, i), true, true, &from, &bypass, incoming)
+                .map_err(|w| unsupported(offset, w))?;
             self.s.m.set_phi(v, incoming);
         }
         Ok(())

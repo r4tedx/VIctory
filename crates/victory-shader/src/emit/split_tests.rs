@@ -1678,7 +1678,9 @@ fn groups_sharing_lds_stop_where_waves_part() {
         0x87FE_6A7E, // s_and_b64 exec, exec, vcc
         0xBF89_FFFC, // s_cbranch_execnz loop
     ];
-    assert_eq!(why(&lane_loop), super::lower::groups::LOOP_LEFT_APART);
+    // A loop the waves leave apart, with EXEC left as the loop left it:
+    // the lanes after it are the loop's.
+    assert_eq!(why(&lane_loop), super::lower::groups::MASK_OUT_OF_LOOP);
     let barrier_inside = [
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
@@ -1730,6 +1732,251 @@ fn groups_sharing_lds_match_the_console_on_every_adapter() {
         "a region by each wave's own count",
         &program_lds_of(OWN_COUNT_REGION, 128, 1),
         |t| if t < 64 { 7 } else { 20 },
+        true,
+    );
+}
+
+// ---- groups whose console waves part (`lower::groups`) ----
+
+/// After a body leaving lane t's result in v2: each lane writes it to its
+/// dword, and after an `s_barrier` reads the dword of lane t ^ 64 (the
+/// other console wave) into v2.
+const SWAP_WAVES: &[u32] = &[
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0xD834_0000,
+    0x0000_0204, // ds_write_b32 v4, v2
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x3A0A_00C0, // v_xor_b32 v5, 64, v0
+    0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+    0xD8D8_0000,
+    0x0200_0005, // ds_read_b32 v2, v5
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+fn then_swap(body: &[u32]) -> Vec<u32> {
+    let mut w = body.to_vec();
+    w.extend_from_slice(SWAP_WAVES);
+    w
+}
+
+/// `body` after a lane read (`v_readlane_b32 s9, v0, 40`): a program the
+/// per-lane form cannot run, so it takes the console flow.
+fn console(body: &[u32]) -> Vec<u32> {
+    let mut w = vec![
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+    ];
+    w.extend_from_slice(body);
+    w
+}
+
+/// Each lane counts up to its thread id (at least 1): the first console
+/// wave leaves the loop after 63 iterations, the second after 127. EXEC
+/// is restored after it.
+const LANE_COUNT: &[u32] = &[
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    0x4A04_0481, // loop: v_add_nc_u32 v2, 1, v2
+    0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF89_FFFC, // s_cbranch_execnz loop
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+];
+
+/// The same count two steps an iteration, an exit after each: a wave
+/// leaves by the one its last lane's parity says.
+const LANE_COUNT_TWO_EXITS: &[u32] = &[
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    0x4A04_0481, // loop: v_add_nc_u32 v2, 1, v2
+    0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF88_0004, // s_cbranch_execz out
+    0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+    0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF89_FFF8, // s_cbranch_execnz loop
+    0xBEFE_040A, // out: s_mov_b64 exec, s[10:11]
+];
+
+/// A lane count inside an outer lane loop, its count used after it in
+/// the outer loop: the waves leave the inner loop apart on every outer
+/// iteration. Lane t ends with its count, at least 1.
+const NESTED_LANE_COUNT: &[u32] = &[
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    0x7E0A_0280, // outer: v_mov_b32 v5, 0
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    0x4A0A_0A81, // inner: v_add_nc_u32 v5, 1, v5
+    0x7D82_0105, // v_cmp_lt_u32 vcc, v5, v0
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF89_FFFC, // s_cbranch_execnz inner
+    0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    0x4A04_0B02, // v_add_nc_u32 v2, v2, v5
+    0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF89_FFF5, // s_cbranch_execnz outer
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+];
+
+/// Only the first console wave's lanes (below 64) go into a region that
+/// holds a branch with code on both sides: lanes below 20 get 2, the
+/// others of the wave 3; the second wave keeps 7.
+const FIRST_WAVE_BOTH_SIDES: &[u32] = &[
+    0x7E04_0287, // v_mov_b32 v2, 7
+    0xBE8A_047E, // s_mov_b64 s[10:11], exec
+    0x7DA8_00C0, // v_cmpx_gt_u32 exec, 64, v0
+    0xBF88_0007, // s_cbranch_execz after
+    0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+    0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+    0xBF86_0002, // s_cbranch_vccz else
+    0x7E04_0281, // v_mov_b32 v2, 1
+    0xBF82_0001, // s_branch end
+    0x7E04_0282, // else: v_mov_b32 v2, 2
+    0x4A04_0481, // end: v_add_nc_u32 v2, 1, v2
+    0xBEFE_040A, // after: s_mov_b64 exec, s[10:11]
+];
+
+/// [`early_end`] with the end taken on a count (`s_bcnt1`, SCC) rather
+/// than an empty EXEC: the second wave's EXEC is full when it ends.
+fn early_end_on_a_count() -> Vec<u32> {
+    let mut w = early_end();
+    w[1] = 0xBE89_106A; // s_bcnt1_i32_b64 s9, vcc
+    w[2] = 0xBF84_0000 | (w[2] & 0xFFFF); // s_cbranch_scc0 s_endpgm
+    w
+}
+
+/// Thread 0 clears dword 0; the loop's count is a first-lane read of one
+/// dword past the output (0: out of bounds) plus 2; each iteration every
+/// lane adds 1 to dword 0 and meets the others at an `s_barrier`; after
+/// it every lane reads the total, twice the group's threads.
+const COUNT_FROM_ONE_DWORD: &[u32] = &[
+    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    0xD834_0000,
+    0x0000_0707, // ds_write_b32 v7, v7
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0xE030_0FFC,
+    0x8001_0100, // buffer_load_dword v1, off, s[4:7], 0 offset:4092
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E12_0501, // v_readfirstlane_b32 s9, v1
+    0x8109_8209, // s_add_i32 s9, s9, 2
+    0xBE8A_0380, // s_mov_b32 s10, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x7E10_0281, // loop: v_mov_b32 v8, 1
+    0xD800_0000,
+    0x0000_0807, // ds_add_u32 v7, v8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x810A_810A, // s_add_i32 s10, s10, 1
+    0xBF04_090A, // s_cmp_lt_i32 s10, s9
+    0xBF85_FFF8, // s_cbranch_scc1 loop
+    0xD8D8_0000,
+    0x0200_0007, // ds_read_b32 v2, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// Groups whose console waves leave a loop at different iterations (by
+/// one exit or two), take a branch with code on both sides in a region
+/// only one wave goes into, end on a count, or count a loop with a
+/// barrier by a dword all read, emit for a 32-lane host as one host group,
+/// valid. LDS up to 32 KiB less the exchange's 4 bytes per host wave fits.
+#[test]
+fn groups_whose_waves_part_emit_as_one_host_group() {
+    for (label, body) in [
+        ("lane count", then_swap(LANE_COUNT)),
+        ("lane count, two exits", then_swap(LANE_COUNT_TWO_EXITS)),
+        ("nested lane counts", then_swap(NESTED_LANE_COUNT)),
+        ("first wave, both sides", FIRST_WAVE_BOTH_SIDES.to_vec()),
+        ("end on a count", early_end_on_a_count()),
+        ("count from one dword", COUNT_FROM_ONE_DWORD.to_vec()),
+    ] {
+        one_host_group(&program_lds_of(&console(&body), 128, 1), label);
+    }
+    one_host_group(
+        &program_lds_of(&console(&then_swap(LANE_COUNT)), 256, 2),
+        "lane count, 256",
+    );
+    // 32,256 bytes of the title's and 16 of the exchange.
+    one_host_group(&program_lds_of(LDS_ACROSS_WAVES, 128, 63), "LDS 63 granules");
+}
+
+/// What such groups cannot run as one control flow stops with its reason:
+/// an `s_barrier` in a loop the waves leave apart, LDS with no room for
+/// the exchange.
+#[test]
+fn groups_whose_waves_part_stop_where_they_cannot() {
+    let why = |p: &crate::NativeProgram| match emit_for(p, NVIDIA) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what,
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("emitted"),
+    };
+    let mut barrier_inside = LANE_COUNT.to_vec();
+    barrier_inside.insert(5, 0xBF8A_0000); // s_barrier
+    barrier_inside[6] = 0xBF89_FFFB; // s_cbranch_execnz loop
+    assert_eq!(
+        why(&program_lds_of(&console(&barrier_inside), 128, 1)),
+        super::lower::groups::BARRIER_IN_LOOP
+    );
+    assert_eq!(
+        why(&program_lds_of(LDS_ACROSS_WAVES, 128, 64)),
+        super::lower::groups::NO_LDS_ROOM
+    );
+}
+
+/// The same programs dispatched on every 32-lane hardware adapter (none
+/// under `VICTORY_WARP=1`), two console groups each, checked lane by lane
+/// against the console.
+#[test]
+fn groups_whose_waves_part_match_the_console_on_every_adapter() {
+    let count = |t: u32| (t ^ 64).max(1);
+    program_case(
+        "a loop the waves leave apart",
+        &program_lds_of(&console(&then_swap(LANE_COUNT)), 128, 1),
+        count,
+        true,
+    );
+    program_case(
+        "a loop the waves leave apart, 256 threads",
+        &program_lds_of(&console(&then_swap(LANE_COUNT)), 256, 2),
+        count,
+        true,
+    );
+    program_case(
+        "a loop the waves leave apart by two exits",
+        &program_lds_of(&console(&then_swap(LANE_COUNT_TWO_EXITS)), 128, 1),
+        count,
+        true,
+    );
+    program_case(
+        "nested loops the waves leave apart",
+        &program_lds_of(&console(&then_swap(NESTED_LANE_COUNT)), 128, 1),
+        count,
+        true,
+    );
+    program_case(
+        "both sides in the first wave's region",
+        &program_lds_of(&console(FIRST_WAVE_BOTH_SIDES), 128, 1),
+        |t| match t {
+            0..20 => 2,
+            20..64 => 3,
+            _ => 7,
+        },
+        true,
+    );
+    program_case(
+        "waves that end on a count",
+        &program_lds_of(&early_end_on_a_count(), 128, 1),
+        |t| if t < 64 { (t ^ 32) + 1 + 40 } else { 0 },
+        true,
+    );
+    program_case(
+        "a loop counted by one dword, a barrier in it",
+        &program_lds_of(&console(COUNT_FROM_ONE_DWORD), 128, 1),
+        |_| 2 * 128,
         true,
     );
 }
