@@ -4648,20 +4648,37 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
-            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            // A uniform byte address still uses the table's structured view.
+            // Split each dword separately since a load may span two elements.
+            let stride = kind
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                .map(|u| u.stride)
+                .filter(|&stride| stride >= 4 && stride.is_multiple_of(4));
+            let (h, addr) = match stride {
+                Some(stride) => (self.handle(site, src, false, (12, stride))?, addr),
+                None => self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?,
+            };
             let c = self.cur;
+            let stride = stride.map(|stride| self.s.m.i32(stride));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let (index, offset) = match stride {
+                    Some(stride) => (
+                        self.s.m.bin(c, Bin::UDiv, a, stride),
+                        self.s.m.bin(c, Bin::URem, a, stride),
+                    ),
+                    None => (a, u),
+                };
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, offset, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);

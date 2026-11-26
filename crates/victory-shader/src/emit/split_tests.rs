@@ -98,6 +98,66 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
 }
 
 #[test]
+fn scalar_buffer_load_crosses_structured_elements() {
+    use super::host::Stride;
+    use crate::native::{ResourceType, UsedResource};
+
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware D3D12 device; skipped");
+        return;
+    };
+    let mut native = program(
+        &[
+            0xF408_0301,
+            0xFA00_0020, // load table slot 1 into s[12:15]
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF428_0406,
+            0xFA00_0008, // load four dwords starting at byte 8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_0211, // v_mov_b32 v2, s17 (the second element's first dword)
+        ],
+        64,
+    );
+    native.layout.push(RootParam {
+        table_offset_dwords: 8,
+        base_register: 1,
+        ..native.layout[0]
+    });
+    native.used.push(UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 8,
+        lower_bound: 1,
+        stride: 12,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    });
+    let cs = emit_for(&native, host.target()).expect("emit scalar structured load");
+    let (root, pso) = host.compute_pipeline(&cs).expect("create compute PSO");
+    let words = [10, 20, 30, 40, 50, 60];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; cs.user_data_dwords() as usize]))],
+                views: &[
+                    View::RawUav(64),
+                    View::Buffer {
+                        data: &words,
+                        stride: Stride::Structured(12),
+                    },
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch and readback");
+    assert_eq!(out, [vec![words[3]; 64]]);
+}
+
+#[test]
 fn in_half_lane_reads_match_the_console_on_every_adapter() {
     let Ok(names) = adapters() else {
         eprintln!("no DXGI; skipped");
