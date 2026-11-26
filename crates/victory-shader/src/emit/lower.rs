@@ -692,10 +692,11 @@ fn lane_uniform(
                     continue;
                 }
                 // Implicit VGPR inputs include accumulators and the other side of a swap.
-                let implicit_alike = inst
-                    .reads
-                    .iter()
-                    .all(|(reg, value)| !matches!(reg, Reg::V(_)) || known(&next, value));
+                let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
+                    || inst
+                        .reads
+                        .iter()
+                        .all(|(reg, value)| !matches!(reg, Reg::V(_)) || known(&next, value));
                 let mask_alike = name != "v_cndmask_b32"
                     || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
                         if inst.read(Reg::S(*code))
