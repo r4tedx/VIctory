@@ -796,6 +796,8 @@ fn memory_at(address: usize) -> String {
     };
     // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualQuery.record(0);
     // SAFETY: reads the address space's bookkeeping, not `address` itself.
     let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
     if n == 0 {

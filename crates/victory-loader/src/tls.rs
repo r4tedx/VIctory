@@ -51,6 +51,8 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualProtect.record(len);
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
             bail!(
@@ -61,6 +63,8 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         // SAFETY: writable now, and no title code runs yet.
         let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
         patched += patch(code, start, thunks);
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualProtect.record(len);
         // SAFETY: restoring the protection we changed; flushing our own code.
         unsafe {
             VirtualProtect(start as _, len, old, &mut old);
@@ -128,6 +132,8 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
         };
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualProtect.record(4096);
     // SAFETY: `block` is our allocation of one page.
     if unsafe { VirtualProtect(block as _, 4096, PAGE_EXECUTE_READ, &mut old) } == 0 {
         bail!(

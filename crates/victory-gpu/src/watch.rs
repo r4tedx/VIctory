@@ -319,15 +319,21 @@ fn runtime_memory(at: usize, views: bool) -> bool {
     };
     let page = at & !(4096 - 1);
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: room for one answer; no reset, so nothing changes.
     let watched = unsafe {
         GetWriteWatch(0, page as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity)
     } == 0;
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::GetWriteWatch.record_timed(4096, started);
     if watched || !views {
         return watched;
     }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualQuery.record(0);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State != MEM_FREE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
@@ -368,6 +374,8 @@ fn open(g: &mut Guards, page: usize) -> bool {
         return false;
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualProtect.record(PAGE);
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     #[cfg(feature = "diagnostics")]
@@ -511,12 +519,16 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualProtect.record((to - from) * PAGE);
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
     let unmapped = |page: usize| {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualQuery.record(0);
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
         n == 0 || info.State != MEM_COMMIT
@@ -829,9 +841,16 @@ fn install() {
         let page = at & !(4096 - 1);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // Atomics only: no locks in an exception handler.
+        #[cfg(feature = "diagnostics")]
+        victory_core::memory_syscalls::Call::VirtualQuery.record(0);
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        if n != 0 {
+            victory_core::memory_syscalls::Call::VirtualProtect.record(4096);
+        }
         // SAFETY: the page the store touched, given back its guard bit
         // with the protection it has now (its own, less that bit).
         if n != 0 && unsafe { VirtualProtect(page as *const _, 4096, info.Protect | PAGE_GUARD, &mut old) } == 0 {
@@ -858,6 +877,8 @@ fn writable(at: usize) -> bool {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::VirtualQuery.record(0);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE

@@ -290,6 +290,8 @@ impl LoadedImage {
         for &(rva, address) in slots {
             let slot = (self.base() + rva as usize) as *mut u64;
             let mut old = 0;
+            #[cfg(feature = "diagnostics")]
+            victory_core::memory_syscalls::Call::VirtualProtect.record(8);
             // SAFETY: the parser only yields slots inside the image.
             if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
                 bail!(
@@ -300,6 +302,8 @@ impl LoadedImage {
             // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
             unsafe { slot.write_volatile(address as u64) };
             let mut ignored = 0;
+            #[cfg(feature = "diagnostics")]
+            victory_core::memory_syscalls::Call::VirtualProtect.record(8);
             // SAFETY: restoring the protection we just changed.
             unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
         }

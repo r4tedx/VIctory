@@ -2858,10 +2858,15 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let copied = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    #[cfg(feature = "diagnostics")]
+    victory_core::memory_syscalls::Call::ReadProcessMemory.record_timed(done, started);
+    copied != 0
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -3267,6 +3272,8 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        #[cfg(feature = "diagnostics")]
+        let syscalls = victory_core::memory_syscalls::take(frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -3284,6 +3291,8 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         // Over the same frames too.
         let (table_bytes, table_copies) = crate::tables::take_copied();
+        #[cfg(feature = "diagnostics")]
+        tracing::info!("memory syscalls per frame ({frames:.0} frames): {syscalls}");
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(

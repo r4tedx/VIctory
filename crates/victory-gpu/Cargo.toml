@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+victory-core = { workspace = true, optional = true }
 blake3.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
@@ -22,7 +23,7 @@ victory-shader = { workspace = true, features = ["host"] }
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
-diagnostics = []
+diagnostics = ["dep:victory-core", "victory-core/diagnostics"]
 
 [lints]
 workspace = true
