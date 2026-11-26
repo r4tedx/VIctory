@@ -175,13 +175,29 @@ Each failure was run again alone (`--exact`, WARP):
   free - 1. a6cd2b68 takes dynamic slots in runs of 256, so the test's
   one-slot count does not hold on this line.
 - `query_resolves_after_unordered_access_to_destination`: "the UAV dispatch
-  wrote its draw arguments" is not seen. This is #159's test. Its
-  indirect-argument setup assumed the in-place clamp; it was adapted to main's
-  clamp for this branch, and the adaptation is still wrong.
-- `placed_uav_textures_create_real_host_uavs`: "srv case 0": a placed SRV slot
-  is not kept after `mirror(.., true)`. This is main's #1273 test. **Open**:
-  not yet traced. It may be a real difference between this line's view-heap
-  code and main's for placed views.
+  wrote its draw arguments" is not seen. This is #159's test, and only the
+  test is wrong. Main's clamp (315cea18) reads the title's records through a
+  root view and writes the clamped ones into the list's own argument buffer.
+  The title's copy is never written or transitioned, so the destination is
+  never left in unordered access, and word 0 stays as the title wrote it.
+  **Fixed in the test** on top of 794ebdde: renamed
+  `query_resolves_after_a_clamp_reads_destination`, it checks that the title's
+  records stay as written and that the resolve lands. It matches the
+  author-branch fix gpu/host-queries ba872ae2, using this line's `bound()`
+  arguments.
+- `placed_uav_textures_create_real_host_uavs`: "srv case 0" (kept: true,
+  expected false). The placed SRV slot now gets a real host view where main's
+  test expects the null fallback. Cause: #2294 (96f6894e, `fits` in
+  descriptor/host.rs, `DEPTH_READABLE`). It makes a typed depth format in a
+  shader resource view in its readable colour format: D32_FLOAT becomes
+  R32_FLOAT, and D16_UNORM becomes R16_UNORM. Those are valid host views of an
+  R32_TYPELESS or R16_TYPELESS texture, and the debug layer logs nothing (the
+  test checks the log is empty). Main does not have #2294, so main's #1273
+  test still expects null for SRV cases 0 and 1. The unordered-access cases
+  stay null, because `fits` makes the depth change for shader resource views
+  only. **Fixed in the test**: SRV cases 0 and 1 now expect a real view. This
+  is not a placed-view bug: no placed view loses its host descriptor.
+
 - victory-shader `a_mask_joined_with_data_needs_a_uniform_join` and
   `a_scalar_result_needs_no_exec`: lower() returns the wave64 stack's
   "a wave64 program whose halves exchange lanes (console flow)" retry. These

@@ -2990,8 +2990,10 @@ mod tests {
             );
         }
         for (offset, (res_fmt, view_fmt, expect_real)) in [
-            (39u32, 40u32, false), // R32_TYPELESS + D32_FLOAT SRV -> null fallback
-            (53u32, 55u32, false), // R16_TYPELESS + D16_UNORM SRV -> null fallback
+            // A typed depth format in a shader resource view is made in its
+            // readable colour format (`DEPTH_READABLE` in `fits`, #2294).
+            (39u32, 40u32, true), // R32_TYPELESS + D32_FLOAT SRV -> R32_FLOAT
+            (53u32, 55u32, true), // R16_TYPELESS + D16_UNORM SRV -> R16_UNORM
             (29u32, 0u32, true),   // R8G8B8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 29
             (91u32, 0u32, true),   // B8G8R8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 91
         ]

@@ -552,13 +552,15 @@ mod tests {
         }
     }
 
-    /// The indirect clamp writes the destination's host copy as a UAV and
-    /// leaves it in unordered access before the query resolve is recorded.
+    /// The indirect clamp reads the destination's host copy through a root
+    /// view in the same list before the query resolve is recorded; it
+    /// writes the clamped records into the list's own argument buffer
+    /// (315cea18) and leaves the title's copy as written.
     #[cfg(windows)]
     #[test]
-    fn query_resolves_after_unordered_access_to_destination() {
+    fn query_resolves_after_a_clamp_reads_destination() {
         let Some(host) = crate::host::host() else {
-            eprintln!("skipped query_resolves_after_unordered_access_to_destination: no host GPU");
+            eprintln!("skipped query_resolves_after_a_clamp_reads_destination: no host GPU");
             return;
         };
         let triangle = Triangle::new();
@@ -570,8 +572,9 @@ mod tests {
         let host_list = crate::list::host_list(list).unwrap();
         shadow.refresh(host_list, address, 64);
         shadow.gpu_writes(host_list, address, 16, false);
-        let clamped = crate::indirect::bound(host_list, (&shadow.buffer, shadow.gpu(address)), None, (0, 16, 1));
-        crate::indirect::done(host_list, &clamped.expect("clamped"));
+        let clamped = crate::indirect::bound(host_list, (&shadow.buffer, shadow.gpu(address)), None, (0, 16, 1))
+            .expect("the clamp ran");
+        crate::indirect::done(host_list, &clamped);
 
         slot::<Mark>(list, BEGIN)(list, occlusion, OCCLUSION, 0);
         triangle.draw(list, true);
@@ -579,7 +582,7 @@ mod tests {
         slot::<Resolve>(list, RESOLVE)(list, occlusion, OCCLUSION, 0, 1, buffer, 32);
         run(queue, list);
 
-        assert_ne!(read(data, 0), 0xeeee_eeee_eeee_eeee, "the UAV dispatch wrote its draw arguments");
+        assert_eq!(read(data, 0), 0xeeee_eeee_eeee_eeee, "the clamp leaves the title's records as written");
         let measured = read(data, 4);
         assert_eq!(measured, u64::from(Triangle::SIZE * Triangle::SIZE));
         assert_eq!(shadow.read_host(address + 32, 2), [0xeeee_eeee; 2]);
