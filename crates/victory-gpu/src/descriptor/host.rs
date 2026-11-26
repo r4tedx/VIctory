@@ -519,10 +519,18 @@ impl Slots {
             freed = true;
         }
         if freed {
-            // The free run the slots joined, which may be the longest now.
-            let left = self.taken[..first].iter().rev().take_while(|t| !**t).count();
-            let right = self.taken[end..].iter().take_while(|t| !**t).count();
-            self.longest = self.longest.max(left + (end - first) + right);
+            // The free run the slots joined, which may be the longest now:
+            // counted up to `SCAN` slots on each side, past which the bound
+            // is dropped (every free run may be as long as the pool) rather
+            // than walk a long free run at every release (a list's reset).
+            const SCAN: usize = 4096;
+            let left = self.taken[..first].iter().rev().take(SCAN).take_while(|t| !**t).count();
+            let right = self.taken[end..].iter().take(SCAN).take_while(|t| !**t).count();
+            self.longest = if left == SCAN || right == SCAN {
+                self.taken.len()
+            } else {
+                self.longest.max(left + (end - first) + right)
+            };
         }
     }
 }
@@ -2304,6 +2312,19 @@ mod tests {
         bands.add(u32::MAX, 1);
         assert_eq!(bands.take_text(), "0k: 2, 896k: 1, 1984k: 1");
         assert_eq!(bands.take_text(), "none");
+    }
+
+    /// A release next to a long free run does not walk it: the bound on the
+    /// longest free run is dropped, and a long run is found again.
+    #[test]
+    fn a_release_beside_a_long_free_run_drops_the_bound() {
+        let mut slots = Slots::new(10_000);
+        assert_eq!(slots.take(8, 8), Some((0, 8)));
+        assert_eq!(slots.take(10_000, 9_000), Some((8, 9_992)));
+        slots.release(8, 9_992);
+        slots.release(0, 8);
+        assert_eq!(slots.longest, 10_000, "no bound kept");
+        assert_eq!(slots.take(10_000, 10_000), Some((0, 10_000)));
     }
 
     /// Slots given back are free again, counted once however often.
