@@ -350,7 +350,9 @@ pub(crate) fn figures() -> Figures {
     let [d3d_video, d3d_system] = d3d();
     let (title_regions, title_reserved, title_committed) = reservations();
     let (textures, texture_bytes, ..) = crate::resource::texture_counts();
-    let (staging, staging_bytes, ..) = crate::texture::staging_counts();
+    // Main 13f91ca pools texture staging in shared upload buffers (fdf34ab7,
+    // 8a3d9759): counted under upload, none apart.
+    let (staging, staging_bytes) = (0u64, 0u64);
     Figures {
         private,
         working_set,

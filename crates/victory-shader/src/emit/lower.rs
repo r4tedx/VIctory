@@ -186,9 +186,9 @@ pub(super) fn synthetic_mark_dxil(view_mark: bool, bytes: u32, in_branch: bool) 
     let p = crate::ir::build(&native.code, false, 1).expect("ir");
     let st = crate::structure::structure(&p).expect("st");
     let (res, io) = (crate::resource::track(&p, &[], HwStage::Cs, Some(&st)).expect("res"), crate::io::raise(&p, &native).expect("io"));
-    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: view_mark };
+    let parts = Parts { native: &native, p: &p, st: &st, io: &io, res: &res, inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, target: super::Target::ANY, console_cf: false, per_lane_only: false, view_marks: view_mark };
     let bad = HashMap::new();
-    let mut l = Lower::new(&parts, &bad);
+    let mut l = Lower::new(&parts, &bad, false);
     l.cur = l.s.entry;
     let (z, iu) = (l.s.m.i32(0), l.s.m.undef(l.s.t.i32));
     let at = in_branch.then(|| {
@@ -11618,7 +11618,9 @@ impl<'a> Lower<'a> {
                 let other = self.console_cf.then(|| self.x.st.other.get(&arg)).flatten();
                 let x = match (self.x.st.masks.get(&arg).or(other), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                    (None, Some(&Val::I32(word))) if number => {
+                        self.lane_bit(qb, word, None).map_err(|w| unsupported(offset, w))?
+                    }
                     // Not in the console flow: a lane goes along edges its
                     // own conditions do not hold on there.
                     (None, _)

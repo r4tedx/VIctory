@@ -2650,7 +2650,7 @@ mod tests {
                     },
                 };
                 let src_loc = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(host_tex),
+                    pResource: std::mem::transmute_copy(&host_tex),
                     Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         SubresourceIndex: 0,

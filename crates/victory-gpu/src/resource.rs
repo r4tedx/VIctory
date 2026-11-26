@@ -2726,9 +2726,9 @@ mod tests {
             flags: RENDER_TARGET,
             ..desc
         };
-        let target = make_texture(&target, 0, std::ptr::null()).expect("a render target");
+        let target = make_texture(&target, 0, std::ptr::null(), false).expect("a render target");
         assert_eq!(kept(&target.texture), Some(Residency::Frame));
-        let streamed = make_texture(&desc, 0, std::ptr::null()).expect("a texture");
+        let streamed = make_texture(&desc, 0, std::ptr::null(), false).expect("a texture");
         // Placed in a heap of textures, it takes the heap's priority.
         let want = if streamed.placement.is_some() { None } else { Some(Residency::Streamed) };
         assert_eq!(kept(&streamed.texture), want);
@@ -3414,7 +3414,7 @@ mod tests {
         let uav_bit = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32;
         if format_support1(86).is_some_and(|s| s & uav_bit == 0) {
             assert_eq!(d.flags & UNORDERED, 0);
-            assert!(make_texture(&d, 0, std::ptr::null()).is_some());
+            assert!(make_texture(&d, 0, std::ptr::null(), false).is_some());
         }
 
         let b4g4r4a4_rt = ResourceDesc {
@@ -3426,7 +3426,7 @@ mod tests {
         let rt_bit = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32;
         if format_support1(115).is_some_and(|s| s & rt_bit == 0) {
             assert_eq!(d.flags & 1, 0);
-            assert!(make_texture(&d, 0, std::ptr::null()).is_some());
+            assert!(make_texture(&d, 0, std::ptr::null(), false).is_some());
         }
     }
 }

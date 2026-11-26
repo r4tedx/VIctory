@@ -79,7 +79,7 @@ fn pixel(dword: u32, signature: &[u8]) -> HostShader {
     let res =
         victory_shader::resource::track(&ir, &native.layout, native.stage, Some(&st)).unwrap();
     let io = victory_shader::io::raise(&ir, &native).unwrap();
-    let host = victory_shader::emit::emit(&sig, &native, &ir, &st, &io, &res).unwrap();
+    let host = victory_shader::emit::emit(&sig, &native, &ir, &st, &io, &res, victory_shader::emit::Target::ANY).unwrap();
     assert_eq!(
         host.user_data,
         [UserData {
@@ -121,6 +121,7 @@ fn pipeline(dword: u32, fixtures: &Fixtures) -> crate::object::This {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        group_waves: 1,
     };
     let mut graphics = GraphicsState {
         topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -135,6 +136,7 @@ fn pipeline(dword: u32, fixtures: &Fixtures) -> crate::object::This {
         super::super::hand_out(
             vec![stage("vertex", vs), stage("pixel", ps)],
             Some(Box::new(graphics)),
+            &[],
             &super::super::PIPELINE_IIDS[0],
             &mut out
         ),
@@ -197,7 +199,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
         MaxDepth: 1.,
         ..Default::default()
     };
-    crate::draw::viewports(&list, &[viewport]);
+    state.viewports(&list, &[viewport]);
     // SAFETY: an open list and a live target, held through the synchronous submission.
     unsafe {
         list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -210,7 +212,7 @@ fn pattern(dword: u32, fixtures: &Fixtures) -> bool {
     for (left, right, value) in [(0, 8, 1f32), (8, 16, 0f32)] {
         constants[dword as usize] = value.to_bits();
         state.set_constants(false, 0, &constants, 0);
-        crate::draw::scissors(
+        state.scissors(
             &list,
             &[RECT {
                 left,

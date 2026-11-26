@@ -726,7 +726,7 @@ pub(crate) mod tests {
         let list = host.new_list().unwrap();
         list.scratch(1).unwrap();
         let s = list.scratch.lock().unwrap();
-        assert_eq!(kept(&s.chunks[0]._buffer), Some(Residency::Frame));
+        assert_eq!(kept(&s.chunks[0].buffer), Some(Residency::Frame));
         drop(s);
         list.close();
     }
@@ -2675,7 +2675,7 @@ impl HostList {
             let (buffer, data) = host.readback_buffer(len)?;
             name(&buffer, || format!("list read-back {len:#x}"));
             self.deferred().uploads.push(buffer.clone());
-            return Some((buffer, 0, data.cast_const()));
+            return Some((buffer, 0, data));
         }
         let mut r = self.readback.lock().unwrap_or_else(|e| e.into_inner());
         if r.chunks.get(r.current).is_some() && len > READBACK_CHUNK - r.used {
@@ -3395,40 +3395,6 @@ impl Host {
             }
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
-                None
-            }
-        }
-    }
-
-    /// A mapped read-back buffer of `size` bytes: a copy destination the
-    /// CPU reads once the GPU has written it.
-    fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a read-back buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no read-back buffer");
                 None
             }
         }

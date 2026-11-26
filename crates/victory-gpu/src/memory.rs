@@ -693,7 +693,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
-        pipeline_of(SOURCE)
+        pipeline_of(source)
     }
 
     fn pipeline_of(

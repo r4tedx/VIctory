@@ -1161,6 +1161,7 @@ mod regressions;
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use windows::Win32::Graphics::Direct3D12::*;
 
     thread_local! {
         pub(super) static UAV_BARRIERS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -1602,8 +1603,26 @@ mod tests {
         for (i, ((kind, records, _), &offset)) in calls.iter().zip(&offsets).enumerate() {
             let spec = (*kind, words(*kind) as u32 * 4, *records);
             let count = inline_count(i);
-            let clamped = super::bound(&list, &old, count, old_gpu + offset, spec).unwrap();
-            super::done(&list, &old, count.map(|(buffer, _)| buffer), clamped);
+            let clamped = super::bound(&list, (&old, old_gpu + offset), count.map(|(buffer, _)| buffer), spec).unwrap();
+            // Main's clamp (315cea18) leaves the records in the list's
+            // argument buffer: copied over the title's, where the in-place
+            // clamp left them, for the comparison below.
+            let bytes = u64::from(spec.1) * u64::from(spec.2);
+            // SAFETY: an open list; live buffers of ours.
+            unsafe {
+                list.list.ResourceBarrier(&[super::transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyBufferRegion(&old, offset, &clamped, 0, bytes);
+                list.list.ResourceBarrier(&[super::transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+            super::done(&list, &clamped);
         }
         let (old_budget, old_budget_at) = read_back(&list, &[(list.budget().unwrap().0, 0, 4)]);
         list.close();
@@ -1619,8 +1638,26 @@ mod tests {
             if inline(i) {
                 super::end(&batched);
                 let count = inline_count(i);
-                let clamped = super::bound(&batched, &new, count, new_gpu + offset, spec).unwrap();
-                super::done(&batched, &new, count.map(|(buffer, _)| buffer), clamped);
+                let clamped = super::bound(&batched, (&new, new_gpu + offset), count.map(|(buffer, _)| buffer), spec).unwrap();
+                // Main's clamp (315cea18) leaves the records in the list's
+                // argument buffer: copied over the title's, where the in-place
+                // clamp left them, for the comparison below.
+                let bytes = u64::from(spec.1) * u64::from(spec.2);
+                // SAFETY: an open list; live buffers of ours.
+                unsafe {
+                    batched.list.ResourceBarrier(&[super::transition(
+                        &clamped,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    batched.list.CopyBufferRegion(&new, offset, &clamped, 0, bytes);
+                    batched.list.ResourceBarrier(&[super::transition(
+                        &clamped,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                }
+                super::done(&batched, &clamped);
                 members.push(None);
             } else {
                 // The first window fills (one run); then 30 executions name
@@ -2103,12 +2140,12 @@ RWByteAddressBuffer b : register(u0);
                                 l.ExecuteIndirect(&signature, 1, &m.buffer, m.offset, None, 0);
                             }
                         } else {
-                            let clamped = super::bound(&list, &args, None, a + at, (2, 12, 1)).unwrap();
+                            let clamped = super::bound(&list, (&args, a + at), None, (2, 12, 1)).unwrap();
                             title();
                             if executes {
-                                l.ExecuteIndirect(&signature, 1, &args, at, None, 0);
+                                l.ExecuteIndirect(&signature, 1, &clamped, 0, None, 0);
                             }
-                            super::done(&list, &args, None, clamped);
+                            super::done(&list, &clamped);
                         }
                     }
                     super::end(&list);

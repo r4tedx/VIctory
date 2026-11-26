@@ -687,6 +687,9 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
             view_marks: true,
         })
         .expect("lower")
@@ -723,6 +726,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        group_waves: l.group_waves,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");

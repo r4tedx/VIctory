@@ -4072,18 +4072,18 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#,
         );
         let (out, data) = host.shared_buffer(u64::from(N * N) * 8).unwrap();
-        let free = heap_host.dynamic_free();
+        let free = heap_host.dynamic_free().0;
         let list = host.new_list().unwrap();
         let mut state = State::default();
         state.set_heaps(&[heap]);
         for k in 1..=8 {
             assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true, None), "clear {k}");
         }
-        assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
+        assert_eq!(heap_host.dynamic_free().0, free - 1, "eight clears of one view, one slot");
         assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true, None));
-        assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
+        assert_eq!(heap_host.dynamic_free().0, free - 2, "another view, another slot");
         assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true, None));
-        assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
+        assert_eq!(heap_host.dynamic_free().0, free - 2, "the first view's slot again");
         for t in &textures {
             let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
             readable(&list, &used(ResourceType::Srv), &srv, false);
@@ -4098,11 +4098,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.reset();
         state.reset(null);
-        assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
+        assert_eq!(heap_host.dynamic_free().0, free, "the slots come back at reset");
         // A new recording takes a slot afresh.
         state.set_heaps(&[heap]);
         assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true, None));
-        assert_eq!(heap_host.dynamic_free(), free - 1);
+        assert_eq!(heap_host.dynamic_free().0, free - 1);
         list.close();
         host.execute(&[&list]);
         list.reset();
@@ -4332,7 +4332,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             readable(&list, &used(ResourceType::Uav), &uav, false);
             run(&list, &slots, &seed, 0, None, (N / 8, N / 8));
             state.set_pipeline(gated);
-            let ran = state.execute_indirect(&list, (2, 12, max), 0, count.map(|_| counts + 4));
+            let ran = state.execute_indirect(&list, (2, 12, max), 0, count.map(|_| counts + 4), 0);
             assert!(!ran, "max {max} count {count:?}: the dispatch does not run");
             readable(&list, &used(ResourceType::Srv), &srv, false);
             run(&list, &slots, &read, 1, Some(&out), (N / 8, N / 8));
