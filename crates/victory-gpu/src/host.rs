@@ -3401,14 +3401,7 @@ impl Meter {
                 crate::bindless::log(window);
                 crate::shadow::log_views(window);
                 crate::vram::log(window);
-                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
-                let (windows, window_bytes) = crate::shadow::loose_stats();
-                tracing::info!(
-                    "loose windows: {windows} ({:.0} MB live), {} covered by a wider \
-                     one since start",
-                    window_bytes as f64 / 1e6,
-                    reuses
-                );
+                crate::shadow::log_loose(window);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

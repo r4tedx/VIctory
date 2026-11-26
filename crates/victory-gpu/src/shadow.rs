@@ -239,7 +239,8 @@ unsafe impl Sync for Shadow {}
 
 impl Shadow {
     fn touch(&self) {
-        self.last_use.fetch_max(SUBMISSION.load(Ordering::Relaxed), Ordering::Relaxed);
+        // The loose-map lock serializes both touches and retirement.
+        self.last_use.store(SUBMISSION.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub(crate) fn was_remapped(&self) -> bool {
@@ -1652,15 +1653,49 @@ const WINDOW: u64 = 4 << 20;
 const LOOSE_IDLE_SUBMISSIONS: u64 = 8;
 static SUBMISSION: AtomicU64 = AtomicU64::new(0);
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+// Upper bound on window lengths, advanced under the loose-map lock.
+static LOOSE_SPAN: AtomicU64 = AtomicU64::new(0);
 static REMOVED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "diagnostics")]
 pub(crate) static REUSES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn loose_stats() -> (usize, u64) {
+#[derive(Default)]
+struct LooseActivity {
+    recently_retired: std::collections::HashSet<(u64, u64)>,
+    retired: u64,
+    made: u64,
+    recreated: u64,
+    merged: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static LOOSE_ACTIVITY: OnceLock<Mutex<LooseActivity>> = OnceLock::new();
+
+#[cfg(feature = "diagnostics")]
+fn loose_activity() -> std::sync::MutexGuard<'static, LooseActivity> {
+    LOOSE_ACTIVITY.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_loose(frames: f64) {
     let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    (map.len(), map.keys().map(|&(_, len)| len).sum())
+    let windows = map.len();
+    let bytes: u64 = map.keys().map(|&(_, len)| len).sum();
+    drop(map);
+    let mut activity = loose_activity();
+    let made = std::mem::take(&mut activity.made) as f64 / frames;
+    let recreated = std::mem::take(&mut activity.recreated) as f64 / frames;
+    let retired = std::mem::take(&mut activity.retired) as f64 / frames;
+    let merged = std::mem::take(&mut activity.merged) as f64 / frames;
+    let reuses = REUSES.load(Ordering::Relaxed);
+    drop(activity);
+    tracing::info!(
+        "loose windows: {windows} ({:.0} MB live), {reuses} covered by a wider one since start; \
+         per frame: {made:.2} made, {recreated:.2} recreated, {retired:.2} retired, {merged:.2} merged",
+        bytes as f64 / 1e6
+    );
 }
 
 /// The previous submission's fence and all its copy-backs have completed.
@@ -1669,14 +1704,25 @@ pub(crate) fn loose_stats() -> (usize, u64) {
 pub(crate) fn reap_loose() -> bool {
     let now = SUBMISSION.fetch_add(1, Ordering::Relaxed) + 1;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let old_count = map.len();
-    map.retain(|_, copy| {
-        now.saturating_sub(copy.last_use.load(Ordering::Relaxed)) < LOOSE_IDLE_SUBMISSIONS
-            || Arc::strong_count(copy) > 1
+    map.retain(|key, copy| {
+        let keep = now.saturating_sub(copy.last_use.load(Ordering::Relaxed)) < LOOSE_IDLE_SUBMISSIONS
+            || Arc::strong_count(copy) > 1;
+        #[cfg(feature = "diagnostics")]
+        if !keep {
+            let mut activity = loose_activity();
+            activity.retired += 1;
+            // Bound history without scanning it during lookups. Counts cover
+            // the same aligned allocation key within the retained history.
+            if activity.recently_retired.len() >= 4096 {
+                activity.recently_retired.clear();
+            }
+            activity.recently_retired.insert(*key);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = key;
+        keep
     });
-    if old_count != map.len() {
-        changed();
-    }
+    // Map-only copies own no live entry. Keep the published layouts valid.
     REMOVED.swap(false, Ordering::Relaxed)
 }
 
@@ -1705,6 +1751,8 @@ pub(crate) fn remapped(at: usize, len: usize) {
         REMOVED.store(true, Ordering::Relaxed);
         changed();
     }
+    #[cfg(feature = "diagnostics")]
+    loose_activity().recently_retired.retain(|&(start, size)| !overlaps(start, size));
     drop(map);
     EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.retain(|&(start, size), copy| {
         if !overlaps(start, size) {
@@ -1725,8 +1773,14 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         copy.touch();
         return Some(copy.clone());
     }
-    // A larger copy already holding the range is safe to use at its offset.
-    if let Some((_, copy)) = map.range(..=(start, u64::MAX)).rev().find(|((at, len), _)| at + len >= end) {
+    // The longest window bounds how far back a covering copy can start.
+    let lowest = end.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+    if lowest <= start
+        && let Some((_, copy)) = map
+            .range((lowest, 0)..=(start, u64::MAX))
+            .rev()
+            .find(|((at, len), _)| at + len >= end)
+    {
         #[cfg(feature = "diagnostics")]
         REUSES.fetch_add(1, Ordering::Relaxed);
         copy.touch();
@@ -1752,6 +1806,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     if let Some(at) = neighbor {
         map.remove(&(at, WINDOW));
+    }
+    LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut activity = loose_activity();
+        activity.made += 1;
+        let recreated = activity.recently_retired.remove(&(start, len));
+        activity.recreated += u64::from(recreated);
+        activity.merged += u64::from(neighbor.is_some());
     }
     map.insert((start, len), shadow.clone());
     changed();
@@ -2806,6 +2869,169 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "WARP CPU timing benchmark"]
+    fn loose_window_lookup_and_submit_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WINDOWS: u64 = 700;
+        const LOOKUPS: u64 = 16_384;
+        const FRAMES: u64 = 32;
+        const SUBMISSIONS: u64 = 128;
+        let window = WINDOW;
+        let start = 0x30_0000_0000;
+        let stride = 3 * window;
+        let limit = start + WINDOWS * stride;
+        let host = host().expect("WARP host");
+        let list = host.new_list().expect("empty list");
+        list.close();
+        let submit_ms = || {
+            let now = Instant::now();
+            for _ in 0..SUBMISSIONS {
+                host.execute(&[&list]);
+            }
+            now.elapsed().as_secs_f64() * 1e6 / SUBMISSIONS as f64
+        };
+        let empty_before_us = submit_ms();
+
+        // The benchmark submits no GPU commands that access the synthetic
+        // windows. Use distinct Shadow owners over one valid WARP buffer
+        // so lookup, pinning and page-table setup have real reference counts.
+        let (buffer, data) = host.shared_buffer(2 * window).expect("shared WARP buffer");
+        // SAFETY: this is a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut pinned = Vec::new();
+        {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.is_empty(), "run this ignored benchmark by itself");
+            for i in 0..WINDOWS {
+                let at = start + i * stride;
+                let copy = Shadow::new(buffer.clone(), data, gpu, at, 2 * window);
+                map.insert((at, 2 * window), copy.clone());
+                pinned.push(copy);
+            }
+            LOOSE_SPAN.fetch_max(2 * window, Ordering::Relaxed);
+        }
+        changed();
+
+        let frame_ms = |lookup: &mut dyn FnMut(u64)| {
+            let now = Instant::now();
+            for _ in 0..FRAMES {
+                for i in 0..LOOKUPS {
+                    lookup(start + ((i * 433) % WINDOWS) * stride);
+                }
+            }
+            now.elapsed().as_secs_f64() * 1e3 / FRAMES as f64
+        };
+        let exact_ms = frame_ms(&mut |at| {
+            black_box(find(at, 2 * window).unwrap());
+        });
+        let covered_ms = frame_ms(&mut |at| {
+            black_box(find(at + window, 4).unwrap());
+        });
+        let (old_miss_ms, bounded_miss_ms) = {
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let old = frame_ms(&mut |at| {
+                let gap = at + 2 * window;
+                black_box(map.range(..=(gap, u64::MAX)).rev().find(|((address, size), _)| {
+                    address + size >= gap + window
+                }));
+            });
+            let bounded = frame_ms(&mut |at| {
+                let gap = at + 2 * window;
+                let end = gap + window;
+                black_box(map.range((end - 2 * window, 0)..=(gap, u64::MAX)).rev().find(
+                    |((address, size), _)| address + size >= end,
+                ));
+            });
+            (old, bounded)
+        };
+
+        let now = Instant::now();
+        for _ in 0..1024 {
+            assert!(!reap_loose());
+        }
+        let reap_us = now.elapsed().as_secs_f64() * 1e6 / 1024.0;
+        let pinned_submit_us = submit_ms();
+        let memory_list = host.new_list().expect("memory list");
+        let _map = crate::memory::bind(&memory_list, crate::memory::OURS).expect("page table");
+        crate::memory::prepare(crate::memory::OURS, |_, _, _| {});
+        let now = Instant::now();
+        for _ in 0..FRAMES {
+            changed();
+            crate::memory::prepare(crate::memory::OURS, |_, _, _| {});
+        }
+        let rewrite_us = now.elapsed().as_secs_f64() * 1e6 / FRAMES as f64;
+        drop(memory_list);
+        drop(pinned);
+        crate::watch::title_memory_remapped(start as usize, (limit - start) as usize);
+        host.execute(&[&list]);
+        let empty_after_us = submit_ms();
+
+        println!(
+            "{WINDOWS} windows, {LOOKUPS} lookups/frame, window {window} bytes: \
+             exact={exact_ms:.3} ms/frame, covered={covered_ms:.3} ms/frame, \
+             old unbounded miss scan={old_miss_ms:.3} ms/frame, bounded miss scan={bounded_miss_ms:.3} ms/frame; \
+             reap={reap_us:.3} us/submission, empty submit before/after={empty_before_us:.3}/{empty_after_us:.3} us, \
+             pinned submit={pinned_submit_us:.3} us, warm-pair forced table rewrite={rewrite_us:.3} us"
+        );
+
+        // Measure real allocation, merge and recreation separately from
+        // the 700-window lookup model.
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const CHURN_RUNS: u32 = 16;
+        let reserve = (3 * window) as usize;
+        // SAFETY: our reservation, freed below once all copies are gone.
+        let pool = unsafe {
+            VirtualAlloc(std::ptr::null(), reserve, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!pool.is_null());
+        let at = (pool as u64).next_multiple_of(window);
+        let (mut single, mut merge, mut retire, mut recreate, mut refresh) =
+            (0.0, 0.0, 0.0, 0.0, 0.0);
+        for _ in 0..CHURN_RUNS {
+            let now = Instant::now();
+            drop(find(at, 4).expect("single loose window"));
+            single += now.elapsed().as_secs_f64();
+            let now = Instant::now();
+            let wide = find(at + window, 4).expect("adjacent loose window");
+            merge += now.elapsed().as_secs_f64();
+            assert_eq!(wide.range(), (at, 2 * window));
+            let weak = Arc::downgrade(&wide);
+            drop(wide);
+            for _ in 1..LOOSE_IDLE_SUBMISSIONS {
+                assert!(!reap_loose());
+            }
+            let now = Instant::now();
+            assert!(!reap_loose());
+            retire += now.elapsed().as_secs_f64();
+            assert!(weak.upgrade().is_none());
+            let previous = loose_activity().recreated;
+            let now = Instant::now();
+            let copy = find(at, 2 * window).expect("recreated loose window");
+            recreate += now.elapsed().as_secs_f64();
+            assert_eq!(loose_activity().recreated, previous + 1);
+            let now = Instant::now();
+            assert_eq!(copy.update(at as usize, (2 * window) as usize), (2 * window) as usize);
+            refresh += now.elapsed().as_secs_f64();
+            drop(copy);
+            crate::watch::title_memory_remapped(pool as usize, reserve);
+            reap_loose();
+        }
+        // SAFETY: our reservation, with no outstanding GPU accesses.
+        assert_ne!(unsafe { VirtualFree(pool, 0, MEM_RELEASE) }, 0);
+        let mean_us = |time| time * 1e6 / f64::from(CHURN_RUNS);
+        println!(
+            "{CHURN_RUNS} real WARP allocation cycles: single={:.3} us, merge={:.3} us, retire={:.3} us, \
+             recreate={:.3} us, full refresh of recreated copy={:.3} us",
+            mean_us(single), mean_us(merge), mean_us(retire), mean_us(recreate), mean_us(refresh)
+        );
     }
 
     #[cfg(feature = "diagnostics")]
