@@ -4128,6 +4128,14 @@ impl Host {
         if regions.is_empty() {
             return;
         }
+        // Test hook (review of #3102): the copy does not run, as when the
+        // list's Reset, Close or Execute fails, or there is no copier; a
+        // failed Signal or wait before the copy finished reads the same.
+        #[cfg(test)]
+        if crate::shadow::tests::repro_3102::copy_fails() {
+            tracing::warn!("a host copy did not run (test hook)");
+            return;
+        }
         struct Copier {
             allocator: ID3D12CommandAllocator,
             list: ID3D12GraphicsCommandList,

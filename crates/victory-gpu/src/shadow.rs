@@ -700,6 +700,9 @@ impl Shadow {
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
         self.push(from - start, n);
+        // Test hook (review of #3102): the title writes the page here.
+        #[cfg(test)]
+        tests::repro_3102::before_taken();
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
@@ -1892,6 +1895,9 @@ mod bench;
 pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Repro tests for the review of #3102 (adapted from #2993's tests).
+    pub(crate) mod repro_3102;
 
     /// The views' written-pages bitmaps, which shaders that mark their
     /// writes set every frame, are kept resident.
