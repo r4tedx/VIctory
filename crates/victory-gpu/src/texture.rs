@@ -549,8 +549,16 @@ impl Staging {
     pub(crate) fn refresh(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        // The first detiling of one made again after one was let go.
+        #[cfg(feature = "diagnostics")]
+        let again = self.force.load(Relaxed);
         let (read, changed) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
+        #[cfg(feature = "diagnostics")]
+        if again {
+            let us = started.elapsed().as_micros() as u64;
+            crate::copystat::add(crate::copystat::C::StagingRemadeDetileUs, us);
+        }
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         changed
@@ -748,6 +756,8 @@ fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<S
         }
         return Some(s.clone());
     }
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -818,6 +828,17 @@ fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<S
     s.touch();
     STAGING[0].fetch_add(1, Relaxed);
     STAGING[1].fetch_add(total, Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let us = making.elapsed().as_micros() as u64;
+        add(C::StagingMade, 1);
+        add(C::StagingMadeUs, us);
+        if force {
+            add(C::StagingRemade, 1);
+            add(C::StagingRemadeUs, us);
+        }
+    }
     held.live = Some(s.clone());
     drop(held);
     STAGED
