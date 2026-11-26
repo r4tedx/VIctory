@@ -338,11 +338,16 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 ///
-/// The GPU side's copies are told first that the memory is gone
+/// A 32-bit block's reservation is reported to the GPU side's copies first
 /// ([`victory_gpu::title_memory_remapped`]): what reuses it next may not
-/// report itself (the host heap hands out freed blocks again unseen), and a
-/// copy-back still pending for the freed memory would otherwise land in the
-/// new memory.
+/// report itself, and a copy-back still pending for the freed memory would
+/// otherwise land in the new memory.
+///
+/// shortcut: a heap block is not reported. The GPU side tracks only the
+/// runtime's write-watched pools and page views, so no tracker holds the
+/// host heap's memory, and a report would reach no copy. A copy-back still
+/// pending for a freed heap block can still land in what takes it next.
+/// Closing that needs remap state that copies without a tracker check.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
@@ -360,27 +365,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
-        // Only the host pages the block fills: its first and last may hold
-        // other blocks of the heap, still in use.
-        let (first, last) = (
-            (user as usize).next_multiple_of(HOST_PAGE),
-            (user as usize - align + size) & !(HOST_PAGE - 1),
-        );
-        let _remap = (first < last).then(|| {
-            // As above.
-            let remap = victory_gpu::title_memory_remapping();
-            freed(first, last - first);
-            remap
-        });
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
     }
 }
-
-/// The host's page, the GPU side's unit of change tracking.
-const HOST_PAGE: usize = 4 << 10;
 
 /// Tells the GPU side's copies that title memory `[at, at + len)` was
 /// freed: what it shows next is new.
@@ -1159,14 +1149,14 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
-    /// `XMemFreeDefault` tells the GPU side's copies the memory it frees is
-    /// gone, before the host can hand it out again: a 32-bit block's whole
-    /// reservation, even split by a protection change (as a guard makes); of
-    /// a heap block, only the host pages it fills, and nothing for one
-    /// inside a page (the heap's other blocks there are still in use).
+    /// `XMemFreeDefault` tells the GPU side's copies a 32-bit block's memory
+    /// is gone, before the host can hand it out again: its whole
+    /// reservation, even split by a protection change (as a guard makes).
+    /// Heap blocks are not reported (no tracker holds heap memory).
     #[test]
     fn freed_memory_is_reported_to_the_gpu_side() {
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        const HOST_PAGE: usize = 4 << 10;
         let reported = || FREED.with(|f| std::mem::take(&mut *f.borrow_mut()));
         reported();
         let a = XMemAllocDefault(3 * HOST_PAGE, ALLOC_32BIT);
@@ -1178,24 +1168,11 @@ mod tests {
         assert_ne!(protected, 0);
         XMemFreeDefault(a, ALLOC_32BIT);
         assert_eq!(reported(), [(a as usize, 3 * HOST_PAGE)], "a 32-bit block");
-        let aligned = 12 << ALIGNMENT_SHIFT;
-        let b = XMemAllocDefault(5 * HOST_PAGE, aligned);
-        assert!(!b.is_null() && (b as usize).is_multiple_of(HOST_PAGE));
+        let aligned = 16 << ALIGNMENT_SHIFT;
+        let b = XMemAllocDefault(5 << 16, aligned);
+        assert!(!b.is_null());
         XMemFreeDefault(b, aligned);
-        assert_eq!(reported(), [(b as usize, 5 * HOST_PAGE)], "a heap block of whole pages");
-        let c = XMemAllocDefault(3 * HOST_PAGE + 100, 0) as usize;
-        assert_ne!(c, 0);
-        XMemFreeDefault(c as *mut c_void, 0);
-        let (first, last) = (
-            c.next_multiple_of(HOST_PAGE),
-            (c + 3 * HOST_PAGE + 100) & !(HOST_PAGE - 1),
-        );
-        assert!(last - first >= 2 * HOST_PAGE);
-        assert_eq!(reported(), [(first, last - first)], "the pages a heap block fills");
-        let d = XMemAllocDefault(64, 0);
-        assert!(!d.is_null());
-        XMemFreeDefault(d, 0);
-        assert!(reported().is_empty(), "a heap block inside a page");
+        assert!(reported().is_empty(), "a heap block");
     }
 
     fn query(address: *const c_void) -> BasicInformation {
