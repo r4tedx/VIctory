@@ -33,7 +33,8 @@
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen, unless the
-//! runtime allocates it (`XMemVirtualAlloc` reports it as remapped).
+//! runtime frees it (`XMemFreeDefault`) or allocates it (`XMemVirtualAlloc`):
+//! both report it as remapped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
