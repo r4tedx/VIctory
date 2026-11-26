@@ -129,6 +129,15 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Texture staging buffers made and the microseconds their making
+    /// took; those made again after their texture's was let go as idle,
+    /// their making's microseconds and their first detiling's
+    /// (`texture::remade`).
+    StagingMade,
+    StagingMadeUs,
+    StagingRemade,
+    StagingRemadeUs,
+    StagingRemadeDetileUs,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1257,6 +1266,14 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "texture staging per frame: {:.1} buffers made {:.2} ms; {:.1} of them made again after          their texture's was let go as idle {:.2} ms, their first detiling {:.2} ms",
+        c[C::StagingMade as usize],
+        ms(c[C::StagingMadeUs as usize]),
+        c[C::StagingRemade as usize],
+        ms(c[C::StagingRemadeUs as usize]),
+        ms(c[C::StagingRemadeDetileUs as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

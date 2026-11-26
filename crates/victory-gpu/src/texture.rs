@@ -44,6 +44,10 @@ pub(crate) struct Staging {
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
+    /// Diagnostics: made again after its texture's buffer was let go as
+    /// idle, and not detiled since ([`remade`]).
+    #[cfg(feature = "diagnostics")]
+    remade: std::sync::atomic::AtomicBool,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -507,8 +511,44 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
-/// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
-/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
+/// The fewest frames a staging buffer goes unused before it may go.
+const IDLE_FRAMES: u64 = 4;
+
+/// The frames a staging buffer goes unused before it may go when
+/// `VICTORY_STAGING_IDLE_FRAMES` is not set: at a few frames a second,
+/// cool's time rule drops to 2 s when the PC's memory runs short
+/// ([`crate::host::ram_idle_ms`]), and then 4 frames was all that kept a
+/// texture the title writes every few frames from having its buffer let go
+/// and made again between each use (a new upload buffer, its first-touch
+/// faults and a whole detiling). Our N5A/N5B runs: 0.5 against 38.8 made
+/// again a frame.
+const IDLE_FRAMES_UNSET: u64 = 30;
+
+/// `VICTORY_STAGING_IDLE_FRAMES=<n>`: a staging buffer goes unused for
+/// `max(n, 4)` frames, as well as cool's time, before it may go. Unset:
+/// [`IDLE_FRAMES_UNSET`]; `0`: cool's 4.
+fn idle_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| idle_frames_of(std::env::var("VICTORY_STAGING_IDLE_FRAMES").ok().as_deref()))
+}
+
+/// [`idle_frames`] for the switch's value (`None`: not set; a value that
+/// is no number counts as not set).
+fn idle_frames_of(set: Option<&str>) -> u64 {
+    set.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(IDLE_FRAMES_UNSET)
+        .max(IDLE_FRAMES)
+}
+
+/// Whether a staging buffer last used at `used` goes at `now` (both
+/// [`crate::host::moment`]s): no list holds it (`held`), and it was not
+/// used for `idle_ms` milliseconds and `frames` frames.
+fn goes(held: bool, now: u64, used: u64, idle_ms: u64, frames: u64) -> bool {
+    !held && crate::host::long_ago_at(now, used, idle_ms, frames)
+}
+
+/// Lets go of the staging buffers no list recorded a use of for
+/// `ram_idle_ms` and [`idle_frames`] frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
@@ -516,7 +556,6 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -525,23 +564,77 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let (now, frames) = (crate::host::moment(), idle_frames());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+    map.retain(|&resource, s| {
+        let keep = !goes(Arc::strong_count(s) > 1, now, s.used.load(Relaxed), idle_ms, frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            #[cfg(feature = "diagnostics")]
+            remade::let_go(resource);
         }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = resource;
         keep
     });
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+}
+
+/// Diagnostics for [`let_go_idle`]'s rule (`VICTORY_STAGING_IDLE_FRAMES`):
+/// staging buffers made and the time their making took, those made again
+/// for a texture whose buffer was let go as idle and their time, and the
+/// first detiling of those made again. Counted per frame in the copies
+/// lines (`copystat`).
+#[cfg(feature = "diagnostics")]
+mod remade {
+    use crate::copystat::{C, add};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Textures whose staging buffer was let go as idle and not made again
+    /// since. (Taken with [`super::STAGING`] held, after it.)
+    static GONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+    /// `resource`'s staging buffer was let go as idle.
+    pub(super) fn let_go(resource: usize) {
+        GONE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(resource);
+    }
+
+    /// A staging buffer was made for `resource`, in `took`: whether it is
+    /// one made again after a let-go.
+    pub(super) fn made(resource: usize, took: std::time::Duration) -> bool {
+        let us = took.as_micros() as u64;
+        add(C::StagingMade, 1);
+        add(C::StagingMadeUs, us);
+        let again = GONE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|g| g.remove(&resource));
+        if again {
+            add(C::StagingRemade, 1);
+            add(C::StagingRemadeUs, us);
+        }
+        again
+    }
+
+    /// Times the first detiling of a buffer made again, until dropped.
+    pub(super) struct FirstDetiling(std::time::Instant);
+
+    impl FirstDetiling {
+        pub(super) fn new() -> Self {
+            FirstDetiling(std::time::Instant::now())
+        }
+    }
+
+    impl Drop for FirstDetiling {
+        fn drop(&mut self) {
+            add(C::StagingRemadeDetileUs, self.0.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -1489,6 +1582,11 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let _first = self
+            .remade
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            .then(remade::FirstDetiling::new);
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1846,6 +1944,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     {
         return Some(s.clone());
     }
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1910,12 +2010,16 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let remade = remade::made(resource as usize, making.elapsed());
     let s = Arc::new(Staging {
         buffer,
         base,
         _piece: piece,
         #[cfg(feature = "diagnostics")]
         size: total,
+        #[cfg(feature = "diagnostics")]
+        remade: std::sync::atomic::AtomicBool::new(remade),
         data,
         footprints,
         rows,
@@ -2293,5 +2397,85 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_idle_tests {
+    use super::{IDLE_FRAMES, IDLE_FRAMES_UNSET, goes, idle_frames_of};
+
+    /// The moment (as `crate::host::moment` counts) of frame `frame`, `ms`
+    /// milliseconds after the start.
+    fn at(frame: u64, ms: u64) -> u64 {
+        (frame << 32) | (ms / 100)
+    }
+
+    /// `VICTORY_STAGING_IDLE_FRAMES`: unset 30, `0` cool's 4, never fewer
+    /// than 4, and a value that is no number counts as unset.
+    #[test]
+    fn the_switch_counts_frames_unset_30_and_0_is_cools_4() {
+        assert_eq!(IDLE_FRAMES_UNSET, 30);
+        assert_eq!(idle_frames_of(None), 30);
+        assert_eq!(idle_frames_of(Some("0")), IDLE_FRAMES);
+        assert_eq!(idle_frames_of(Some("2")), 4, "never under cool's 4");
+        assert_eq!(idle_frames_of(Some(" 60 ")), 60);
+        assert_eq!(idle_frames_of(Some("lots")), 30, "not a number: as unset");
+    }
+
+    /// A buffer goes only once both cool's time and the frames have
+    /// passed, and never while a list holds it (our 3ef8b75a's
+    /// `staging_goes_sooner_past_the_pressure_line`, on cool's rule).
+    #[test]
+    fn a_buffer_goes_only_after_its_time_and_its_frames() {
+        let used = at(100, 10_000);
+        assert!(!goes(false, at(129, 60_000), used, 2_000, 30), "29 frames");
+        assert!(goes(false, at(130, 60_000), used, 2_000, 30), "30 frames and 50 s");
+        assert!(!goes(false, at(200, 11_900), used, 2_000, 30), "100 frames, 1.9 s");
+        assert!(goes(false, at(200, 12_000), used, 2_000, 30), "100 frames, 2 s");
+        assert!(!goes(true, at(1_000, 999_000), used, 2_000, 30), "a list holds it");
+    }
+
+    /// With cool's time rule at its 2 s floor (under 2 GiB of the PC's
+    /// memory free) and 1.25 frames a second, the title using a texture
+    /// every `every` frames: how often its staging buffer is let go and
+    /// how often it is made again, in 120 frames, with `frames` counted.
+    fn churn(every: u64, frames: u64) -> (u64, u64) {
+        let idle_ms = crate::host::ram_idle_ms(Some(1 << 30));
+        assert_eq!(idle_ms, 2_000, "under 2 GiB free: cool's floor of 2 s");
+        let (mut live, mut used, mut went, mut made) = (true, at(0, 0), 0, 0);
+        for k in 1..=120u64 {
+            let now = at(k, k * 800);
+            // The sweep before the frame's submission, then the frame's use.
+            if live && goes(false, now, used, idle_ms, frames) {
+                (live, went) = (false, went + 1);
+            }
+            if k % every == 0 {
+                if !live {
+                    (live, made) = (true, made + 1);
+                }
+                used = now;
+            }
+        }
+        (went, made)
+    }
+
+    /// The forced-2 s case of our N5A/N5B runs: at a few frames a second,
+    /// a texture used every 6th frame has its buffer let go and made again
+    /// between each use under cool's 4 frames (`=0`), and never at the
+    /// default 30; one used every 3rd frame keeps it either way; unused
+    /// for 30 frames a buffer goes, not a frame sooner.
+    #[test]
+    fn staging_kept_at_low_frame_rates_counted_in_frames() {
+        let (thirty, cool) = (idle_frames_of(None), idle_frames_of(Some("0")));
+        assert_eq!(churn(3, thirty), (0, 0), "every 3rd frame, 30 frames");
+        assert_eq!(churn(3, cool), (0, 0), "every 3rd frame, cool's 4");
+        assert_eq!(churn(6, thirty), (0, 0), "every 6th frame, 30 frames: kept");
+        let (went, made) = churn(6, cool);
+        assert!(went >= 19 && made >= 19, "every 6th frame, cool's 4: {went} let go, {made} made again");
+        let idle_ms = crate::host::ram_idle_ms(Some(1 << 30));
+        let used = at(40, 32_000);
+        let later = |n: u64| goes(false, at(40 + n, 32_000 + n * 800), used, idle_ms, thirty);
+        assert!(!later(29), "a frame too soon");
+        assert!(later(30), "unused for 30 frames");
     }
 }
