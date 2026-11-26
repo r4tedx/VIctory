@@ -1343,11 +1343,14 @@ impl Host {
         // What shaders wrote into copies in video memory, for the copy-backs
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
-        crate::shadow::pull(&snapshots);
-        // Copies whose system memory side stays current
-        // (`VICTORY_VRAM_COPIES`, `crate::vram`): the withheld ranges too,
-        // so that side holds what the GPU side holds wherever shaders wrote.
-        crate::shadow::pull_current(&withheld);
+        // Withheld ranges need nothing more for copies whose system memory
+        // side stays current (`VICTORY_VRAM_COPIES`, `crate::vram`): those
+        // declared unmarked have snapshots (`snapshots` takes every list's,
+        // withheld or not), and `copy_back_marks` pulled the marked pages of
+        // the others, withheld ones too. Brought back whole once more, they
+        // cost a GPU copy of every withheld range, marked ones included, per
+        // submission.
+        crate::shadow::pull(&snapshots, crate::vram::Pulled::Declared);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

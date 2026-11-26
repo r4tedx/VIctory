@@ -262,6 +262,15 @@ impl Shadow {
         self.vram.is_some()
     }
 
+    /// Where its GPU side is under `VICTORY_VRAM_COPIES` (tests).
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> crate::vram::Class {
+        match self.vram.as_ref().map(|v| &v.bar) {
+            Some(Bar::Current(_, class)) => *class,
+            _ => crate::vram::Class::System,
+        }
+    }
+
     /// The pages (by index in the copy) its mirror is behind on.
     #[cfg(test)]
     fn stale_pages(&self) -> Vec<usize> {
@@ -1174,6 +1183,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             .iter()
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
+        crate::vram::Pulled::Marked,
     );
     for (copy, page) in pages {
         if withheld
@@ -1200,7 +1210,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
 // shortcut: shaders' writes outside every declared range and marked page
 // (to the copy, not to title memory) stay in video memory: the mirror keeps
 // the bytes from before until a later range brings them.
-pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
+///
+/// `why`: what the ranges are, for the diagnostics line (`crate::vram::log`).
+pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)], why: crate::vram::Pulled) {
     // Whole pages, so that the pages pulled are current in the mirror.
     let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
     for (copy, address, len) in ranges {
@@ -1217,6 +1229,8 @@ pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
         );
         runs.push((copy, from, to - from));
     }
+    crate::vram::PULLED_BY[why as usize]
+        .fetch_add(runs.iter().map(|r| r.2 as u64).sum(), Relaxed);
     bring_back(&mut runs);
 }
 
@@ -1224,14 +1238,14 @@ pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
 /// ([`Bar::Current`]) alone: ranges whose writes stay out of title memory
 /// (withheld), so that the mirror holds what video memory holds wherever
 /// shaders wrote. Nothing for other copies, as before `crate::vram`.
-pub(crate) fn pull_current(ranges: &[(Arc<Shadow>, usize, usize)]) {
+pub(crate) fn pull_current(ranges: &[(Arc<Shadow>, usize, usize)], why: crate::vram::Pulled) {
     let current: Vec<_> = ranges
         .iter()
         .filter(|(c, ..)| c.vram.as_ref().is_some_and(Vram::current))
         .cloned()
         .collect();
     if !current.is_empty() {
-        pull(&current);
+        pull(&current, why);
     }
 }
 
@@ -1442,6 +1456,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             .then(|| {
                 // Admitted first: a refused copy makes no second buffer.
                 let (video, bar) = crate::vram::make(host, size, class)?;
+                // Counted as used by #2222's budget until its next reading
+                // has them, as copies in GPU upload heaps are.
+                if let Some(b) = crate::budget::get() {
+                    b.charge(size);
+                }
                 let (home, home_data) = host.shared_buffer(size)?;
                 crate::host::name(&home, || {
                     format!("title buffer {:#x}+{len:#x} (system memory side)", key.0)
@@ -2067,7 +2086,7 @@ mod tests {
             "page 2 did not"
         );
         // Bytes the GPU wrote in page 3 are pulled: the whole page comes.
-        pull(&[(copy.clone(), p + 3 * PAGE + 100, 4)]);
+        pull(&[(copy.clone(), p + 3 * PAGE + 100, 4)], crate::vram::Pulled::Declared);
         assert_eq!(copy.stale_pages(), [0, 2]);
         assert!(mirror[3 * PAGE..] == title[3 * PAGE..]);
         // A snapshot ahead over page 2: the refresh there writes both.
@@ -2315,7 +2334,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut best = f64::MAX;
         for _ in 0..10 {
             let t = std::time::Instant::now();
-            pull(&pages);
+            pull(&pages, crate::vram::Pulled::Declared);
             best = best.min(t.elapsed().as_secs_f64());
         }
         eprintln!(
@@ -2326,7 +2345,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut best = f64::MAX;
         for _ in 0..10 {
             let t = std::time::Instant::now();
-            pull(&one);
+            pull(&one, crate::vram::Pulled::Declared);
             best = best.min(t.elapsed().as_secs_f64());
         }
         eprintln!(
@@ -2764,10 +2783,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Where a copy's GPU side is under `VICTORY_VRAM_COPIES`.
     fn class(copy: &Shadow) -> crate::vram::Class {
-        match copy.vram.as_ref().map(|v| &v.bar) {
-            Some(Bar::Current(_, class)) => *class,
-            _ => crate::vram::Class::System,
-        }
+        copy.class()
     }
 
     /// A byte of title memory.
@@ -3038,6 +3054,79 @@ void main(uint3 id : SV_DispatchThreadID) {
         unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// What comes back from video memory after a submission, for a copy
+    /// whose mirror stays current: of a range declared written and marked,
+    /// its marked page alone, withheld or not (the CPU reads nothing else of
+    /// it); of a range declared unmarked and withheld, the whole range,
+    /// once (its snapshot's pull). The mirror has the GPU's byte each time;
+    /// title memory only where the list's writes go back. Counted by why
+    /// (the diagnostics line's split).
+    #[test]
+    fn withheld_and_marked_ranges_of_current_copies_come_back_once_by_what_was_written() {
+        use crate::vram::tests::{FAKE, in_child};
+        use crate::vram::{Class, PULLED, PULLED_BY, Pulled};
+        if !in_child(
+            "shadow::tests::withheld_and_marked_ranges_of_current_copies_come_back_once_by_what_was_written",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 4 * PAGE;
+        let p = crate::watch::tests::pool(4);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(copy.class(), Class::VramWritten);
+        copy.update(p, len);
+        let pulled = || {
+            [
+                PULLED[0].load(Relaxed),
+                PULLED_BY[Pulled::Declared as usize].load(Relaxed),
+                PULLED_BY[Pulled::Marked as usize].load(Relaxed),
+            ]
+        };
+        let run = |marked: bool, withheld: bool, at: usize, byte: u8| {
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, len as u64, marked);
+            gpu_store(&list, &copy, at, &[byte]);
+            if withheld {
+                list.defer_missed(|| true);
+            }
+            list.close();
+            if marked {
+                copy.mark_written(at as u64);
+            }
+            let (title_before, before) = (title(at), pulled());
+            host.execute(&[&list]);
+            // SAFETY: a byte of the mirror (system memory).
+            let mirror = unsafe { *copy.data.add(at - p) };
+            assert_eq!(mirror, byte, "the mirror has the GPU's byte");
+            let want = if withheld { title_before } else { byte };
+            assert_eq!(title(at), want, "title memory: withheld {withheld}");
+            let after = pulled();
+            [0, 1, 2].map(|i| after[i] - before[i])
+        };
+        let (page, all) = (PAGE as u64, len as u64);
+        assert_eq!(
+            run(true, false, p + PAGE + 10, 0x5a),
+            [page, 0, page],
+            "the marked page alone, not the 4 pages declared"
+        );
+        assert_eq!(
+            run(true, true, p + PAGE + 20, 0x5b),
+            [page, 0, page],
+            "withheld: still the marked page alone"
+        );
+        assert_eq!(
+            run(false, true, p + 2 * PAGE + 3, 0x6b),
+            [all, all, 0],
+            "withheld and unmarked: whole, once"
+        );
+        unregister(p, p as u64);
     }
 
     /// The order of a copy-back into a copy in video memory: the title

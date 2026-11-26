@@ -491,9 +491,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
             .collect();
         if withheld > 0 {
-            crate::shadow::pull_current(&pulled);
+            crate::shadow::pull_current(&pulled, crate::vram::Pulled::Computed);
         } else {
-            crate::shadow::pull(&pulled);
+            crate::shadow::pull(&pulled, crate::vram::Pulled::Computed);
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {

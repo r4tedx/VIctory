@@ -14,10 +14,20 @@
 //! be read.
 //!
 //! Admission: copies in video memory hold at most a share of the budget
-//! the system gives this process (DXGI), and a copy is not made where use
-//! would pass nine tenths of it. A copy refused stays in system memory, as
-//! without the switch. Without that budget, copies took 19 GB of a 10.5 GB
-//! budget on an RTX 5070 and the device was removed (#693).
+//! the system gives this process (DXGI): a quarter of it, and never more
+//! than what the rest of the process leaves under 85 % of it, so the cap
+//! shrinks as textures, render targets and depth buffers take the card.
+//! Once use passes 85 %, no copy is admitted until it is back under 75 %.
+//! A copy refused stays in system memory, as without the switch. Without
+//! that budget, copies took 19 GB of a 10.5 GB budget on an RTX 5070 and
+//! the device was removed (#693).
+//!
+//! Copies are admitted when they are made, and stay. They are made before
+//! most of the title's textures (a title run: 1.2 GB of copies at 54 % of
+//! the budget, then textures took the card to 95 %), so they are kept at a
+//! low residency priority: past the budget, the system moves them to
+//! system memory before the title's textures and targets. Shaders then
+//! read them across the bus, as they read a copy in system memory.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -90,17 +100,55 @@ pub(crate) struct Reading {
     pub(crate) usage: u64,
 }
 
+/// The part of the budget use may reach with copies admitted: 85 %. The
+/// rest is left to the title's textures, render targets and depth buffers,
+/// which have nowhere else to go, and to what they stream in later.
+pub(crate) const MARGIN: (u64, u64) = (85, 100);
+
+/// Once use passed [`MARGIN`], copies wait until it is back under 75 %: the
+/// budget is near full then, and the room a texture gave back is soon taken
+/// again.
+pub(crate) const RESUME: (u64, u64) = (75, 100);
+
+/// `part` of `budget`.
+fn of(budget: u64, part: (u64, u64)) -> u64 {
+    (u128::from(budget) * u128::from(part.0) / u128::from(part.1)) as u64
+}
+
+/// What copies in video memory may hold in all now, with copies there
+/// holding `own` bytes (counted in the reading's use): `cap` (by default a
+/// quarter of the budget), and never more than what the rest of the
+/// process leaves under [`MARGIN`]. Use by others shrinks it; the copies'
+/// own bytes do not.
+pub(crate) fn limit(r: Reading, own: u64, cap: Option<u64>) -> u64 {
+    let cap = cap.unwrap_or(r.budget / 4);
+    let others = r.usage.saturating_sub(own);
+    cap.min(of(r.budget, MARGIN).saturating_sub(others))
+}
+
 /// Whether a copy of `size` bytes may go to video memory, with copies there
-/// holding `own` bytes: the copies hold at most `cap` in all (by default a
-/// quarter of the budget), and use stays under nine tenths of the budget
-/// (the last tenth is left to the title's textures and targets, which have
-/// nowhere else to go). Without a reading, never.
-pub(crate) fn admits(reading: Option<Reading>, own: u64, size: u64, cap: Option<u64>) -> bool {
+/// holding `own` bytes: within [`limit`], and use stays under [`MARGIN`].
+/// `full`: use passed the margin before and has not been back under
+/// [`RESUME`] since (set and cleared here). Without a reading, never.
+pub(crate) fn admits(
+    reading: Option<Reading>,
+    own: u64,
+    size: u64,
+    cap: Option<u64>,
+    full: &mut bool,
+) -> bool {
     let Some(r) = reading else {
         return false;
     };
-    let cap = cap.unwrap_or(r.budget / 4);
-    own + size <= cap && r.usage + size <= r.budget - r.budget / 10
+    if *full && r.usage > of(r.budget, RESUME) {
+        return false;
+    }
+    *full = false;
+    if r.usage + size > of(r.budget, MARGIN) {
+        *full = true;
+        return false;
+    }
+    own + size <= limit(r, own, cap)
 }
 
 /// Bytes of copies in video memory now: charged when one is made, given
@@ -115,6 +163,22 @@ static LIVE_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) static REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static PULLED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Why bytes were brought back from video memory ([`PULLED_BY`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pulled {
+    /// Ranges lists declared as written by shaders, unmarked (a snapshot
+    /// tells what changed in them, so they come back whole).
+    Declared = 0,
+    /// Pages marked in a written-pages bitmap.
+    Marked = 1,
+    /// Pages written at computed addresses (`crate::memory`).
+    Computed = 2,
+}
+
+/// Bytes brought back by [`Pulled`], before runs of a copy that meet are
+/// joined (diagnostics).
+pub(crate) static PULLED_BY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Bytes of copies in video memory now.
 pub(crate) fn own() -> u64 {
     OWN.load(Relaxed)
@@ -126,12 +190,15 @@ struct Last {
     at: Option<Instant>,
     reading: Option<Reading>,
     charged: u64,
+    /// Use passed [`MARGIN`] and has not been back under [`RESUME`].
+    full: bool,
 }
 
 static LAST: Mutex<Last> = Mutex::new(Last {
     at: None,
     reading: None,
     charged: 0,
+    full: false,
 });
 
 /// How old a reading may be.
@@ -241,14 +308,17 @@ pub(crate) fn make(host: &Host, size: u64, class: Class) -> Option<(ID3D12Resour
     // Admission and charge under one lock: copies made on two threads at
     // once must not both pass on the same room.
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if !admits(reading(&mut last), own(), size, cap()) {
+    let now = reading(&mut last);
+    if !admits(now, own(), size, cap(), &mut last.full) {
         REFUSED[0].fetch_add(1, Relaxed);
         REFUSED[1].fetch_add(size, Relaxed);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(
                 own_mb = own() >> 20,
-                "the video memory budget is full: host copies made from now on may stay in system memory"
+                usage_mb = now.map_or(0, |r| r.usage >> 20),
+                budget_mb = now.map_or(0, |r| r.budget >> 20),
+                "host copies past their share of the video memory budget, or use past 85 % of it: copies made from now on may stay in system memory"
             );
         });
         return None;
@@ -272,6 +342,7 @@ pub(crate) fn make(host: &Host, size: u64, class: Class) -> Option<(ID3D12Resour
         });
         return None;
     }
+    low_priority(host, &buffer);
     OWN.fetch_add(size, Relaxed);
     LIVE[class as usize].fetch_add(1, Relaxed);
     LIVE_BYTES[class as usize].fetch_add(size, Relaxed);
@@ -285,6 +356,28 @@ pub(crate) fn make(host: &Host, size: u64, class: Class) -> Option<(ID3D12Resour
     ))
 }
 
+/// Puts a copy's buffer in video memory at a low residency priority: past
+/// the budget, the system moves it to system memory before the title's
+/// textures, render targets and depth buffers (normal or high), whose
+/// bytes have nowhere else to be read from. A committed buffer, not a
+/// descriptor heap or a placed resource (a priority on those removed the
+/// device on NVIDIA).
+fn low_priority(host: &Host, buffer: &ID3D12Resource) {
+    let (Ok(device), Ok(pageable)) = (
+        host.device.cast::<ID3D12Device1>(),
+        buffer.cast::<ID3D12Pageable>(),
+    ) else {
+        return;
+    };
+    // SAFETY: one live pageable object and its priority.
+    let set =
+        unsafe { device.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_LOW) };
+    if let Err(e) = set {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::debug!(error = %e, "no residency priorities on this host"));
+    }
+}
+
 /// Logs the copies in video memory and what moved, per frame over `frames`
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -295,22 +388,37 @@ pub(crate) fn log(frames: f64) {
     let mb = |b: u64| b as f64 / 1e6;
     let [refused, refused_bytes] = [0, 1].map(|i| REFUSED[i].swap(0, Relaxed));
     let [pulled, copies] = [0, 1].map(|i| PULLED[i].swap(0, Relaxed));
-    let reading = reading(&mut LAST.lock().unwrap_or_else(|e| e.into_inner()));
+    let by = [0, 1, 2].map(|i| PULLED_BY[i].swap(0, Relaxed));
+    let (reading, full) = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        (reading(&mut last), last.full)
+    };
     tracing::info!(
         "host copies in video memory: {} of read-only buffers ({:.0} MB), {} of written ones ({:.0} MB), {:.0} MB in all \
-         (cap {:.0} MB; card {:.0} of {:.0} MB); refused for the budget {refused} ({:.0} MB); \
-         shaders' writes brought back {:.2} MB/frame in {:.1} GPU copies/frame",
+         (cap now {:.0} MB; card {:.0} of {:.0} MB{}); refused for the budget {refused} ({:.0} MB); \
+         shaders' writes brought back {:.2} MB/frame in {:.1} GPU copies/frame \
+         (declared ranges {:.2}, marked pages {:.2}, computed-address pages {:.2} MB/frame); \
+         system commit they add: about the MB in all (a GPU upload heap is charged about its size; \
+         the system memory sides are the copies made without the switch)",
         LIVE[1].load(Relaxed),
         mb(LIVE_BYTES[1].load(Relaxed)),
         LIVE[2].load(Relaxed),
         mb(LIVE_BYTES[2].load(Relaxed)),
         mb(own()),
-        mb(cap().or(reading.map(|r| r.budget / 4)).unwrap_or(0)),
+        mb(reading.map_or(cap().unwrap_or(0), |r| limit(r, own(), cap()))),
         mb(reading.map_or(0, |r| r.usage)),
         mb(reading.map_or(0, |r| r.budget)),
+        if full {
+            ", past 85 %: admitting none"
+        } else {
+            ""
+        },
         mb(refused_bytes),
         mb(pulled) / frames,
         copies as f64 / frames,
+        mb(by[0]) / frames,
+        mb(by[1]) / frames,
+        mb(by[2]) / frames,
     );
 }
 
@@ -355,12 +463,13 @@ pub(crate) mod tests {
         false
     }
 
-    /// The admission rule: within the cap and under nine tenths of the
-    /// budget, nothing without a reading, and #693's numbers refused.
+    /// The admission rule: within the cap and under 85 % of the budget,
+    /// nothing without a reading, and #693's numbers refused.
     #[test]
     fn copies_go_to_video_memory_within_the_cap_and_the_budget() {
         const GB: u64 = 1 << 30;
         let r = |budget: u64, usage: u64| Some(Reading { budget, usage });
+        let admits = |reading, own, size, cap| admits(reading, own, size, cap, &mut false);
         assert!(
             admits(r(8 * GB, GB), 0, GB, None),
             "room under a quarter of the budget"
@@ -374,8 +483,8 @@ pub(crate) mod tests {
             "a cap set by hand"
         );
         assert!(
-            !admits(r(10 * GB, 8 * GB + GB / 2), 0, GB, None),
-            "into the last tenth of the budget"
+            !admits(r(10 * GB, 8 * GB), 0, GB, None),
+            "into the last 15 % of the budget"
         );
         // #693: 19,042 MB of a 10,570 MB budget.
         assert!(
@@ -386,5 +495,83 @@ pub(crate) mod tests {
             !admits(None, 0, 64 << 10, Some(GB)),
             "no reading, no copy in video memory"
         );
+    }
+
+    /// The margin left to textures, render targets and depth buffers, with
+    /// a title run's numbers (an 11,668 MB budget): the cap shrinks as
+    /// others' use grows, even below what copies hold; past 85 % nothing is
+    /// admitted, and nothing until use is back under 75 %, however small
+    /// the copy.
+    #[test]
+    fn the_cap_shrinks_as_the_card_fills_and_copies_wait_near_a_full_budget() {
+        const MB: u64 = 1 << 20;
+        let budget = 11_668 * MB;
+        let at = |others: u64, own: u64| Reading {
+            budget,
+            usage: others + own,
+        };
+        // Before the title's textures: a quarter of the budget.
+        assert_eq!(limit(at(2_000 * MB, 0), 0, None), budget / 4);
+        // Textures took 9,800 MB: under 118 MB left for copies.
+        let left = limit(at(9_800 * MB, 0), 0, None);
+        assert!((117 * MB..119 * MB).contains(&left), "{} MB", left / MB);
+        assert!(
+            limit(at(9_800 * MB, 1_231 * MB), 1_231 * MB, None) < 1_231 * MB,
+            "below what copies hold: no more of them"
+        );
+        assert!(
+            limit(at(9_800 * MB, 0), 0, Some(4_000 * MB)) == left,
+            "a cap set by hand shrinks too"
+        );
+        let mut full = false;
+        assert!(!admits(
+            Some(at(2_000 * MB, 2_900 * MB)),
+            2_900 * MB,
+            64 * MB,
+            None,
+            &mut full
+        ));
+        assert!(!full, "refused for the cap, not near a full budget");
+        assert!(admits(Some(at(9_800 * MB, 0)), 0, 64 * MB, None, &mut full));
+        assert!(!admits(
+            Some(at(9_800 * MB, 0)),
+            0,
+            128 * MB,
+            None,
+            &mut full
+        ));
+        assert!(full, "past 85 % with it");
+        full = false;
+        // The title run's end: 11,063 MB in use, 1,231 MB of it copies.
+        assert!(!admits(
+            Some(at(9_832 * MB, 1_231 * MB)),
+            1_231 * MB,
+            64 << 10,
+            None,
+            &mut full
+        ));
+        assert!(full, "past 85 %");
+        // Textures gave back room: 80 % in use, under the margin, but the
+        // budget was full a moment ago.
+        let own = 100 * MB;
+        let eighty = budget / 10 * 8 - own;
+        assert!(!admits(
+            Some(at(eighty, own)),
+            own,
+            64 << 10,
+            None,
+            &mut full
+        ));
+        assert!(full, "still waiting");
+        // Back under 75 %.
+        let seventy = budget / 100 * 74 - own;
+        assert!(admits(
+            Some(at(seventy, own)),
+            own,
+            64 << 10,
+            None,
+            &mut full
+        ));
+        assert!(!full);
     }
 }

@@ -3051,6 +3051,75 @@ void main(uint lane : SV_GroupIndex) {
         host.release(all, total);
     }
 
+    /// A host copy whose GPU side is in video memory (`VICTORY_VRAM_COPIES`,
+    /// `crate::vram`) costs a list no more dynamic slots than one in system
+    /// memory: over 8 submissions, root views of each (read and written, at
+    /// two addresses in the copy) take the same slots per list, one view per
+    /// copy and kind, and the copy in video memory keeps the one GPU address
+    /// and buffer it was made with.
+    #[test]
+    fn a_copy_in_video_memory_takes_no_more_dynamic_slots_than_one_in_system_memory() {
+        use crate::vram::Class;
+        use crate::vram::tests::{FAKE, in_child};
+        if !in_child(
+            "draw::tests::a_copy_in_video_memory_takes_no_more_dynamic_slots_than_one_in_system_memory",
+            "1",
+        ) {
+            return;
+        }
+        let host = crate::host::host().expect("a host GPU");
+        const MIB: u64 = 1 << 20;
+        // Room for the first copy; the card full for the second.
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let (a, b) = (buffer(MIB), buffer(MIB));
+        let (a_bytes, _) = crate::resource::buffer_bytes(a).unwrap();
+        let (b_bytes, _) = crate::resource::buffer_bytes(b).unwrap();
+        let (a, b) = (a_bytes as u64, b_bytes as u64);
+        let vram = crate::shadow::find(a, 1).expect("a copy");
+        *FAKE.lock().unwrap() = Some((1 << 30, 1 << 30));
+        let system = crate::shadow::find(b, 1).expect("a copy");
+        assert_eq!((vram.class(), system.class()), (Class::VramRead, Class::System));
+        let made = (vram.gpu(a), vram.buffer.as_raw() as usize);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+        for round in 0..8 {
+            let mut taken = Vec::new();
+            let mut states = Vec::new();
+            for (list, address) in lists.iter().zip([a, b]) {
+                if round > 0 {
+                    list.reset();
+                }
+                let free = heap_host.dynamic_free().0;
+                let mut state = State::default();
+                state.set_heaps(&[heap]);
+                state.set_view(true, 0, address + 0x100);
+                state.set_view(true, 1, address + 0x8000);
+                let read = state.root_view(list, true, 0, false).expect("a root view");
+                assert_eq!(state.root_view(list, true, 1, false).map(|v| v.0), Some(read.0), "one view per copy");
+                state.root_view(list, true, 0, true).expect("a written root view");
+                state.root_view(list, true, 1, true).expect("a written root view");
+                taken.push((free - heap_host.dynamic_free().0, state.root_slots.len()));
+                list.close();
+                states.push(state);
+            }
+            assert_eq!(taken[0], taken[1], "round {round}: the same slots in video memory and in system memory");
+            assert_eq!(taken[0].1, 2, "round {round}: a read view and a written one");
+            host.execute(&[&lists[0], &lists[1]]);
+            // The lists are done with their slots (they go back at reset).
+            drop(states);
+            assert_eq!(
+                (vram.gpu(a), vram.buffer.as_raw() as usize),
+                made,
+                "round {round}: the GPU address and buffer it was made with"
+            );
+        }
+    }
+
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
     fn title_memory(bytes: usize) -> u64 {
         let layout = std::alloc::Layout::from_size_align(bytes, 1 << 16).unwrap();
