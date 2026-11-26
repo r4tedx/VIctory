@@ -1,7 +1,6 @@
-//! Host copies of title buffers in video memory (opt-in,
-//! `VICTORY_VRAM_COPIES`: `=1` for buffers the title made without
-//! unordered access, `=2` for those shaders may write too; unset or `=0`
-//! for none).
+//! Host copies of title buffers in video memory (`VICTORY_VRAM_COPIES`:
+//! unset or `=2`, the default, for every buffer; `=1` for buffers the
+//! title made without unordered access only; `=0` for none).
 //!
 //! A title buffer's host copy ([`crate::shadow`]) is a buffer in system
 //! memory that the CPU maps and shaders read across the bus. Here a copy
@@ -61,10 +60,13 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| level_of(std::env::var_os("VICTORY_VRAM_COPIES").as_deref()))
 }
 
-/// [`level`] from the switch's value: unset or `0` none, `1` read-only
-/// copies, `2` every copy; any other value means 1, as `=1` did before.
+/// [`level`] from the switch's value: unset is 2 (every copy, the default
+/// since play/main-next-4, after the GPU thread's run N2P), `0` none, `1`
+/// read-only copies, `2` every copy; any other value means 1, as `=1` did
+/// before.
 fn level_of(value: Option<&std::ffi::OsStr>) -> u8 {
     match value {
+        None => 2,
         Some(v) if v == "2" => 2,
         v if crate::switch::value_is_on(v) => 1,
         _ => 0,
@@ -491,12 +493,12 @@ pub(crate) fn log(frames: f64) {
 pub(crate) mod tests {
     use super::*;
 
-    /// `VICTORY_VRAM_COPIES` is opt-in: unset or `0` none, `1` read-only
-    /// copies, `2` every copy; any other value 1, as before.
+    /// `VICTORY_VRAM_COPIES`: unset is 2 (every copy), `0` none, `1`
+    /// read-only copies, `2` every copy; any other value 1, as before.
     #[test]
-    fn vram_copies_are_opt_in() {
+    fn vram_copies_are_every_copy_by_default() {
         use std::ffi::OsStr;
-        assert_eq!(level_of(None), 0, "unset");
+        assert_eq!(level_of(None), 2, "unset");
         for (value, want) in [("0", 0), ("1", 1), ("2", 2), ("yes", 1), ("", 1)] {
             assert_eq!(level_of(Some(OsStr::new(value))), want, "{value:?}");
         }

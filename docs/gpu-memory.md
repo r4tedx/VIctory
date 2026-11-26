@@ -106,7 +106,8 @@ xychart-beta
 So a copy shaders use heavily belongs in video memory, but the CPU must
 never read it there. Two switches act on that, both off by default
 (`=1` turns one on). They come after P-0a's video memory copies
-(`VICTORY_VRAM_COPIES=1` or `=2`, also opt-in, `crate::vram`): a new copy tries
+(`VICTORY_VRAM_COPIES`, every copy by default, `=1` read-only ones, `=0`
+none; `crate::vram`): a new copy tries
 video memory under its budget first, then a GPU upload heap if these ask
 for one, then system memory. The chosen placement is logged once when
 the host device is made.

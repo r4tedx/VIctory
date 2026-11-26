@@ -333,7 +333,7 @@ mod tests {
     /// Host copies go to GPU upload heaps only when asked
     /// (`VICTORY_GPU_UPLOAD=1`, and `VICTORY_GPU_UPLOAD_WRITES=1` for the
     /// written ones too) and the host has them: unset or `=0` keeps them
-    /// in system memory (or P-0a's video memory, `crate::vram`, if asked).
+    /// in system memory (or P-0a's video memory, `crate::vram`, by default).
     #[test]
     fn upload_placement_follows_the_switches_and_the_heaps() {
         use super::placement;
@@ -3803,8 +3803,8 @@ impl Host {
                 upload_written = written,
                 gpu_upload_heaps = heaps,
                 "host copies of title buffers: in video memory under its budget first \
-                 (VICTORY_VRAM_COPIES=2 every copy, =1 read-only ones; off by \
-                 default), then in GPU upload heaps (VICTORY_GPU_UPLOAD=1 for read-only \
+                 (VICTORY_VRAM_COPIES: every copy by default or with =2, read-only \
+                 ones with =1, none with =0), then in GPU upload heaps (VICTORY_GPU_UPLOAD=1 for read-only \
                  copies, VICTORY_GPU_UPLOAD_WRITES=1 for written ones; off by default), \
                  then system memory"
             );
