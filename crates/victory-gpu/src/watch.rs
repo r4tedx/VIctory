@@ -293,10 +293,13 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages.
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
+/// Guards the other mappings of taken pages; returns the taken pages with
+/// another mapping that could not be guarded (a write the guards do not see
+/// under way there): a write there would go unseen, so they stay changed.
+fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    pairs.iter().filter(|(_, a)| !guarded.contains(a)).map(|&(p, _)| p).collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -504,7 +507,8 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
+        let unguarded = guard_aliases(&mut g, &others);
+        let whole: Vec<usize> = whole.into_iter().filter(|p| !unguarded.contains(p)).collect();
         #[cfg(feature = "diagnostics")]
         drop(asked);
         let mut unmapped = Vec::new();
@@ -542,8 +546,9 @@ impl Tracked {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        let unguarded = guard_aliases(&mut g, &others);
+        let pages: Vec<usize> = pages.iter().copied().filter(|p| !unguarded.contains(p)).collect();
+        for page in protect(&mut g, &pages) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -681,26 +686,32 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
-    for page in others {
-        changed_here(g, page, page + 1, save);
+    // Every tracker is marked (and keeps the bytes) before any of the pages
+    // is opened: once open, another thread writes them without a fault and
+    // without our lock, and that write must find the trackers marked
+    // already ([`Tracked::clean`] reads them without a lock) and the bytes
+    // from before it kept.
+    mark_changed(g, first, last, save);
+    for &page in &others {
+        mark_changed(g, page, page + 1, save);
     }
-    guarded
-}
-
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
+    for &page in guarded.iter().chain(&others) {
         open(g, page);
     }
+    !guarded.is_empty()
+}
+
+/// Marks `[first, last)` changed in every tracker holding it. With `save`,
+/// before the write lands: trackers armed for a page they had taken keep
+/// its bytes.
+fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -715,7 +726,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -1249,6 +1259,24 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// A page taken while another mapping of it is being written unseen
+    /// ([`writing`]) cannot be guarded there: it stays changed (from #2136's
+    /// f85763e0).
+    #[test]
+    fn taking_alias_while_other_mapping_is_busy_keeps_page_changed() {
+        let (a, b) = twin_views(1);
+        let tb = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
+        let write = writing(a, 8);
+        assert!(tb.changed(b / PAGE));
+        assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert!(tb.changed(b / PAGE) && !tb.clean(), "the other mapping is open");
+        drop(write);
+        assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert!(tb.clean(), "both mappings are guarded now");
+        drop(tb);
     }
 
     /// `pages` pages of a fresh pagefile section mapped twice (as the
