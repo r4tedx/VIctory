@@ -2266,8 +2266,20 @@ impl State {
         // Thread counts (`VICTORY_DISPATCH_THREADS`) are divided into whole
         // groups where records are copied into a list-owned buffer (the
         // rewrite): the clamp works in place in the title buffer's copy,
-        // where it would divide them again at every execution.
-        let threads = if dispatch.is_some() { threads } else { 0 };
+        // where it would divide them again at every execution. Not with
+        // batched clamps (`VICTORY_BATCH_CLAMPS`): the rewrite would end
+        // their window at every such dispatch.
+        let threads = if dispatch.is_none() {
+            0
+        } else if threads != 0 && crate::indirect::batching() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("VICTORY_DISPATCH_THREADS: indirect thread counts not applied with batched clamps");
+            });
+            0
+        } else {
+            threads
+        };
         let rewrite = waves > 1 || threads != 0;
         let host_stride = if rewrite { 12 } else { stride };
         let Some(mut signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
