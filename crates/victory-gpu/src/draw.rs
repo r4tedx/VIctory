@@ -309,6 +309,70 @@ const SLOTS_TAKEN_BACK: usize = 3;
 static TABLE_SLOTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FRESH_TABLES: crate::descriptor::host::Bands = crate::descriptor::host::Bands::new();
 
+/// Title tables used in place (below the host's title slots), by the
+/// slot they start at: once per table and draw.
+pub(crate) static TABLES_IN_PLACE: crate::descriptor::host::Bands = crate::descriptor::host::Bands::new();
+
+/// What a cache of fresh tables shared by lists would save
+/// (`top-band-tables.md`, step 0): fresh tables made; of them, the same
+/// table and records as one another list made this frame, and the same
+/// records as the last one made of that table; distinct tables a frame's
+/// draws used fresh, and their slots; nanoseconds in the fresh-table path
+/// (slots taken, views made).
+static FRESH_CENSUS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const FRESH_MADE: usize = 0;
+const FRESH_DUPLICATE: usize = 1;
+const FRESH_UNCHANGED: usize = 2;
+const FRESH_DISTINCT: usize = 3;
+const FRESH_DISTINCT_SLOTS: usize = 4;
+const FRESH_NS: usize = 5;
+
+/// The tables of [`FRESH_CENSUS`] (title table, slots): records made
+/// this frame, used this frame, and the records last made.
+#[derive(Default)]
+struct FreshSeen {
+    frame: u64,
+    made: std::collections::HashSet<(u64, u32, u64)>,
+    used: std::collections::HashSet<(u64, u32)>,
+    last: std::collections::HashMap<(u64, u32), u64>,
+}
+
+static FRESH_SEEN: std::sync::LazyLock<std::sync::Mutex<FreshSeen>> = std::sync::LazyLock::new(Default::default);
+
+/// Counts a fresh table of `n` slots at title address `table` holding
+/// `records` (their hash) used by a draw, and with `made` one made.
+fn fresh_census(table: u64, n: u32, records: u64, made: bool) {
+    let mut seen = FRESH_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = crate::queue::presented();
+    if seen.frame != frame {
+        seen.frame = frame;
+        seen.made.clear();
+        seen.used.clear();
+    }
+    if !made {
+        if seen.used.insert((table, n)) {
+            FRESH_CENSUS[FRESH_DISTINCT].fetch_add(1, Ordering::Relaxed);
+            FRESH_CENSUS[FRESH_DISTINCT_SLOTS].fetch_add(u64::from(n), Ordering::Relaxed);
+        }
+        return;
+    }
+    FRESH_CENSUS[FRESH_MADE].fetch_add(1, Ordering::Relaxed);
+    // Within a list the same table and records is made once, so a table
+    // made already this frame was made by another list.
+    if !seen.made.insert((table, n, records)) {
+        FRESH_CENSUS[FRESH_DUPLICATE].fetch_add(1, Ordering::Relaxed);
+    }
+    if seen.last.insert((table, n), records) == Some(records) {
+        FRESH_CENSUS[FRESH_UNCHANGED].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`FRESH_CENSUS`] since the last call: made, made by another list this
+/// frame too, unchanged since last made, distinct used, their slots, ns.
+pub(crate) fn take_fresh_census() -> [u64; 6] {
+    FRESH_CENSUS.each_ref().map(|a| a.swap(0, Ordering::Relaxed))
+}
+
 /// Dynamic slots taken for fresh tables since the last call.
 pub(crate) fn take_table_slots() -> u64 {
     TABLE_SLOTS.swap(0, Ordering::Relaxed)
@@ -1760,6 +1824,8 @@ impl State {
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
+        // The census of tables used in place, once per table and call.
+        let mut counted: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -1779,6 +1845,11 @@ impl State {
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+            } else if !counted.contains(&u.slot) {
+                counted.push(u.slot);
+                if let Some(first) = heap.index(table) {
+                    TABLES_IN_PLACE.add(first, 1);
+                }
             }
         }
         fresh.sort_unstable();
@@ -1820,6 +1891,7 @@ impl State {
                 }
                 (table, h.finish())
             };
+            fresh_census(table, n, key.1, false);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -1830,6 +1902,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            let started = std::time::Instant::now();
             let Some(first) = self.take_slots(std::ptr::from_ref(heap) as usize, host, n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
@@ -1867,6 +1940,8 @@ impl State {
                     }
                 }
             }
+            FRESH_CENSUS[FRESH_NS].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            fresh_census(table, n, key.1, true);
             made.push((slot, first * 32));
         }
         made
@@ -3321,6 +3396,29 @@ void main(uint lane : SV_GroupIndex) {
         assert_eq!(host.dynamic_free().0, 1024);
         host.release(all, total);
         assert_eq!(host.dynamic_free(), (total, total));
+    }
+
+    /// The fresh-table census: a table made in a second list this frame is
+    /// counted as made by another list, a table made again with its last
+    /// records as unchanged, and each table used once a frame as distinct.
+    #[test]
+    fn the_fresh_table_census_tells_duplicates_and_unchanged_records() {
+        take_fresh_census();
+        let frame = crate::queue::presented();
+        // A table no other test uses.
+        let table = 0x7777_0000_0000;
+        fresh_census(table, 8, 1, false);
+        fresh_census(table, 8, 1, true);
+        fresh_census(table, 8, 1, false);
+        fresh_census(table, 8, 1, true);
+        fresh_census(table, 4, 2, false);
+        fresh_census(table, 4, 2, true);
+        let [made, duplicate, unchanged, distinct, slots, _] = take_fresh_census();
+        if crate::queue::presented() != frame {
+            return; // a frame went by meanwhile
+        }
+        assert_eq!((made, duplicate, unchanged), (3, 1, 1));
+        assert_eq!((distinct, slots), (2, 12));
     }
 
     /// A list the title submits again without a reset is never taken from:
