@@ -387,6 +387,12 @@ pub(crate) mod tests {
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// Holds submissions off while it lives (they take every write mark at
+    /// their copy-back), for tests that set marks themselves.
+    pub(crate) fn no_submission() -> Option<std::sync::MutexGuard<'static, u64>> {
+        super::host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))

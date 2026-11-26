@@ -1594,6 +1594,104 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// Memory the title frees while shaders write its copy, and allocates
+    /// again at the same address with new bytes, keeps the new bytes once
+    /// the free is reported (as `XMemFreeDefault` reports it, before the
+    /// host can hand the memory out again), whichever copy-back would have
+    /// put the shaders' there: a declared range's snapshot, a marked page, a
+    /// page at a computed address. Unreported, the shaders' bytes land in
+    /// the new memory on all three: the control.
+    #[test]
+    fn memory_freed_and_allocated_again_keeps_the_new_bytes_once_reported() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free, pool};
+        use crate::watch::title_memory_remapped;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // Nothing else takes the marks set below.
+        let _one = crate::host::tests::no_submission();
+        let len = 3 * PAGE;
+        for report in [false, true] {
+            // Another test may allocate at the address between the free and
+            // the new allocation: then tried again elsewhere.
+            let mut tries = 0;
+            let (p, copy, b) = loop {
+                tries += 1;
+                assert!(tries <= 8, "an address allocated again");
+                let p = pool(3);
+                register(p, p as u64, len as u64);
+                let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+                    unregister(p, p as u64);
+                    free(p);
+                    return; // no host GPU here
+                };
+                // The submission begins.
+                copy.update(p, len);
+                // Page 0 declared (a snapshot), 1 marked, 2 neither
+                // (written at a computed address). The shaders write a byte
+                // in each.
+                copy.writing(p, PAGE, false);
+                copy.writing(p + PAGE, PAGE, true);
+                for k in 0..3 {
+                    copy.write_host((p + k * PAGE + 10) as u64, &[0x99]);
+                }
+                // Meanwhile the title frees the memory and allocates it
+                // again at the same address.
+                if report {
+                    title_memory_remapped(p, len);
+                }
+                free(p);
+                // SAFETY: a fresh allocation where ours was, freed below.
+                let again = unsafe {
+                    VirtualAlloc(
+                        p as *const _,
+                        len,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                } as usize;
+                if again == p {
+                    break (p, copy, b);
+                }
+                if again != 0 {
+                    free(again);
+                }
+                unregister(p, p as u64);
+            };
+            // The title fills the new memory.
+            // SAFETY: our new allocation, read-write.
+            unsafe { (p as *mut u8).write_bytes(0xee, len) };
+            let n = copy.marks.expect("tracked memory gets mark bits") as usize + 1;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+            copy_back_marks(&[], false);
+            copy.copy_back(p, PAGE);
+            copy.copy_back_page(p + 2 * PAGE);
+            // SAFETY: a byte of our allocation.
+            let read = |k: usize| unsafe { ((p + k * PAGE + 10) as *const u8).read_volatile() };
+            let got = [read(0), read(1), read(2)];
+            if report {
+                assert_eq!(
+                    got,
+                    [0xee; 3],
+                    "reported: the new memory keeps the title's bytes (snapshot, marked page, computed address)"
+                );
+                // The copy takes the new memory at its next refresh.
+                assert!(copy.update(p, len) >= len);
+                assert_eq!(copy.read_host((p + 8) as u64, 1)[0].to_le_bytes()[2], 0xee);
+            } else {
+                assert_eq!(
+                    got,
+                    [0x99; 3],
+                    "unreported, the shaders' bytes land in the new memory (the control)"
+                );
+            }
+            unregister(p, p as u64);
+            drop(copy);
+            free(p);
+        }
+    }
+
     /// What a frame withheld leaves every host copy of its memory at the
     /// frame's end (run textures9's shape): in frame N a program using title
     /// memory writes a record into the copies and the frame misses, so it
