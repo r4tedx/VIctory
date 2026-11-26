@@ -128,6 +128,12 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    static MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let draws = drawn.saturating_sub(before);
+    if first_world_frame(&MARKED, draws) {
+        // The play line's words, which the run tools look for (`compare-runs`).
+        tracing::info!(frame, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -140,6 +146,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 "));
         }
     }
+}
+
+/// Whether a frame that ran `draws` draws on the host is the world's first:
+/// the first of 500 draws or more (`marked` says one was found already).
+/// The world marker of our play line: logged once in every build with
+/// diagnostics, with `VICTORY_CAPTURE_WORLD` or not.
+fn first_world_frame(marked: &std::sync::atomic::AtomicBool, draws: u64) -> bool {
+    draws >= 500 && !marked.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether frame `n` is saved.
@@ -860,5 +874,18 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod world_marker_tests {
+    /// The world's first frame is the first of 500 draws or more, once.
+    #[test]
+    fn the_world_marker_is_the_first_frame_of_500_draws_once() {
+        let marked = std::sync::atomic::AtomicBool::new(false);
+        assert!(!super::first_world_frame(&marked, 0));
+        assert!(!super::first_world_frame(&marked, 499), "a menu of 499 draws");
+        assert!(super::first_world_frame(&marked, 500), "the world");
+        assert!(!super::first_world_frame(&marked, 7_500), "once only");
     }
 }
