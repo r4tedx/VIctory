@@ -167,9 +167,32 @@ pub(crate) fn let_go_idle_staging() {
     if !on || now < last + 1000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
         return;
     }
-    let (ms, frames) = staging_idle_time(STAGING[1].load(Relaxed));
+    let (ms, frames) = staging_idle_time(STAGING[1].load(Relaxed), idle_frames());
     let_go_staging(now, crate::queue::presented(), ms, frames, |_| true);
 }
+
+/// Frames a staging buffer goes unused before it may go while staging is
+/// under [`STAGING_PRESSURE`] (`VICTORY_STAGING_IDLE_FRAMES`, default
+/// [`IDLE_FRAMES`]; 0: the 2 s and 2 frames of before).
+fn idle_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_IDLE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(IDLE_FRAMES)
+    })
+}
+
+/// See [`idle_frames`]: at ~1 frame a second, 2 s was 2 frames, and a
+/// texture the title writes every third frame had its buffer let go and
+/// made again (a new upload buffer, its first-touch faults and a whole
+/// detiling) between each use.
+const IDLE_FRAMES: u64 = 30;
+
+/// Staging bytes alive under which no buffer goes for being idle (with
+/// [`idle_frames`] above 0): a quarter of [`STAGING_PRESSURE`].
+const STAGING_FLOOR: u64 = STAGING_PRESSURE / 4;
 
 /// Staging bytes alive past which an idle buffer goes as soon as a frame
 /// was presented without it.
@@ -182,13 +205,19 @@ const STAGING_PRESSURE: u64 = 512 << 20;
 /// L4Fa/L4Fa2, where commit ran out), and letting 1.6 GB go brought the
 /// process's private bytes down by 1.4 GB. Past [`STAGING_PRESSURE`] one
 /// goes once a frame was presented since its last use; under it, after
-/// 2 s and 2 frames (a texture the title writes every frame or two keeps
-/// its buffer). A buffer a list holds stays either way.
-fn staging_idle_time(alive: u64) -> (u64, u64) {
+/// 2 s and `frames` frames ([`idle_frames`]), and none goes while
+/// [`STAGING_FLOOR`] or fewer bytes are alive. With `frames` 0, as before:
+/// 2 s and 2 frames whatever is alive (a texture the title writes every
+/// frame or two keeps its buffer). A buffer a list holds stays either way.
+fn staging_idle_time(alive: u64, frames: u64) -> (u64, u64) {
     if alive > STAGING_PRESSURE {
         (0, 1)
-    } else {
+    } else if frames == 0 {
         (2_000, 2)
+    } else if alive <= STAGING_FLOOR {
+        (u64::MAX, u64::MAX)
+    } else {
+        (2_000, frames)
     }
 }
 
@@ -520,8 +549,16 @@ impl Staging {
     pub(crate) fn refresh(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        // The first detiling of one made again after one was let go.
+        #[cfg(feature = "diagnostics")]
+        let again = self.force.load(Relaxed);
         let (read, changed) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
+        #[cfg(feature = "diagnostics")]
+        if again {
+            let us = started.elapsed().as_micros() as u64;
+            crate::copystat::add(crate::copystat::C::StagingRemadeDetileUs, us);
+        }
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         changed
@@ -719,6 +756,8 @@ fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<S
         }
         return Some(s.clone());
     }
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -789,6 +828,17 @@ fn staging(resource: This, texture: &ID3D12Resource, used: bool) -> Option<Arc<S
     s.touch();
     STAGING[0].fetch_add(1, Relaxed);
     STAGING[1].fetch_add(total, Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let us = making.elapsed().as_micros() as u64;
+        add(C::StagingMade, 1);
+        add(C::StagingMadeUs, us);
+        if force {
+            add(C::StagingRemade, 1);
+            add(C::StagingRemadeUs, us);
+        }
+    }
     held.live = Some(s.clone());
     drop(held);
     STAGED
@@ -804,13 +854,95 @@ mod tests {
 
     #[test]
     fn staging_goes_sooner_past_the_pressure_line() {
-        assert_eq!(staging_idle_time(0), (2_000, 2));
-        assert_eq!(staging_idle_time(STAGING_PRESSURE), (2_000, 2));
+        // `VICTORY_STAGING_IDLE_FRAMES=0`: the rule of before.
+        assert_eq!(staging_idle_time(0, 0), (2_000, 2));
+        assert_eq!(staging_idle_time(STAGING_PRESSURE, 0), (2_000, 2));
         assert_eq!(
-            staging_idle_time(STAGING_PRESSURE + 1),
+            staging_idle_time(STAGING_PRESSURE + 1, 0),
             (0, 1),
             "a frame without it is enough"
         );
+        // Counted in frames.
+        let n = IDLE_FRAMES;
+        assert_eq!(staging_idle_time(0, n), (u64::MAX, u64::MAX), "nothing goes under the floor");
+        assert_eq!(staging_idle_time(STAGING_FLOOR, n), (u64::MAX, u64::MAX));
+        assert_eq!(staging_idle_time(STAGING_FLOOR + 1, n), (2_000, n));
+        assert_eq!(staging_idle_time(STAGING_PRESSURE, n), (2_000, n));
+        assert_eq!(staging_idle_time(STAGING_PRESSURE + 1, n), (0, 1), "the cap's pressure path stays");
+    }
+
+    /// At about a frame a second, a texture the title writes every third
+    /// frame keeps its staging buffer when idleness is counted in frames
+    /// (none made again), and loses it each time under the 2 s / 2 frame
+    /// rule. Unused past the frames counted, it goes; past the cap, a
+    /// frame without it is enough.
+    #[test]
+    fn staging_kept_at_low_frame_rates_counted_in_frames() {
+        let p = crate::watch::tests::pool(4);
+        let words = crate::resource::texture_words(256, 256, 28, 1);
+        let Some(r) = crate::resource::texture_at(p as u64, &words) else {
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let host = host().expect("a host GPU");
+        let copy = crate::resource::host_copy(r).expect("its host copy");
+        let texture = copy.texture.clone();
+        let mine = |h: &crate::resource::HostTexture| std::ptr::eq(h, &raw const *copy);
+        let live = || copy.staging.lock().unwrap_or_else(|e| e.into_inner()).live.clone();
+        // Staging in use between the floor and the cap, as in play.
+        let alive = STAGING_FLOOR + (STAGING_PRESSURE - STAGING_FLOOR) / 2;
+        let (t0, f0) = (crate::resource::now_ms() + 1_000_000, crate::queue::presented() + 1_000);
+        // A frame at 0.8 s apart (1.25 frames a second) and the sweep at
+        // its present; every third frame the title writes the texture and
+        // the heap's upload takes it (and marks the buffer used then).
+        let run = |frames: u64, every: u64| -> (u64, u64) {
+            let (mut went, mut made) = (0, 0);
+            for k in 0..frames {
+                let (now, frame) = (t0 + k * 800, f0 + k);
+                let (ms, n) = staging_idle_time(alive, every);
+                went += let_go_staging(now, frame, ms, n, mine).0;
+                if k % 3 == 0 {
+                    // SAFETY: committed pages of ours: the title writes its texture.
+                    unsafe { ((p + 100 + k as usize) as *mut u8).write_volatile(k as u8 + 1) };
+                    made += u64::from(live().is_none());
+                    let list = host.new_list().expect("a list");
+                    assert!(upload_changed(&list, r, &texture), "changed memory is uploaded");
+                    list.close();
+                    list.reset();
+                    let s = live().expect("its buffer");
+                    s.used[0].store(now, Relaxed);
+                    s.used[1].store(frame, Relaxed);
+                }
+            }
+            (went, made)
+        };
+        // The first upload makes one; frame-counted, it is kept from then on.
+        let (went, made) = run(30, IDLE_FRAMES);
+        assert_eq!((went, made), (0, 1), "kept between uses: none made again");
+        // The rule of before lets it go before each use, and it is made again.
+        let (went, made) = run(30, 0);
+        assert!(went >= 9 && made >= 9, "{went} let go, {made} made");
+        // Unused past the frames counted, it goes; not a frame before.
+        let s = live().expect("its buffer");
+        let (used_ms, used) = (s.used[0].load(Relaxed), s.used[1].load(Relaxed));
+        drop(s);
+        let (ms, n) = staging_idle_time(alive, IDLE_FRAMES);
+        let later = |frames: u64| let_go_staging(used_ms + frames * 800, used + frames, ms, n, mine).0;
+        assert_eq!(later(IDLE_FRAMES - 1), 0, "a frame too soon");
+        assert_eq!(later(IDLE_FRAMES), 1, "idle for the frames counted");
+        // Past the cap, a frame without it is enough.
+        let list = host.new_list().expect("a list");
+        upload(&list, r, &texture);
+        list.close();
+        list.reset();
+        let s = live().expect("made again");
+        let (used_ms, used) = (s.used[0].load(Relaxed), s.used[1].load(Relaxed));
+        drop(s);
+        let (ms, n) = staging_idle_time(STAGING_PRESSURE + 1, IDLE_FRAMES);
+        assert_eq!(let_go_staging(used_ms, used, ms, n, mine).0, 0, "used this frame");
+        assert_eq!(let_go_staging(used_ms, used + 1, ms, n, mine).0, 1, "gone a frame later");
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     #[test]

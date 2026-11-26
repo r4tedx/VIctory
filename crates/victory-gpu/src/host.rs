@@ -1232,11 +1232,17 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // SAFETY: querying the fence owned by this queue.
         if unsafe { self.fence.GetCompletedValue() } >= *submitted {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::ReapUs);
             crate::memory::reap_loose();
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
-        crate::descriptor::sync_heaps();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+            crate::descriptor::sync_heaps();
+        }
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1290,6 +1296,8 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         // Snapshots of copies in video memory read their mirrors: brought up
         // to date at once, and kept so until the copy-backs.
+        #[cfg(feature = "diagnostics")]
+        let ahead = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotsAheadUs);
         let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
             .iter()
             .flat_map(|l| {
@@ -1306,6 +1314,8 @@ impl Host {
             })
             .collect();
         crate::shadow::snapshots_ahead(&snapshots);
+        #[cfg(feature = "diagnostics")]
+        drop(ahead);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1321,7 +1331,11 @@ impl Host {
         // What the host wrote into lookup tables in video memory since the
         // last submission (`VICTORY_TABLES_VRAM=copy`), before any list
         // reads them; held until the submission has run.
+        #[cfg(feature = "diagnostics")]
+        let tabled = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TableCopiesUs);
         let table_copies = crate::tables::copies(self);
+        #[cfg(feature = "diagnostics")]
+        drop(tabled);
         if let Some(c) = &table_copies {
             lists.insert(0, Some(c.list.clone()));
             for first in firsts.iter_mut().skip(1) {

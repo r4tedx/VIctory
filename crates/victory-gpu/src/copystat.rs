@@ -97,8 +97,24 @@ pub(crate) enum C {
     /// Spans copy-backs wrote into title memory (marked pages and declared
     /// ranges alike).
     BackSpans,
+    /// Preparing submissions, parts no other counter times: reaping loose
+    /// memory, bringing the title's own heap copies in (`sync_heaps`),
+    /// snapshots ahead of video-memory copies, lookup-table copies.
+    ReapUs,
+    SyncHeapsUs,
+    SnapshotsAheadUs,
+    TableCopiesUs,
+    /// Texture staging buffers made and the time; of them those made again
+    /// after one was let go while idle, the time making them and their
+    /// first detiling (the whole memory, into fresh upload memory).
+    StagingMade,
+    StagingMadeUs,
+    StagingRemade,
+    StagingRemadeUs,
+    StagingRemadeDetileUs,
 }
-const COUNTERS: usize = 58;
+const COUNTERS: usize = 67;
+const _: () = assert!(C::StagingRemadeDetileUs as usize + 1 == COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -210,6 +226,26 @@ pub(crate) fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
+/// The line of the parts of preparing no other counter times, and of the
+/// staging buffers made, from the counters per frame `c` (by [`C`]).
+fn untimed_line(c: &[f64]) -> String {
+    let ms = |k: C| c[k as usize] / 1e3;
+    format!(
+        "  preparing, otherwise untimed, per frame: reap_loose {:.1} ms, sync_heaps {:.1} ms, \
+         snapshots ahead {:.1} ms, table copies {:.1} ms; staging buffers made {:.1} in {:.1} ms, \
+         {:.1} of them again after being let go in {:.1} ms, their first detiling {:.1} ms",
+        ms(C::ReapUs),
+        ms(C::SyncHeapsUs),
+        ms(C::SnapshotsAheadUs),
+        ms(C::TableCopiesUs),
+        c[C::StagingMade as usize],
+        ms(C::StagingMadeUs),
+        c[C::StagingRemade as usize],
+        ms(C::StagingRemadeUs),
+        ms(C::StagingRemadeDetileUs),
+    )
+}
+
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
@@ -301,6 +337,7 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    tracing::info!("{}", untimed_line(&c));
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
@@ -331,5 +368,42 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+#[cfg(test)]
+mod untimed_tests {
+    use super::*;
+
+    /// The line of the untimed parts of preparing gives each counter, per
+    /// frame, in its place, and parses back.
+    #[test]
+    fn untimed_line_gives_each_part() {
+        let mut c = vec![0.0; COUNTERS];
+        for (k, v) in [
+            (C::ReapUs, 1_200.0),
+            (C::SyncHeapsUs, 70_400.0),
+            (C::SnapshotsAheadUs, 3_000.0),
+            (C::TableCopiesUs, 60.0),
+            (C::StagingMade, 61.0),
+            (C::StagingMadeUs, 5_500.0),
+            (C::StagingRemade, 55.5),
+            (C::StagingRemadeUs, 4_900.0),
+            (C::StagingRemadeDetileUs, 12_340.0),
+        ] {
+            c[k as usize] = v;
+        }
+        let line = untimed_line(&c);
+        assert_eq!(
+            line,
+            "  preparing, otherwise untimed, per frame: reap_loose 1.2 ms, sync_heaps 70.4 ms, \
+             snapshots ahead 3.0 ms, table copies 0.1 ms; staging buffers made 61.0 in 5.5 ms, \
+             55.5 of them again after being let go in 4.9 ms, their first detiling 12.3 ms"
+        );
+        let numbers: Vec<f64> = line
+            .split([' ', ',', ';'])
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        assert_eq!(numbers, [1.2, 70.4, 3.0, 0.1, 61.0, 5.5, 55.5, 4.9, 12.3]);
     }
 }
