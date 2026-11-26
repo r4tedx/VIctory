@@ -59,7 +59,8 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        // (Not on a host without 64-lane waves: there the builder is off.)
+        let builder = crate::pipeline::builder_allowed();
         if builder {
             return false;
         }
@@ -72,7 +73,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let builder = crate::pipeline::builder_allowed();
         if builder {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }

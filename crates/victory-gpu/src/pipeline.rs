@@ -329,8 +329,7 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let wide = wide_waves();
@@ -368,6 +367,47 @@ fn builder_runs_with(b: &mut Builder, wide: bool) -> bool {
         tracing::warn!(pipelines = b.pipelines.len(), "the ray-tracing structure builder {why}");
     }
     open
+}
+
+/// Whether the structure builder may run at all: `VICTORY_BVH_BUILDER=1`
+/// on a host with 64-lane waves. Otherwise everything is as without the
+/// switch: the builder is off, and so are the programs that walk its
+/// structures (`make::left_out`). On a host without 64-lane waves the
+/// switch is ignored: with it the builder was held back (the 32-lane
+/// guard, [`decide`]) while the walking programs ran over structures it
+/// never built, and the title crashed in loading on an RTX 5070 (cool/play
+/// run C1, a write through a null pointer at the address the #2118 thread
+/// reported for a half-run builder). Said once, when asked.
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        // (The host is asked only with the switch on.)
+        let (on, why) = allowed(asked, asked && wide_waves());
+        if asked {
+            if on {
+                tracing::info!("the ray-tracing structure builder {why}");
+            } else {
+                tracing::warn!("the ray-tracing structure builder {why}");
+            }
+        }
+        on
+    })
+}
+
+/// [`builder_allowed`] from whether `VICTORY_BVH_BUILDER=1` (`asked`) and
+/// whether the host runs 64-lane waves, and why (the log's words).
+#[cfg(windows)]
+fn allowed(asked: bool, wide: bool) -> (bool, &'static str) {
+    match (asked, wide) {
+        (false, _) => (false, "is off (VICTORY_BVH_BUILDER is not 1)"),
+        (true, false) => (
+            false,
+            "held back: the host has no 64-lane waves; VICTORY_BVH_BUILDER=1 is ignored, and the builder and              the programs that walk its structures stay off as without it",
+        ),
+        (true, true) => (true, "may run (VICTORY_BVH_BUILDER=1, a host with 64-lane waves)"),
+    }
 }
 
 /// Whether the builder runs, and why (the log's words), from whether all
@@ -859,6 +899,20 @@ mod tests {
                 "wide={wide}"
             );
         }
+    }
+
+    /// On a host without 64-lane waves `VICTORY_BVH_BUILDER=1` is ignored:
+    /// the builder and the programs that walk its structures stay off as
+    /// without it (run C1: held back alone, the walks ran over nothing and
+    /// the title crashed). Fails if a narrow host can allow the builder.
+    #[cfg(windows)]
+    #[test]
+    fn the_switch_is_ignored_on_hosts_without_64_lane_waves() {
+        assert!(!allowed(false, false).0 && !allowed(false, true).0, "off without the switch");
+        let (on, why) = allowed(true, false);
+        assert!(!on, "a host without 64-lane waves");
+        assert!(why.starts_with("held back: the host has no 64-lane waves"), "{why}");
+        assert!(allowed(true, true).0, "the switch on a host with 64-lane waves");
     }
 
     /// [`builder_runs_with`] asks the guard, also once the builder is
