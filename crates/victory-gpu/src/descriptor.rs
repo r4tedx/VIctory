@@ -231,12 +231,19 @@ pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<
         if used.is_empty() {
             return;
         }
+        for &index in &used {
+            SHADER_READS.add(index, 1);
+        }
         let made = make_used(heap, &used);
         USAGE.0.fetch_add(used.len() as u64, std::sync::atomic::Ordering::Relaxed);
         USAGE.1.fetch_add(made, std::sync::atomic::Ordering::Relaxed);
     });
     Some(gpu)
 }
+
+/// Heap slots shaders marked read (once per list that read them), by slot.
+#[cfg(windows)]
+pub(crate) static SHADER_READS: host::Bands = host::Bands::new();
 
 /// Heap slots marked read, and views made for them, since the last call.
 #[cfg(windows)]

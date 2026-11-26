@@ -192,11 +192,16 @@ impl HostHeap {
                     // shader's index past the heap reads its last slot,
                     // which no view takes (translated shaders clamp to it).
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (
-                        make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - MIN_DYNAMIC,
-                        MIN_DYNAMIC - 1,
-                    )
+                    let wanted = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok());
+                    let (kept, dynamic) = capped_split(PORTABLE_VIEWS, wanted);
+                    tracing::info!(
+                        asked = count,
+                        title_slots = kept,
+                        dynamic,
+                        wanted,
+                        "capped view heap: title slots kept and dynamic slots (VICTORY_DYNAMIC_SLOTS)"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, kept, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -350,6 +355,57 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
         Some(heap)
     })
     .as_ref()
+}
+
+/// Counts by view heap index in bands of 64 Ki slots (a view heap census
+/// for the log: where the title writes, where shaders read, where fresh
+/// tables' title tables lie), up to `HEAP_VIEWS`.
+pub(crate) struct Bands([std::sync::atomic::AtomicU64; BANDS]);
+
+const BAND: u32 = 1 << 16;
+const BANDS: usize = (victory_shader::emit::HEAP_VIEWS / BAND) as usize;
+
+impl Bands {
+    pub(crate) const fn new() -> Self {
+        Bands([const { std::sync::atomic::AtomicU64::new(0) }; BANDS])
+    }
+
+    pub(crate) fn add(&self, index: u32, n: u64) {
+        let band = ((index / BAND) as usize).min(BANDS - 1);
+        self.0[band].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The counts since the last call, as "start in Ki: count" for each
+    /// band with any ("none" if none).
+    pub(crate) fn take_text(&self) -> String {
+        let text: Vec<String> = self
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(b, n)| match n.swap(0, std::sync::atomic::Ordering::Relaxed) {
+                0 => None,
+                n => Some(format!("{}k: {n}", b as u32 * BAND / 1024)),
+            })
+            .collect();
+        if text.is_empty() { "none".into() } else { text.join(", ") }
+    }
+}
+
+/// Title writes of view heap slots (views made, descriptors copied), by
+/// slot: where the title keeps its descriptors.
+pub(crate) static TITLE_WRITES: Bands = Bands::new();
+
+/// The title slots and dynamic slots of a view heap capped at `total`
+/// (NVIDIA, 1,000,000), for a title asking for more than fit: `wanted`
+/// dynamic slots (`VICTORY_DYNAMIC_SLOTS`), else [`MIN_DYNAMIC`], kept
+/// between that and half the heap. The heap's last slot stays null
+/// (translated shaders clamp to it), so one dynamic slot fewer.
+/// More dynamic slots leave fewer title slots: tables past them are made
+/// afresh in dynamic slots, and what shaders read there by index reads
+/// dynamic slots instead (as for title slots past the cap's split now).
+pub(crate) fn capped_split(total: u32, wanted: Option<u32>) -> (u32, u32) {
+    let dynamic = wanted.unwrap_or(MIN_DYNAMIC).clamp(MIN_DYNAMIC, total / 2);
+    (total - dynamic, dynamic - 1)
 }
 
 /// What [`HostHeap::dynamic_stats`] tells.
@@ -899,6 +955,9 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        if !for_draw {
+            TITLE_WRITES.add(index, 1);
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2241,6 +2300,22 @@ mod tests {
         full.release(3, 1);
         assert_eq!(full.take_top(2), None);
         assert_eq!(full.take_top(1), Some(3));
+    }
+
+    /// A capped heap keeps its title slots first: 2^16 dynamic slots unless
+    /// more are asked for, at most half the heap, the last slot null.
+    #[test]
+    fn a_capped_heap_splits_as_asked_within_bounds() {
+        assert_eq!(capped_split(1_000_000, None), (934_464, 65_535));
+        assert_eq!(capped_split(1_000_000, Some(262_144)), (737_856, 262_143));
+        assert_eq!(capped_split(1_000_000, Some(1)), (934_464, 65_535), "never fewer than now");
+        assert_eq!(capped_split(1_000_000, Some(900_000)), (500_000, 499_999), "at most half");
+        let bands = Bands::new();
+        bands.add(5, 2);
+        bands.add(934_464, 1);
+        bands.add(u32::MAX, 1);
+        assert_eq!(bands.take_text(), "0k: 2, 896k: 1, 1984k: 1");
+        assert_eq!(bands.take_text(), "none");
     }
 
     /// Slots given back are free again, counted once however often.
