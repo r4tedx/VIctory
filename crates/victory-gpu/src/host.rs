@@ -1165,6 +1165,10 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // SAFETY: querying the fence owned by this queue.
+        if unsafe { self.fence.GetCompletedValue() } >= *submitted {
+            crate::memory::reap_loose();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -3095,6 +3099,10 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::shadow::log_loose(report_frames);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

@@ -827,6 +827,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    drop(g);
+    crate::shadow::remapped(at, len);
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:

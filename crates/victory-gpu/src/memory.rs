@@ -94,9 +94,9 @@ impl Map {
 
 /// What a heap's page table names: the copies, the level-1 index of each
 /// block (block 0 is the null one), and the copy each entry names (or [`NO_OWNER`]).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Layout {
-    copies: Vec<Arc<Shadow>>,
+    copies: Vec<Option<Arc<Shadow>>>,
     /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
@@ -394,14 +394,14 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// Writes the page table for host copies `copies` (start, bytes), copy `k`'s
 /// view pair at heap index `pairs[k]`, and `null` for unowned pages directly into
 /// `out` (which must hold at least [`TABLE_DWORDS`] dwords). Returns
-/// `(written_dwords, blocks, owner)` where `owner` holds copy indices or
-/// [`NO_OWNER`]. At most [`CAPACITY`] blocks besides the null one.
+/// `(written_dwords, blocks, owner, used)` where `owner` holds copy indices or
+/// [`NO_OWNER`]. At most [`CAPACITY`] blocks besides the null one. The used bits identify the copies named by live entries.
 fn write_table(
     copies: &[(u64, u64)],
     pairs: &[u32],
     null: u32,
     out: &mut [u32],
-) -> (usize, Vec<usize>, Vec<u32>) {
+) -> (usize, Vec<usize>, Vec<u32>, Vec<bool>) {
     assert!(out.len() >= TABLE_DWORDS);
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
@@ -443,6 +443,7 @@ fn write_table(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
     }
+    let mut used = vec![false; copies.len()];
     out[..LEVEL1].copy_from_slice(&level1);
     let l2_dwords = owner.len() * 2;
     let l2 = &mut out[LEVEL1..LEVEL1 + l2_dwords];
@@ -453,11 +454,12 @@ fn write_table(
             slot[1] = 0;
         } else {
             let k = o as usize;
+            used[k] = true;
             slot[0] = pairs[k];
             slot[1] = copies[k].0 as u32;
         }
     }
-    (LEVEL1 + l2_dwords, blocks, owner)
+    (LEVEL1 + l2_dwords, blocks, owner, used)
 }
 
 #[cfg(test)]
@@ -467,7 +469,7 @@ fn table(
     null: u32,
 ) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut dwords = vec![0u32; TABLE_DWORDS];
-    let (len, blocks, owner) = write_table(copies, pairs, null, &mut dwords);
+    let (len, blocks, owner, _) = write_table(copies, pairs, null, &mut dwords);
     dwords.truncate(len);
     let owner = owner
         .into_iter()
@@ -537,16 +539,56 @@ impl Shared {
         // SAFETY: `self.data` is the persistent mapping of `self.table`, with room
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
-        let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
+        let (_, blocks, owner, used) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        // Copies hidden by another copy on every page have no live entry.
+        let copies: Vec<_> = named.into_iter().zip(used).map(|(copy, used)| {
+            if used {
+                return Some(copy);
+            }
+            let slot = self.pairs.remove(&(Arc::as_ptr(&copy) as usize)).expect("copy has a pair");
+            heap.raw_pair_at(slot, None, 0);
+            heap.free_pair(slot);
+            None
+        }).collect();
         self.layout = Arc::new(Layout {
-            bits: named.iter().map(|c| c.dirty_bit()).collect(),
-            copies: named,
+            bits: copies.iter().map(|c| c.as_ref().and_then(|c| c.dirty_bit())).collect(),
+            copies,
             blocks,
             owner,
         });
         self.generation = now;
         stats(|s| s.tables += 1);
+    }
+}
+
+/// Reclaim idle windows between submissions. A remap can also detach a
+/// window still named by a page table. Null its views and keep the other
+/// copies pinned until the next preparation rewrites that table.
+pub(crate) fn reap_loose() {
+    if !crate::shadow::reap_loose() {
+        return;
+    }
+    let keys: Vec<_> = shared().iter().map(|(key, _)| *key).collect();
+    for key in keys {
+        with_heap(key, |heap| {
+            let mut tables = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            let Some((_, state)) = tables.iter_mut().find(|(k, s)| *k == key && s.host == host) else {
+                return;
+            };
+            for slot in &mut Arc::make_mut(&mut state.layout).copies {
+                if !slot.as_ref().is_some_and(|copy| copy.was_remapped()) {
+                    continue;
+                }
+                let copy = slot.take().expect("remapped copy");
+                if let Some(pair) = state.pairs.remove(&(Arc::as_ptr(&copy) as usize)) {
+                    heap.raw_pair_at(pair, None, 0);
+                    heap.free_pair(pair);
+                }
+                state.generation = u64::MAX;
+            }
+        });
     }
 }
 
@@ -580,7 +622,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
+            if let Some(c) = c
+                && !crate::watch::clean_bit(*bit)
+            {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
             }
@@ -687,10 +731,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let Some(copy) = copies[k].as_ref() else { continue };
+            let n = copy.copy_back_page(at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
-                copy = format_args!("{:#x?}", copies[k].range()),
+                copy = format_args!("{:#x?}", copy.range()),
                 bytes = n,
                 "title memory page written back"
             );
