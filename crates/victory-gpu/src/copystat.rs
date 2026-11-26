@@ -1268,7 +1268,7 @@ pub(crate) fn log(frames: f64) {
         c[C::PartsTogether as usize],
     );
     tracing::info!(
-        "texture staging per frame: {:.1} buffers made {:.2} ms; {:.1} of them made again after          their texture's was let go as idle {:.2} ms, their first detiling {:.2} ms",
+        "texture staging per frame: {:.1} buffers made {:.2} ms; {:.1} of them made again after their texture's was let go as idle {:.2} ms, their first detiling {:.2} ms",
         c[C::StagingMade as usize],
         ms(c[C::StagingMadeUs as usize]),
         c[C::StagingRemade as usize],

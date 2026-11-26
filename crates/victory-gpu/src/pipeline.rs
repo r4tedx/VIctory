@@ -404,7 +404,7 @@ fn allowed(asked: bool, wide: bool) -> (bool, &'static str) {
         (false, _) => (false, "is off (VICTORY_BVH_BUILDER is not 1)"),
         (true, false) => (
             false,
-            "held back: the host has no 64-lane waves; VICTORY_BVH_BUILDER=1 is ignored, and the builder and              the programs that walk its structures stay off as without it",
+            "held back: the host has no 64-lane waves; VICTORY_BVH_BUILDER=1 is ignored, and the builder and the programs that walk its structures stay off as without it",
         ),
         (true, true) => (true, "may run (VICTORY_BVH_BUILDER=1, a host with 64-lane waves)"),
     }
