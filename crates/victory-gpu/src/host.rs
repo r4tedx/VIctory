@@ -3306,6 +3306,23 @@ impl Meter {
                     d.not_run,
                 );
             }
+            // A capped heap's census: where the title keeps its view
+            // descriptors and where shaders read them, to size its split
+            // between title and dynamic slots (`VICTORY_DYNAMIC_SLOTS`).
+            let (writes, reads, fresh) = (
+                crate::descriptor::host::TITLE_WRITES.take_text(),
+                crate::descriptor::SHADER_READS.take_text(),
+                crate::draw::FRESH_TABLES.take_text(),
+            );
+            let table_slots = crate::draw::take_table_slots();
+            if pool.total > 0 && pool.total < (1 << 18) {
+                tracing::info!(
+                    "view heap census (64 Ki bands from slot 0, since the last line): title writes {writes}; \
+                     shader reads (per list) {reads}; fresh tables' slots, by their title table {fresh}; \
+                     {table_slots} dynamic slots taken for fresh tables in {logged_frames} frames ({:.0}/frame)",
+                    table_slots as f64 / logged_frames.max(1) as f64,
+                );
+            }
             let [clear_slots, clears_shared, clears_dropped] = crate::draw::take_clear_slots();
             if busy || clear_slots + clears_dropped > 0 {
                 tracing::info!(

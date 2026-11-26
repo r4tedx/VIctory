@@ -129,6 +129,9 @@ struct Held {
     ran: bool,
     /// Its slots were taken back: it must not run until it is reset.
     lost: bool,
+    /// Submitted again since it last ran, without a reset: the title runs
+    /// it more than once, so its slots are never taken back.
+    again: bool,
 }
 
 impl Held {
@@ -152,6 +155,7 @@ impl Lease {
         let mut held = self.held();
         if held.ran {
             LEASES[RESUBMITTED].fetch_add(1, Ordering::Relaxed);
+            held.again = true;
         }
         if held.lost {
             LEASES[LOST_NOT_RUN].fetch_add(1, Ordering::Relaxed);
@@ -191,7 +195,7 @@ impl Lease {
     fn take_back(&self, key: usize) -> Option<u64> {
         let slots = {
             let mut held = self.held();
-            if held.running > 0 || !held.ran || held.lost || !held.slots.iter().any(|d| d.0 == key) {
+            if held.running > 0 || !held.ran || held.lost || held.again || !held.slots.iter().any(|d| d.0 == key) {
                 return None;
             }
             held.lost = true;
@@ -204,11 +208,11 @@ impl Lease {
         Some(slots.iter().map(|d| u64::from(d.2)).sum())
     }
 
-    /// Whether [`reclaim`] may come back to it: it has run and not been
-    /// taken back.
+    /// Whether [`reclaim`] may come back to it: it has run, has not been
+    /// taken back, and the title does not run it again.
     fn waiting(&self) -> bool {
         let held = self.held();
-        held.ran && !held.lost
+        held.ran && !held.lost && !held.again
     }
 }
 
@@ -298,6 +302,17 @@ const RESUBMITTED: usize = 0;
 const LOST_NOT_RUN: usize = 1;
 const TAKEN_BACK: usize = 2;
 const SLOTS_TAKEN_BACK: usize = 3;
+
+/// Dynamic slots taken for fresh tables, and by the title slot of the
+/// title table each copies (where the title keeps the tables past the
+/// host's title slots).
+static TABLE_SLOTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FRESH_TABLES: crate::descriptor::host::Bands = crate::descriptor::host::Bands::new();
+
+/// Dynamic slots taken for fresh tables since the last call.
+pub(crate) fn take_table_slots() -> u64 {
+    TABLE_SLOTS.swap(0, Ordering::Relaxed)
+}
 
 /// Unordered access clears ([`State::clear_view`]; stand-ins' and the
 /// ambient's): dynamic slots taken for them, clears that shared a slot
@@ -1828,6 +1843,10 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            TABLE_SLOTS.fetch_add(u64::from(n), Ordering::Relaxed);
+            if let Some(index) = heap.index(table) {
+                FRESH_TABLES.add(index, u64::from(n));
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3302,6 +3321,48 @@ void main(uint lane : SV_GroupIndex) {
         assert_eq!(host.dynamic_free().0, 1024);
         host.release(all, total);
         assert_eq!(host.dynamic_free(), (total, total));
+    }
+
+    /// A list the title submits again without a reset is never taken from:
+    /// a heap short of slots takes those of a list that ran once, though
+    /// newer.
+    #[test]
+    fn lists_the_title_runs_again_keep_their_slots() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let key = std::ptr::from_ref(title_heap) as usize;
+        let host = title_heap.host().expect("a host view heap");
+        let (_, total) = host.dynamic_free();
+        let all = host.dynamic(total).unwrap();
+        let base = all + 1000;
+        host.release(base, 512);
+        let (mut again, mut once) = (State::default(), State::default());
+        assert_eq!(again.take_slots(key, host, 256), Some(base));
+        assert_eq!(once.take_slots(key, host, 256), Some(base + 256));
+        let (la, lo) = (again.lease(), once.lease());
+        for _ in 0..2 {
+            assert!(la.start());
+            la.finish(true);
+        }
+        assert!(lo.start());
+        lo.finish(true);
+        let mut new = State::default();
+        assert_eq!(new.take_slots(key, host, 256), Some(base + 256), "the list run once gives its slots");
+        let mut more = State::default();
+        assert_eq!(more.take_slots(key, host, 256), None, "the one run again keeps its own");
+        assert!(la.start(), "and still runs");
+        la.finish(true);
+        drop((la, lo));
+        drop((again, once, new, more));
+        assert_eq!(host.dynamic_free().0, 512);
+        host.release(all, total);
     }
 
     /// Lists making root views of many host copies (a slot per copy and
