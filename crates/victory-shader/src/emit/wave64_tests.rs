@@ -862,7 +862,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
     eprintln!("ran on the hardware device: partial counts 45, 1, 33, 0 exact in 32-lane waves");
 }
 
-/// The prefix of wave totals the console's structure builder computes (issue #4): each console
+/// The prefix of wave totals the console's structure builder computes: each console
 /// wave of a 256-thread group writes its total (10 + its index) to LDS, then, under
 /// `if (id >> 6 != 0)`, loops over the totals of the waves before it with lanes leaving at their
 /// own wave's index, reading the running sum's first lane (`v_readfirstlane`) every iteration.
@@ -872,8 +872,12 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
 /// takes its own first lane; before, the read was refused ("a first-lane read where not every
 /// lane runs"), which kept the builder off on 32-lane GPUs. Every thread stores the sum of the
 /// waves before its own: 0, 10, 10 + 11, 10 + 11 + 12.
-#[test]
-fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
+fn wave_prefix_program(lane_dependent: bool) -> NativeProgram {
+    let lds_address = if lane_dependent {
+        0x3410_0082 // v_lshlrev_b32 v8, 2, v0
+    } else {
+        0x7E10_0210 // v_mov_b32 v8, s16
+    };
     let words = [
         0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0             (the console wave's index)
         0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
@@ -897,7 +901,7 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
         0x7E22_0508, // v_readfirstlane_b32 s17, v8
         0x8F10_8212, // BODY: s_lshl_b32 s16, s18, 2
         0x8112_8112, // s_add_i32 s18, s18, 1
-        0x7E10_0210, // v_mov_b32 v8, s16
+        lds_address, // LDS address for the next subtotal
         0xD8D8_0000,
         0x0800_0008, // ds_read_b32 v8, v8
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
@@ -913,8 +917,18 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
     ];
     let mut native = native_of(&words, true, 256);
     if let StageIo::Cs(cs) = &mut native.io {
-        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        cs.rsrc2 |= 2 << 15; // 1 KiB covers the lane-varying address as well.
     }
+    native
+}
+
+#[test]
+fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let native = wave_prefix_program(false);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     assert!(
         p.blocks
@@ -926,6 +940,7 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
+        eprintln!("DXIL validator accepted the wave32 prefix shader");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -934,15 +949,20 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
         eprintln!("no SM 6.6 hardware device; not run");
         return;
     };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(
-                "the hardware device does not take this program (waves of 32?): {e}; not run"
-            );
-            return;
-        }
-    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the output has the layout and size required by OPTIONS1.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }.expect("query wave capabilities");
+    if !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32) {
+        eprintln!("the device does not support wave32; hardware dispatch skipped");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 prefix pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
         .dispatch(
@@ -956,10 +976,20 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-    let expected = |t: u32| (0..t >> 6).map(|w| 10 + w).sum::<u32>();
+    let expected = |t: u32| (0..(t >> 6)).map(|w| 10 + w).sum::<u32>();
     let got: Vec<u32> = (0..256).map(|t| out[0][t]).collect();
     for t in 0..256u32 {
         assert_eq!(got[t as usize], expected(t), "thread {t}: {got:?}");
     }
     eprintln!("ran on the hardware device: every console wave got the sum of the waves before it");
+}
+
+#[test]
+fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
+    let native = wave_prefix_program(true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let Err(error) = lowered(&native, &p, &HashSet::new()) else {
+        panic!("the two host waves may read different subtotals");
+    };
+    assert!(error.to_string().contains("a first-lane read where not every lane runs"), "{error}");
 }
