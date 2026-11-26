@@ -58,6 +58,92 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<crate::tables::Table>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+    /// A capped heap's views of the title's slots past `count`, for fresh
+    /// tables to copy from ([`HostHeap::copy_overflow`]).
+    overflow: Option<Overflow>,
+}
+
+/// Tests: the title slots a view heap made from now on keeps, fewer than
+/// the title's (0: all, as the host takes).
+#[cfg(test)]
+pub(crate) static TEST_TITLE_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a capped heap keeps views of the title's slots past its own
+/// (`VICTORY_OVERFLOW_VIEWS`, on unless `0`); else fresh tables make every
+/// view each time, as before.
+fn overflow_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OVERFLOW_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// Views of the title's slots past a capped heap's title slots, in a
+/// CPU-only heap (not under the host's limit on shader-visible ones): each
+/// made from the title's record where a fresh table uses the slot, again
+/// only when the record changes, as title slots are made when written; the
+/// fresh table copies them. Each keeps what its view needs alive, as a
+/// title slot does.
+struct Overflow {
+    /// Held for its slots: only their CPU handles are used.
+    _heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    step: u32,
+    len: u32,
+    /// The slots, [`SHARD`] to a lock: lists recording at once take
+    /// different ones.
+    shards: Vec<Mutex<Vec<Over>>>,
+}
+
+/// Overflow slots per lock.
+const SHARD: u32 = 1024;
+
+/// An overflow slot: the record it was made from ([`Over::NULL`] for a
+/// null view, 0 for none made), what it keeps alive and its write mark.
+#[derive(Clone, Default)]
+struct Over {
+    key: u64,
+    kept: Kept,
+    mark: Option<(u32, u32)>,
+}
+
+impl Over {
+    const NULL: u64 = u64::MAX;
+}
+
+impl Overflow {
+    fn new(device: &ID3D12Device, len: u32, step: u32) -> Option<Self> {
+        // SAFETY: plain heap creation.
+        let made = unsafe {
+            device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: len,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+        };
+        let heap = match made {
+            Ok(heap) => heap,
+            Err(e) => {
+                tracing::warn!(error = %e, len, "no overflow view heap: fresh tables make their views each time");
+                return None;
+            }
+        };
+        tracing::info!(
+            slots = len,
+            descriptor_bytes = step,
+            mb = f64::from(len) * f64::from(step) / 1e6,
+            "overflow view heap (CPU memory) for the title's slots past the capped heap's (VICTORY_OVERFLOW_VIEWS)"
+        );
+        // SAFETY: a live heap.
+        let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+        let shards = (0..len.div_ceil(SHARD))
+            .map(|s| Mutex::new(vec![Over::default(); SHARD.min(len - s * SHARD) as usize]))
+            .collect();
+        Some(Overflow { _heap: heap, cpu, step, len, shards })
+    }
+
+    fn cpu(&self, at: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.cpu + at as usize * self.step as usize }
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -160,6 +246,8 @@ impl HostHeap {
             .unwrap_or(victory_shader::emit::HEAP_VIEWS)
             .min(victory_shader::emit::HEAP_VIEWS);
         let samplers = victory_shader::emit::HEAP_SAMPLERS;
+        // The title's slot count, before the host's cap may leave fewer.
+        let asked = count;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -217,6 +305,17 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        // Tests: a heap that keeps fewer title slots than the title has, as a
+        // capped one does (its slots past them are dynamic ones).
+        #[cfg(test)]
+        let count = match TEST_TITLE_SLOTS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => count,
+            kept if !sampler => kept.min(count),
+            _ => count,
+        };
+        let overflow = (!sampler && asked > count && overflow_views())
+            .then(|| Overflow::new(&host.device, asked - count, step))
+            .flatten();
         // SAFETY: a live shader-visible heap.
         let (gpu, total) = unsafe {
             (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
@@ -248,6 +347,7 @@ impl HostHeap {
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
+            overflow,
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -637,6 +737,100 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
+    /// Makes dynamic slots `first..first + n` what the title's table at
+    /// `table`, its slots `index..index + n` past this heap's title slots,
+    /// holds: overflow slots whose record changed since they were made are
+    /// made again, then all `n` are copied in one go, and each dynamic slot
+    /// keeps, strides and marks as [`HostHeap::make_at`] would. How many
+    /// views it made, and the table's views (for the caller's uses); None
+    /// without an overflow heap or past its end (the caller makes them as
+    /// before). Locks are taken once per table: the views', the overflow
+    /// shards the table spans, the kept resources'.
+    pub(crate) fn copy_overflow(&self, first: u32, index: u32, n: u32, table: u64) -> Option<(u32, Vec<Option<View>>)> {
+        let o = self.overflow.as_ref()?;
+        let from = index.checked_sub(self.count)?;
+        if n == 0 || u64::from(from) + u64::from(n) > u64::from(o.len) {
+            return None;
+        }
+        // The table's records, and their views in one look-up.
+        let records: Vec<[u32; 3]> = (0..n)
+            // SAFETY: descriptor slots in title memory.
+            .map(|k| unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() })
+            .collect();
+        let views = super::views_of(&records);
+        // The shards the table spans, locked in order: what is made there
+        // and copied from stays as it is meanwhile.
+        let (s0, s1) = (from / SHARD, (from + n - 1) / SHARD);
+        let mut shards: Vec<_> = (s0..=s1)
+            .map(|s| o.shards[s as usize].lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let (mut made, mut retired) = (0, Vec::new());
+        let (mut kept, mut marks) = (Vec::with_capacity(n as usize), Vec::with_capacity(n as usize));
+        for (k, (view, &[_, i, generation])) in views.iter().zip(&records).enumerate() {
+            let at = from + k as u32;
+            let slot = &mut shards[(at / SHARD - s0) as usize][(at % SHARD) as usize];
+            let key = match view {
+                Some(_) => u64::from(generation) << 32 | u64::from(i),
+                None => Over::NULL,
+            };
+            if slot.key != key {
+                let (made_kept, mark) = match view {
+                    Some(view) => {
+                        let (made_kept, mark) = make_marked(view, o.cpu(at));
+                        if made_kept.is_none() {
+                            null_for(view, o.cpu(at));
+                        }
+                        (made_kept.flatten(), mark)
+                    }
+                    None => {
+                        null_view(o.cpu(at));
+                        (None, None)
+                    }
+                };
+                // What the old view kept goes once the work in flight has
+                // run, as for a title slot ([`HostHeap::keep`]).
+                if let Some((old, _)) = std::mem::replace(slot, Over { key, kept: made_kept, mark }).kept {
+                    retired.push(old);
+                }
+                made += 1;
+            }
+            kept.push(slot.kept.clone());
+            marks.push(slot.mark);
+        }
+        if let Some(host) = host() {
+            // SAFETY: `n` slots inside both heaps; the source is CPU-only.
+            unsafe {
+                host.device
+                    .CopyDescriptorsSimple(n, self.cpu(first), o.cpu(from), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+        }
+        drop(shards);
+        crate::host::retire_all(retired);
+        self.keep_run(first, kept);
+        for (k, (view, mark)) in views.iter().zip(marks).enumerate() {
+            let dst = first + k as u32;
+            self.set_stride(dst, view.as_ref());
+            self.set_mark(dst, mark);
+            self.note_address(dst, view.as_ref());
+        }
+        Some((made, views))
+    }
+
+    /// [`HostHeap::keep`] of slots `first..` in one go: what they kept goes
+    /// once the work in flight has run.
+    fn keep_run(&self, first: u32, resources: Vec<Kept>) {
+        let mut retired = Vec::new();
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (slot, resource) in kept.iter_mut().skip(first as usize).zip(resources) {
+                if let Some((old, _)) = std::mem::replace(slot, resource) {
+                    retired.push(old);
+                }
+            }
+        }
+        crate::host::retire_all(retired);
+    }
+
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
@@ -2312,6 +2506,13 @@ mod tests {
         bands.add(u32::MAX, 1);
         assert_eq!(bands.take_text(), "0k: 2, 896k: 1, 1984k: 1");
         assert_eq!(bands.take_text(), "none");
+    }
+
+    /// Overflow views are off with `VICTORY_OVERFLOW_VIEWS=0`, on otherwise.
+    #[test]
+    fn overflow_views_are_on_unless_switched_off() {
+        let on = |v: Option<&str>| v.is_none_or(|v| v != "0");
+        assert!(on(None) && on(Some("1")) && !on(Some("0")));
     }
 
     /// A release next to a long free run does not walk it: the bound on the

@@ -559,6 +559,20 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
+/// The views of `records` (each a descriptor's first three dwords: tag,
+/// entry, generation), under one look-up.
+#[cfg(windows)]
+pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            let (view, current) = views.list.get(i as usize)?;
+            (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+        })
+        .collect()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
