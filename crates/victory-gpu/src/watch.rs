@@ -33,7 +33,8 @@
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen, unless the
-//! runtime frees it (`XMemFreeDefault` reports it as remapped).
+//! runtime frees it (`XMemFreeDefault`) or allocates it (`XMemVirtualAlloc`):
+//! both report it as remapped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1534,6 +1535,69 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// Memory freed while a tracker holds it and allocated again at the same
+    /// address (the title's `VirtualFree`, which we do not see, then
+    /// `XMemVirtualAlloc`, which reports what it allocates as remapped): the
+    /// new memory has no guard, so a write there does not fault. Reported, it
+    /// is taken again and guarded again, so a later write counts; unreported,
+    /// the write is missed.
+    #[test]
+    fn memory_allocated_again_is_taken_again_once_reported() {
+        for report in [false, true] {
+            // Another test may allocate at the address between the free and
+            // the new allocation: then tried again elsewhere.
+            let (p, t) = (0..8)
+                .find_map(|_| {
+                    let p = pool(1);
+                    let t = track_copy(p, PAGE, true).expect("pool memory is tracked");
+                    assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+                    free(p);
+                    // SAFETY: a fresh allocation where ours was, freed below.
+                    let again = unsafe {
+                        VirtualAlloc(
+                            p as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    } as usize;
+                    if again == p {
+                        return Some((p, t));
+                    }
+                    if again != 0 {
+                        free(again);
+                    }
+                    None
+                })
+                .expect("an address allocated again");
+            if report {
+                title_memory_remapped(p, PAGE);
+            }
+            // SAFETY: our new allocation, read-write: no fault.
+            unsafe { ((p + 8) as *mut u8).write_volatile(7) };
+            if !report {
+                assert!(
+                    t.take(p, p + PAGE).is_empty(),
+                    "unreported, the write is missed"
+                );
+                drop(t);
+                free(p);
+                continue;
+            }
+            assert_eq!(
+                t.take(p, p + PAGE),
+                [(p, p + PAGE)],
+                "the new memory is taken"
+            );
+            assert!(t.clean());
+            // SAFETY: as above, guarded again by the take: the handler opens it.
+            unsafe { ((p + 9) as *mut u8).write_volatile(8) };
+            assert!(t.changed(p / PAGE), "a later write counts");
+            drop(t);
+            free(p);
+        }
     }
 
     /// A write or mapping that runs past the end of the address space (a
