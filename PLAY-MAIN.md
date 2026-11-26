@@ -15,6 +15,19 @@ layer 4 stack's own merge commits list what it holds.
 sha256 `5847b7b3c244dced6f2282d2f47c18f0a9febdb0f829309f17a6d6b47316b5fd`
 (the code of aeeaed59: later commits change only tests or this file).
 
+**Rule: never ship this tree without #2118's all-or-none gate and the
+32-lane guard (4087079c, `wide_waves()` in
+`crates/victory-gpu/src/pipeline/builder.rs`).** Since play/main-next-3
+(f7a85cfc) the whole BVH builder validates at 32 lanes offline (53 of 53
+group programs), so on hosts without 64-lane waves (NVIDIA) the guard is
+the only thing holding it back. The whole builder run as 32-lane halves
+hung an RTX 4070 SUPER within two minutes (device removed). Tests that
+fail if either is removed:
+`pipeline::builder::tests::the_builder_stays_held_back_on_hosts_without_64_lane_waves`
+and `pipeline::builder::tests::runs_consults_the_32_lane_guard`. A run on
+such a host should log "BVH builder held back: the host has no 64-lane
+waves" with made=53.
+
 ## Merged parts, in order
 
 | # | Part | Source branch @ head | Upstream PR | Switch | Merge on play/main |

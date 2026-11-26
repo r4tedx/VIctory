@@ -128,12 +128,7 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    // On a host without 64-lane waves the builder stays held back even with
-    // every pipeline made: its wave64 programs then run as 32-lane halves,
-    // and the whole builder hung an RTX 4070 SUPER within two minutes
-    // (#2118 thread, comment 7170996858: device removed in its submission).
-    let wide = wide_waves();
-    let open = all_made(&states) && wide;
+    let (open, why) = decide(&states, wide_waves());
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -144,14 +139,7 @@ pub(crate) fn runs() -> bool {
             pipelines = states.len(),
             made,
             refused,
-            "BVH builder {}",
-            if open {
-                "runs"
-            } else if !wide && all_made(&states) {
-                "held back: the host has no 64-lane waves"
-            } else {
-                "held back: not all its pipelines are made"
-            }
+            "BVH builder {why}"
         );
     }
     *decided = (frame, open);
@@ -162,11 +150,41 @@ pub(crate) fn runs() -> bool {
     open
 }
 
+/// Whether the builder runs, and why (the log's words), from its
+/// pipelines' states and whether the host runs 64-lane waves. Two gates,
+/// both needed; never ship without either:
+/// - #2118's all or none: one pipeline refused or still being made holds
+///   the whole builder back, so a frame never runs part of it.
+/// - 4087079c's 32-lane guard: on a host without 64-lane waves the
+///   builder stays held back even with every pipeline made. Its wave64
+///   programs then run as 32-lane halves, and the whole builder hung an
+///   RTX 4070 SUPER within two minutes (#2118 thread, comment 7170996858:
+///   device removed in its submission). Since f7a85cfc every builder
+///   program validates at 32 lanes offline (53 of 53), so on such hosts
+///   this guard is all that holds it back.
+fn decide(states: &[Option<bool>], wide: bool) -> (bool, &'static str) {
+    match (all_made(states), wide) {
+        (true, true) => (true, "runs"),
+        (true, false) => (false, "held back: the host has no 64-lane waves"),
+        (false, _) => (false, "held back: not all its pipelines are made"),
+    }
+}
+
 /// Whether the host runs 64-lane waves (no host device: assumed so, as in
 /// tests without one).
 fn wide_waves() -> bool {
+    #[cfg(test)]
+    match WIDE_FOR_TESTS.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
     crate::host::host().is_none_or(|h| h.target().runs(64))
 }
+
+/// Tests: 0 asks the host, 1 a host without 64-lane waves, 2 one with them.
+#[cfg(test)]
+static WIDE_FOR_TESTS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether every pipeline is made (`Some(true)`); refused ones are
 /// `Some(false)`, those still being made `None`.
@@ -203,6 +221,59 @@ mod tests {
         assert!(all_made(&[Some(true), Some(true)]));
         assert!(!all_made(&[Some(true), Some(false)]), "one refused");
         assert!(!all_made(&[Some(true), None]), "one still being made");
+    }
+
+    /// The 32-lane guard and #2118's all-or-none gate both hold: with every
+    /// builder pipeline made (53, as the whole builder validates at 32
+    /// lanes since f7a85cfc), a host without 64-lane waves keeps it held
+    /// back, with that reason; one pipeline not made holds it back on any
+    /// host. Fails if either gate is removed.
+    #[test]
+    fn the_builder_stays_held_back_on_hosts_without_64_lane_waves() {
+        let all = [Some(true); 53];
+        let narrow = (false, "held back: the host has no 64-lane waves");
+        assert_eq!(decide(&all, false), narrow);
+        assert_eq!(decide(&all, true), (true, "runs"));
+        let mut one_refused = all;
+        one_refused[52] = Some(false);
+        let mut one_making = all;
+        one_making[0] = None;
+        for (states, what) in [(&one_refused, "refused"), (&one_making, "being made")] {
+            for wide in [false, true] {
+                assert_eq!(
+                    decide(states, wide),
+                    (false, "held back: not all its pipelines are made"),
+                    "{what}, wide={wide}"
+                );
+            }
+        }
+    }
+
+    /// [`runs`] asks [`wide_waves`]: on a host without 64-lane waves the
+    /// builder does not run even with nothing left to make; with them it
+    /// does. Fails if `runs` stops consulting the guard.
+    #[test]
+    fn runs_consults_the_32_lane_guard() {
+        // Other tests' builder pipelines are set aside, and the switch and
+        // the decision reset, whatever happens.
+        struct Reset(Vec<Weak<Pending>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                WIDE_FOR_TESTS.store(0, Ordering::Relaxed);
+                *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
+                BUILT.store(false, Ordering::Relaxed);
+                let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
+                pipelines.append(&mut self.0);
+            }
+        }
+        let _one = test_lock();
+        let _reset = Reset(std::mem::take(&mut *PIPELINES.lock().unwrap()));
+        // No builder pipeline left to make.
+        WIDE_FOR_TESTS.store(1, Ordering::Relaxed);
+        assert!(!runs(), "a host without 64-lane waves: held back");
+        *DECIDED.lock().unwrap() = (u64::MAX, true);
+        WIDE_FOR_TESTS.store(2, Ordering::Relaxed);
+        assert!(runs(), "a host with 64-lane waves, all made: runs");
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by
