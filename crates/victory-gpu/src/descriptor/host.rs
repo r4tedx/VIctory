@@ -2194,10 +2194,17 @@ mod tests {
         heap.raw_pair_at(first, None, 0);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
-        // Slots past the dynamic ones (host copies' view pairs) have no
-        // entry, and nothing is written past the last: a mark there (the
-        // buffer's allocation reaches past it) stays.
-        assert_eq!(heap.address_at(end), None);
+        // Shaders clamp the heap index to `HEAP_VIEWS` - 1, so the buffer
+        // has an entry for each slot below the larger of `end` and
+        // `HEAP_VIEWS`. Slots past the dynamic ones (host copies' view
+        // pairs) read 0 and are never written; past the last entry there is
+        // none, and nothing is written there: a mark (the buffer's
+        // allocation reaches past it) stays.
+        let slots = end.max(victory_shader::emit::HEAP_VIEWS);
+        if end < slots {
+            assert_eq!(heap.address_at(end), Some(0), "a clamped index reads 0");
+        }
+        assert_eq!(heap.address_at(slots), None);
         let host = host().unwrap();
         let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
         // SAFETY: plain queries of a live buffer.
@@ -2206,15 +2213,22 @@ mod tests {
             let info = host.device.GetResourceAllocationInfo(0, &[desc]);
             (desc, info.SizeInBytes)
         };
-        assert_eq!(desc.Width, 16 * u64::from(end));
-        assert!(size >= desc.Width + 8, "room for the mark");
-        let past = (data + 16 * end as usize) as *mut u64;
-        let mark = 0x5a5a_5a5a_5a5a_5a5a;
-        // SAFETY: mapped memory of the buffer's allocation (checked).
-        unsafe { past.write_unaligned(mark) };
+        assert_eq!(desc.Width, 16 * u64::from(slots));
+        // At `HEAP_VIEWS` entries the buffer fills its allocation; the mark
+        // goes past it only where the allocation has room.
+        if size >= desc.Width + 8 {
+            let past = (data + 16 * slots as usize) as *mut u64;
+            let mark = 0x5a5a_5a5a_5a5a_5a5a;
+            // SAFETY: mapped memory of the buffer's allocation (checked).
+            unsafe { past.write_unaligned(mark) };
+            heap.note_address(slots, Some(&view));
+            // SAFETY: as above.
+            assert_eq!(unsafe { past.read_unaligned() }, mark);
+        }
         heap.note_address(end, Some(&view));
-        // SAFETY: as above.
-        assert_eq!(unsafe { past.read_unaligned() }, mark);
+        if end < slots {
+            assert_eq!(heap.address_at(end), Some(0), "not written past the dynamic slots");
+        }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
