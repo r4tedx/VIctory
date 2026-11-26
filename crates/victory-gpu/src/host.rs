@@ -1320,6 +1320,8 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        // Whether every list that declared `back[i]` marks its writes there.
+        let mut marked: Vec<bool> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -1340,15 +1342,19 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marks, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
                     match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                        Some(&i) => {
+                            back[i].3 &= goes_back;
+                            marked[i] &= *marks;
+                        }
                         None => {
                             index.insert(key, back.len());
                             back.push((shadow.clone(), *address, *len, goes_back));
+                            marked.push(*marks);
                         }
                     }
                 }
@@ -1374,8 +1380,14 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         // What shaders wrote into host copies in video memory first comes
-        // into their system memory side, which the copy-backs read.
-        crate::shadow::pull_written(back.iter().map(|(s, a, n, _)| (s, *a, *n)));
+        // into their system memory side, which the copy-backs read: ranges
+        // declared unmarked whole, marked ones by their marked pages.
+        crate::shadow::pull_written(
+            back.iter()
+                .zip(&marked)
+                .filter(|(_, marked)| !**marked)
+                .map(|((s, a, n, _), _)| (s, *a, *n)),
+        );
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();

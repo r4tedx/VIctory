@@ -1034,10 +1034,12 @@ fn page_of(m: &Marks, n: u32) -> Option<(Arc<Shadow>, usize)> {
 /// After a submission ran, before anything reads the copies: what its
 /// shaders wrote into copies with a video memory side comes into their
 /// system memory side, by one GPU copy: the ranges its lists declared
-/// (`declared`, those withheld too) and the pages marked in either bitmap
+/// unmarked (`declared`, those withheld too: a snapshot tells what changed
+/// there, so they come back whole) and the pages marked in either bitmap
 /// (those held back too, so that the system memory side holds what the GPU
-/// side holds wherever shaders wrote). The bitmaps are left as they are
-/// for [`copy_back_marks`].
+/// side holds wherever shaders wrote). Ranges declared marked are not
+/// brought back whole: the CPU reads nothing of them but their marked
+/// pages. The bitmaps are left as they are for [`copy_back_marks`].
 pub(crate) fn pull_written<'a>(declared: impl Iterator<Item = (&'a Arc<Shadow>, usize, usize)>) {
     if IN_VRAM.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
@@ -1046,6 +1048,8 @@ pub(crate) fn pull_written<'a>(declared: impl Iterator<Item = (&'a Arc<Shadow>, 
         .filter(|(c, ..)| c.vram.is_some())
         .map(|(c, a, n)| (c.clone(), a, n))
         .collect();
+    count(&runs, crate::vram::Pulled::Declared);
+    let declared = runs.len();
     // Collected whole and filtered after the lock: dropping the last
     // holder of a copy takes the lock.
     let found: Vec<(Arc<Shadow>, usize)> = {
@@ -1075,12 +1079,14 @@ pub(crate) fn pull_written<'a>(declared: impl Iterator<Item = (&'a Arc<Shadow>, 
             .filter(|(c, _)| c.vram.is_some())
             .map(|(c, page)| (c, page, PAGE)),
     );
+    count(&runs[declared..], crate::vram::Pulled::Marked);
     bring_back(&runs);
 }
 
-/// Title address ranges `(copy, address, len)` shaders wrote, of copies
-/// with a video memory side (others are passed by): into their system
-/// memory side, by one GPU copy, before the CPU reads them.
+/// Pages `(copy, address, len)` shaders wrote at computed addresses
+/// (`crate::memory`), of copies with a video memory side (others are
+/// passed by): into their system memory side, by one GPU copy, before the
+/// CPU reads them.
 pub(crate) fn pull<'a>(ranges: impl IntoIterator<Item = (&'a Arc<Shadow>, usize, usize)>) {
     if IN_VRAM.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
@@ -1090,7 +1096,21 @@ pub(crate) fn pull<'a>(ranges: impl IntoIterator<Item = (&'a Arc<Shadow>, usize,
         .filter(|(c, ..)| c.vram.is_some())
         .map(|(c, a, n)| (c.clone(), a, n))
         .collect();
+    count(&runs, crate::vram::Pulled::Computed);
     bring_back(&runs);
+}
+
+/// The bytes of `runs` (cut to their copies) brought back for `why`
+/// (diagnostics).
+fn count(runs: &[(Arc<Shadow>, usize, usize)], why: crate::vram::Pulled) {
+    let bytes: usize = runs
+        .iter()
+        .map(|(c, a, n)| {
+            let (from, to) = c.inside(*a, *n);
+            to.saturating_sub(from)
+        })
+        .sum();
+    crate::vram::PULLED_BY[why as usize].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Copies `runs` (cut to their copies, joined where they meet) from video
@@ -1647,7 +1667,7 @@ pub(crate) mod tests {
         assert_eq!(
             classes[4..],
             [Class::System; 2],
-            "past the cap; past nine tenths of the budget"
+            "past the cap; past 85 % of the budget"
         );
         assert_eq!(
             crate::vram::REFUSED[0].load(std::sync::atomic::Ordering::Relaxed),
@@ -1781,6 +1801,66 @@ pub(crate) mod tests {
             "and video memory have the title's byte"
         );
         assert_eq!(copy.update(p, len), 0, "both pages current");
+        unregister(p, p as u64);
+    }
+
+    /// What comes back from video memory after a submission: of a range
+    /// declared written and marked, its marked pages alone, not the whole
+    /// range (the CPU reads nothing else of it); of a range declared
+    /// unmarked, the whole range, once. Counted by why (the diagnostics
+    /// line's split).
+    #[test]
+    fn marked_ranges_of_copies_in_video_memory_come_back_by_their_marked_pages() {
+        use crate::vram::{PULLED, PULLED_BY, Pulled};
+        use std::sync::atomic::Ordering::Relaxed;
+        if !in_child(
+            "shadow::tests::marked_ranges_of_copies_in_video_memory_come_back_by_their_marked_pages",
+            "2",
+        ) {
+            return;
+        }
+        let host = host().expect("a host GPU");
+        *FAKE.lock().unwrap() = Some((1 << 30, 0));
+        let len = 4 * PAGE;
+        let p = crate::watch::tests::pool(4);
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).unwrap();
+        assert_eq!(copy.class(), Class::VramWritten);
+        copy.update(p, len);
+        let pulled = || {
+            [
+                PULLED[0].load(Relaxed),
+                PULLED_BY[Pulled::Declared as usize].load(Relaxed),
+                PULLED_BY[Pulled::Marked as usize].load(Relaxed),
+            ]
+        };
+        let run = |marked: bool, at: usize, byte: u8| {
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, len as u64, marked);
+            if marked {
+                mark(&copy, at as u64);
+            }
+            let c = copy.clone();
+            list.defer_host(move || c.write_host(at as u64, &[byte]));
+            list.close();
+            let before = pulled();
+            host.execute(&[&list]);
+            assert_eq!(title(at), byte, "the shader's byte reached title memory");
+            let after = pulled();
+            [0, 1, 2].map(|i| after[i] - before[i])
+        };
+        let (page, all) = (PAGE as u64, len as u64);
+        assert_eq!(
+            run(true, p + PAGE + 10, 0x5a),
+            [page, 0, page],
+            "the marked page alone, not the 4 pages declared"
+        );
+        assert_eq!(
+            run(false, p + 2 * PAGE + 3, 0x6b),
+            [all, all, 0],
+            "an unmarked range whole, once"
+        );
         unregister(p, p as u64);
     }
 
