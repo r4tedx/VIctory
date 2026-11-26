@@ -249,7 +249,7 @@ impl Shadow {
 
     /// The pages (by index in the copy) its mirror is behind on.
     #[cfg(test)]
-    fn stale_pages(&self) -> Vec<usize> {
+    fn mirror_stale_pages(&self) -> Vec<usize> {
         self.stale_runs(0, self.len as usize)
             .into_iter()
             .flat_map(|(_, at, n)| at / PAGE..(at + n).div_ceil(PAGE))
@@ -859,6 +859,65 @@ impl Shadow {
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
         to - from
+    }
+
+    /// The stale check of this copy ([`check_stale`]): every page its
+    /// tracker calls unchanged and that it holds in tracked memory is
+    /// compared with title memory. Passed by: pages the title writes
+    /// meanwhile (a guard fault marks them before the write lands, so a
+    /// difference is asked about again after the compare), pages with
+    /// nothing mapped, and pages whose withheld shader writes stay in the
+    /// copies until the frame's end
+    /// (`crate::memory::withheld_until_frame_end`). Returns the pages
+    /// compared and, per page that differed, its address and the bytes that
+    /// did; with `fix` such pages are copied again.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stale_pages(&self, fix: bool) -> (u64, Vec<(usize, usize)>) {
+        let Some(t) = &self.tracked else {
+            return (0, Vec::new());
+        };
+        if !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return (0, Vec::new()); // shaders may be writing it
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (mut compared, mut differ) = (0, Vec::new());
+        let mut title = vec![0u8; PAGE];
+        for page in start / PAGE..end.div_ceil(PAGE) {
+            let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            if t.changed(page)
+                || !t.untracked(from, to).is_empty()
+                || crate::memory::withheld_until_frame_end(from, to)
+            {
+                continue;
+            }
+            let title = &mut title[..to - from];
+            if !crate::host::read_into(from as *const u8, title) {
+                continue;
+            }
+            compared += 1;
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let ours =
+                unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+            if ours == &title[..] || t.changed(page) {
+                continue;
+            }
+            differ.push((
+                from,
+                ours.iter()
+                    .zip(title.iter())
+                    .filter(|(a, b)| a != b)
+                    .count(),
+            ));
+            if fix {
+                self.copy(from, to);
+            }
+        }
+        (compared, differ)
     }
 
     /// As [`Shadow::copy`], queued where the caller collects a
@@ -1651,6 +1710,124 @@ pub(crate) fn log_views(frames: f64) {
     }
 }
 
+/// `VICTORY_STALE_CHECK` (diagnostics, after ka1qux's check of the same
+/// name): once per presented frame, before a submission refreshes anything,
+/// one host copy in N (round robin over the copies) has the pages its tracker
+/// calls unchanged compared with title memory. A page that differs holds a
+/// write the tracking missed: the title's through a path that neither faults
+/// nor reports, or the shaders' through a view nobody declared or marked.
+/// The counts and the first pages that differ are logged with the frame
+/// statistics ([`log_stale`]); the target is none.
+///
+/// Its value: N (`1` checks every copy every frame); `fix`, every copy, and
+/// the pages that differ are copied; anything else, one copy in 64; unset,
+/// empty or `0`, off.
+#[cfg(feature = "diagnostics")]
+fn stale_setting(value: Option<&str>) -> Option<(u64, bool)> {
+    match value {
+        None | Some("" | "0") => None,
+        Some("fix") => Some((1, true)),
+        Some(n) => Some((n.parse().ok().filter(|&n| n > 0).unwrap_or(64), false)),
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn stale_check() -> Option<(u64, bool)> {
+    static ON: std::sync::OnceLock<Option<(u64, bool)>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = stale_setting(std::env::var("VICTORY_STALE_CHECK").ok().as_deref());
+        if let Some((every, fix)) = on {
+            tracing::warn!(
+                every,
+                fix,
+                "VICTORY_STALE_CHECK: pages of host copies the write tracking calls unchanged are compared with title memory"
+            );
+        }
+        on
+    })
+}
+
+/// What [`check_stale`] found since the last [`log_stale`]: copies checked,
+/// pages compared, pages and bytes that differed, the first pages that did
+/// (addresses, at most 10); and pages that differed in all.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Stale {
+    copies: u64,
+    pages: u64,
+    differed: u64,
+    bytes: u64,
+    first: Vec<usize>,
+    in_all: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static STALE: Mutex<Stale> = Mutex::new(Stale {
+    copies: 0,
+    pages: 0,
+    differed: 0,
+    bytes: 0,
+    first: Vec::new(),
+    in_all: 0,
+});
+
+/// At the start of a submission (under the submission lock: no copy-back or
+/// refresh runs, nothing is armed or pending): with `VICTORY_STALE_CHECK`,
+/// the first submission of each presented frame checks its share of the
+/// copies ([`Shadow::stale_pages`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_stale() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let Some((every, fix)) = stale_check() else {
+        return;
+    };
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if FRAME.swap(frame, Relaxed) == frame {
+        return;
+    }
+    for (k, copy) in all().iter().enumerate() {
+        if !(k as u64).wrapping_add(frame).is_multiple_of(every) {
+            continue;
+        }
+        let (pages, differ) = copy.stale_pages(fix);
+        let mut s = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        s.copies += 1;
+        s.pages += pages;
+        s.differed += differ.len() as u64;
+        s.in_all += differ.len() as u64;
+        s.bytes += differ.iter().map(|&(_, n)| n as u64).sum::<u64>();
+        let room = 10usize.saturating_sub(s.first.len());
+        s.first.extend(differ.iter().map(|&(at, _)| at).take(room));
+    }
+}
+
+/// Logs what [`check_stale`] found over the last `frames` frames, if on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_stale(frames: f64) {
+    let Some((every, _)) = stale_check() else {
+        return;
+    };
+    let s = {
+        let mut s = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        let in_all = s.in_all;
+        let taken = std::mem::take(&mut *s);
+        s.in_all = in_all;
+        taken
+    };
+    let first: Vec<String> = s.first.iter().map(|a| format!("{a:#x}")).collect();
+    tracing::info!(
+        "stale check over {frames:.0} frames (one copy in {every} a frame): {} copies, {} pages the write tracking \
+         called unchanged compared with title memory, {} of them differed ({} bytes), {} in all; first: {}",
+        s.copies,
+        s.pages,
+        s.differed,
+        s.bytes,
+        s.in_all,
+        first.join(", ")
+    );
+}
+
 /// Copies of single views' bytes ([`for_view`]), by (start, length), held
 /// by the heap slots made from them and the lists that use them: a copy is
 /// found again for as long as a slot shows it, so draws refresh the copy
@@ -2159,7 +2336,7 @@ pub(crate) mod tests {
         }
         let (p, len, copy) = mirrored_buffer(4);
         assert_eq!(
-            copy.stale_pages(),
+            copy.mirror_stale_pages(),
             [0, 1, 2, 3],
             "the refresh wrote video memory only"
         );
@@ -2175,7 +2352,7 @@ pub(crate) mod tests {
             copy.read_host((p + PAGE + 8) as u64, 1)[0].to_le_bytes(),
             title[PAGE + 8..PAGE + 12]
         );
-        assert_eq!(copy.stale_pages(), [0, 2, 3]);
+        assert_eq!(copy.mirror_stale_pages(), [0, 2, 3]);
         assert!(
             mirror[PAGE..2 * PAGE] == title[PAGE..2 * PAGE],
             "page 1 came back whole"
@@ -2186,28 +2363,28 @@ pub(crate) mod tests {
         );
         // Bytes the GPU wrote in page 3 are pulled: the whole page comes.
         pull(&[(copy.clone(), p + 3 * PAGE + 100, 4)]);
-        assert_eq!(copy.stale_pages(), [0, 2]);
+        assert_eq!(copy.mirror_stale_pages(), [0, 2]);
         assert!(mirror[3 * PAGE..] == title[3 * PAGE..]);
         // A snapshot ahead over page 2: the refresh there writes both.
         let ahead = [(copy.clone(), p + 2 * PAGE + 10, 10)];
         snapshots_ahead(&ahead);
-        assert_eq!(copy.stale_pages(), [0], "page 2 brought back up front");
+        assert_eq!(copy.mirror_stale_pages(), [0], "page 2 brought back up front");
         // SAFETY: our pool's bytes.
         unsafe {
             ((p + 2 * PAGE + 500) as *mut u8).write_volatile(0x11);
             ((p + 40) as *mut u8).write_volatile(0x22);
         }
         copy.update(p, len);
-        assert_eq!(copy.stale_pages(), [0], "page 2 stays current");
+        assert_eq!(copy.mirror_stale_pages(), [0], "page 2 stays current");
         assert_eq!(mirror[2 * PAGE + 500], 0x11);
         snapshots_done(&ahead);
         // SAFETY: our pool's bytes.
         unsafe { ((p + 2 * PAGE + 600) as *mut u8).write_volatile(0x33) };
         copy.update(p, len);
-        assert_eq!(copy.stale_pages(), [0, 2], "video memory only again");
+        assert_eq!(copy.mirror_stale_pages(), [0, 2], "video memory only again");
         assert_eq!(gpu_bytes(&copy, p + 2 * PAGE + 600, 1), [0x33]);
         copy.freshen(0, len);
-        assert!(copy.stale_pages().is_empty());
+        assert!(copy.mirror_stale_pages().is_empty());
         assert!(mirror == title, "the mirror has all of it");
         unregister(p, p as u64);
     }
@@ -2232,7 +2409,7 @@ pub(crate) mod tests {
             return;
         }
         let (p, len, copy) = mirrored_buffer(4);
-        assert_eq!(copy.stale_pages().len(), 4);
+        assert_eq!(copy.mirror_stale_pages().len(), 4);
         let list = host.new_list().unwrap();
         copy.refresh(&list, p as u64, len as u64);
         for k in 0..4 {
@@ -2291,7 +2468,7 @@ pub(crate) mod tests {
         host.execute(&[&list]);
         let copies = BROUGHT.load(std::sync::atomic::Ordering::Relaxed) - before;
         assert_eq!(copies, 1, "the marked page alone");
-        assert_eq!(copy.stale_pages(), [0, 1, 3], "the other pages stay behind");
+        assert_eq!(copy.mirror_stale_pages(), [0, 1, 3], "the other pages stay behind");
         // SAFETY: our pool's bytes.
         let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
         assert_eq!(title[2 * PAGE + 100..2 * PAGE + 108], [0x4D; 8]);
@@ -2786,6 +2963,69 @@ void main(uint3 id : SV_DispatchThreadID) {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// The stale check (`VICTORY_STALE_CHECK`) finds a page the title wrote
+    /// with its guard opened behind the tracking's back (a write nothing
+    /// sees or reports), and only it: a write the guard saw counts as
+    /// changed and is passed by, and so is a copy shaders may be writing.
+    /// With `fix` the page is copied, and the next check finds nothing.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_stale_check_finds_writes_the_tracking_missed() {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        assert_eq!(copy.stale_pages(false), (3, Vec::new()), "nothing missed");
+        // SAFETY: a byte of our pool, guarded: the handler marks the page.
+        unsafe { ((p + 10) as *mut u8).write_volatile(1) };
+        let mut old = 0;
+        // SAFETY: a page of our pool; only its protection changes.
+        let opened =
+            unsafe { VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+        assert_ne!(opened, 0);
+        // SAFETY: two bytes of our pool, now writable with no fault.
+        unsafe { ((p + PAGE + 20) as *mut u16).write_volatile(0x0203) };
+        let found = (2, vec![(p + PAGE, 2)]);
+        assert_eq!(
+            copy.stale_pages(false),
+            found,
+            "page 0 changed, page 1 missed"
+        );
+        assert_eq!(copy.stale_pages(true), found);
+        assert_eq!(copy.stale_pages(false), (2, Vec::new()), "copied");
+        assert_eq!(
+            copy.read_host((p + PAGE + 20) as u64, 1)[0] & 0xffff,
+            0x0203
+        );
+        copy.writing(p, len, false);
+        assert_eq!(
+            copy.stale_pages(false),
+            (0, Vec::new()),
+            "shaders may be writing it"
+        );
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+    }
+
+    /// `VICTORY_STALE_CHECK`'s values: off, one copy in N, every copy with
+    /// the pages that differ copied, one in 64 for anything else.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn stale_check_settings() {
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(stale_setting(off), None);
+        }
+        assert_eq!(stale_setting(Some("1")), Some((1, false)));
+        assert_eq!(stale_setting(Some("16")), Some((16, false)));
+        assert_eq!(stale_setting(Some("fix")), Some((1, true)));
+        assert_eq!(stale_setting(Some("on")), Some((64, false)));
     }
 
     /// Runs of the shared buffers start a whole number of elements (and of

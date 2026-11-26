@@ -259,6 +259,19 @@ pub(crate) fn drop_withheld(address: usize, len: usize) {
     }
 }
 
+/// Whether shader writes withheld from title memory in `[from, to)` stay in
+/// the host copies until the frame's end ([`retake_dropped`]): there the
+/// copies differ from title memory on purpose (diagnostics: the stale
+/// check passes them by).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn withheld_until_frame_end(from: usize, to: usize) -> bool {
+    DROPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(at, len)| at < to && from < at.saturating_add(len))
+}
+
 /// At a frame's end: what the frame withheld leaves the host copies, so
 /// that results computed from memory with no copy (garbage record arrays
 /// and node pointers of the BVH builder) do not feed later frames whose
