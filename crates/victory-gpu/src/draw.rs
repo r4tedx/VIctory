@@ -78,9 +78,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds; given back when the list is reset
+    /// or released, or taken back once it has run when a heap runs short
+    /// ([`Lease`]).
+    dynamic: std::sync::Arc<Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -100,9 +101,6 @@ pub(crate) struct State {
     /// back when the list closes or takes another run
     /// ([`State::trim_run`]).
     run: (usize, u32, u32),
-    /// The dynamic slots the list held when first submitted since its
-    /// reset (counted in [`HELD_BY_RAN`] until it is reset or released).
-    ran: Option<u64>,
     /// Slots made for unordered access clears in this list
     /// ([`State::clear_view`]): (view heap, view, host resource) → dynamic
     /// slot, so that clears of one view (a stand-in's, at each dispatch of
@@ -112,15 +110,145 @@ pub(crate) struct State {
     clear_slots: std::collections::BTreeMap<(usize, View, usize), u32>,
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            give_back(heap, first, n);
+/// The dynamic slots a list holds, shared with the queue that runs it and
+/// with [`FINISHED`]: once a submission of the list has run (each is waited
+/// for) the GPU reads them no more unless the list is submitted again, so a
+/// heap that runs short takes them back ([`reclaim`]) and the list is lost:
+/// submitted again before a reset, it does not run.
+#[derive(Default)]
+pub(crate) struct Lease(std::sync::Mutex<Held>);
+
+#[derive(Default)]
+struct Held {
+    /// Title heap (key), first, count.
+    slots: Vec<(usize, u32, u32)>,
+    /// Submissions of the list running now.
+    running: u32,
+    /// A submission of the list has run since its reset: it is in
+    /// [`FINISHED`], and its slots are counted in [`HELD_BY_RAN`].
+    ran: bool,
+    /// Its slots were taken back: it must not run until it is reset.
+    lost: bool,
+}
+
+impl Held {
+    fn count(&self) -> u64 {
+        self.slots.iter().map(|d| u64::from(d.2)).sum()
+    }
+}
+
+/// Leases of lists that have run, oldest first: where [`reclaim`] looks.
+static FINISHED: std::sync::Mutex<std::collections::VecDeque<std::sync::Weak<Lease>>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+impl Lease {
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A submission of the list starts: false if it must not run, its
+    /// slots taken back since it last ran.
+    pub(crate) fn start(&self) -> bool {
+        let mut held = self.held();
+        if held.ran {
+            LEASES[RESUBMITTED].fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(n) = self.ran {
-            HELD_BY_RAN.fetch_sub(n, Ordering::Relaxed);
+        if held.lost {
+            LEASES[LOST_NOT_RUN].fetch_add(1, Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a list submitted again after its dynamic slots were taken back: not run (the title did not reset it)");
+            });
+            return false;
+        }
+        held.running += 1;
+        true
+    }
+
+    /// The submission [`Lease::start`] began has ended; `done`: it was waited
+    /// for, so the GPU has finished with it.
+    pub(crate) fn finish(self: &std::sync::Arc<Self>, done: bool) {
+        let first = {
+            let mut held = self.held();
+            held.running = held.running.saturating_sub(1);
+            let first = done && !held.ran;
+            if first {
+                held.ran = true;
+                HELD_BY_RAN.fetch_add(held.count(), Ordering::Relaxed);
+            }
+            first
+        };
+        if first {
+            FINISHED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(std::sync::Arc::downgrade(self));
         }
     }
+
+    /// Takes back every slot of a list that has run, runs no more now and
+    /// holds some of heap `key`: how many (None if it may not, or has none).
+    fn take_back(&self, key: usize) -> Option<u64> {
+        let slots = {
+            let mut held = self.held();
+            if held.running > 0 || !held.ran || held.lost || !held.slots.iter().any(|d| d.0 == key) {
+                return None;
+            }
+            held.lost = true;
+            HELD_BY_RAN.fetch_sub(held.count(), Ordering::Relaxed);
+            std::mem::take(&mut held.slots)
+        };
+        for &(heap, first, n) in &slots {
+            give_back(heap, first, n);
+        }
+        Some(slots.iter().map(|d| u64::from(d.2)).sum())
+    }
+
+    /// Whether [`reclaim`] may come back to it: it has run and not been
+    /// taken back.
+    fn waiting(&self) -> bool {
+        let held = self.held();
+        held.ran && !held.lost
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let held = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        if held.ran && !held.lost {
+            HELD_BY_RAN.fetch_sub(held.count(), Ordering::Relaxed);
+        }
+        for &(heap, first, n) in &held.slots {
+            give_back(heap, first, n);
+        }
+    }
+}
+
+/// Takes back the slots of lists that have run, oldest first, until heap
+/// `key` (`host`) has `want` consecutive free slots, or its longest free
+/// run of at least `least`: those, taken ([`HostHeap::dynamic_run`]).
+///
+/// [`HostHeap::dynamic_run`]: crate::descriptor::host::HostHeap::dynamic_run
+fn reclaim(key: usize, host: &crate::descriptor::host::HostHeap, want: u32, least: u32) -> Option<(u32, u32)> {
+    let mut finished = FINISHED.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..finished.len() {
+        let Some(weak) = finished.pop_front() else { break };
+        // Gone: the list was reset or released, its slots came back then.
+        let Some(lease) = weak.upgrade() else { continue };
+        match lease.take_back(key) {
+            Some(n) => {
+                LEASES[TAKEN_BACK].fetch_add(1, Ordering::Relaxed);
+                LEASES[SLOTS_TAKEN_BACK].fetch_add(n, Ordering::Relaxed);
+                if let Some(got) = host.dynamic_run(want, least) {
+                    return Some(got);
+                }
+            }
+            // Running again, or holding none of this heap: later.
+            None if lease.waiting() => finished.push_back(weak),
+            None => {}
+        }
+    }
+    None
 }
 
 /// Gives back `n` dynamic slots from `first` of the view heap keyed
@@ -157,11 +285,48 @@ const NO_TABLE_SLOTS: usize = 1;
 const FRAGMENTED: usize = 0;
 const EXHAUSTED: usize = 1;
 
-/// Dynamic slots held by lists submitted since their last reset (each
-/// submission is waited for): once it returns the GPU no longer reads
-/// them unless the title submits the list again, but they come back only
-/// at the reset.
+/// Dynamic slots held by lists that have run since their last reset (each
+/// submission is waited for): the GPU no longer reads them unless the
+/// title submits the list again; they come back at the reset, or when a
+/// heap runs short ([`reclaim`]).
 static HELD_BY_RAN: AtomicU64 = AtomicU64::new(0);
+
+/// Lists' leases: lists submitted again before a reset, of those not run
+/// (their slots taken back), and lists and slots taken back.
+static LEASES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+const RESUBMITTED: usize = 0;
+const LOST_NOT_RUN: usize = 1;
+const TAKEN_BACK: usize = 2;
+const SLOTS_TAKEN_BACK: usize = 3;
+
+/// Unordered access clears ([`State::clear_view`]; stand-ins' and the
+/// ambient's): dynamic slots taken for them, clears that shared a slot
+/// taken before in their list, and clears not run for want of a slot.
+static CLEARS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const CLEAR_SLOT: usize = 0;
+const CLEAR_SHARED: usize = 1;
+const CLEAR_DROPPED: usize = 2;
+
+/// Clears since the last call: slots taken, clears sharing a slot, clears
+/// dropped ([`CLEARS`]).
+pub(crate) fn take_clear_slots() -> [u64; 3] {
+    CLEARS.each_ref().map(|a| a.swap(0, Ordering::Relaxed))
+}
+
+/// Takes of dynamic slots that failed, after taking back what lists that
+/// ran held, by the slots wanted: 1, 2-8, 9-32, 33-256, more.
+static FAILED_TAKES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn failed_take(n: u32) {
+    let bucket = match n {
+        0..=1 => 0,
+        2..=8 => 1,
+        9..=32 => 2,
+        33..=256 => 3,
+        _ => 4,
+    };
+    FAILED_TAKES[bucket].fetch_add(1, Ordering::Relaxed);
+}
 
 /// What [`take_dynamic_drops`] counts.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -171,11 +336,16 @@ pub(crate) struct DynamicDrops {
     pub(crate) short_runs: u64,
     pub(crate) fragmented: u64,
     pub(crate) exhausted: u64,
+    pub(crate) failed_takes: [u64; 5],
+    pub(crate) resubmitted: u64,
+    pub(crate) not_run: u64,
+    pub(crate) taken_back: u64,
+    pub(crate) slots_taken_back: u64,
 }
 
 /// Draws and dispatches dropped since the last call for want of dynamic
-/// slots, the list runs taken shorter than [`LIST_RUN`], and table
-/// refusals by cause.
+/// slots, the list runs taken shorter than [`LIST_RUN`], table refusals by
+/// cause, failed takes by size, and what lists' leases did.
 pub(crate) fn take_dynamic_drops() -> DynamicDrops {
     let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
     DynamicDrops {
@@ -184,10 +354,15 @@ pub(crate) fn take_dynamic_drops() -> DynamicDrops {
         short_runs: take(&SHORT_RUNS),
         fragmented: take(&TABLE_REFUSALS[FRAGMENTED]),
         exhausted: take(&TABLE_REFUSALS[EXHAUSTED]),
+        failed_takes: FAILED_TAKES.each_ref().map(take),
+        resubmitted: take(&LEASES[RESUBMITTED]),
+        not_run: take(&LEASES[LOST_NOT_RUN]),
+        taken_back: take(&LEASES[TAKEN_BACK]),
+        slots_taken_back: take(&LEASES[SLOTS_TAKEN_BACK]),
     }
 }
 
-/// Dynamic slots held now by lists already submitted ([`HELD_BY_RAN`]).
+/// Dynamic slots held now by lists that have run ([`HELD_BY_RAN`]).
 pub(crate) fn held_by_ran() -> u64 {
     HELD_BY_RAN.load(Ordering::Relaxed)
 }
@@ -1004,12 +1179,15 @@ impl State {
         if heap != key || end - next < n {
             self.trim_run();
             let want = LIST_RUN.max(n);
-            let (first, got) = host.dynamic_run(want, n)?;
+            let Some((first, got)) = host.dynamic_run(want, n).or_else(|| reclaim(key, host, want, n)) else {
+                failed_take(n);
+                return None;
+            };
             if got < want {
                 once!(got, n, "dynamic slots short: lists take runs under {LIST_RUN} slots");
                 SHORT_RUNS.fetch_add(1, Ordering::Relaxed);
             }
-            self.dynamic.push((key, first, got));
+            self.dynamic.held().slots.push((key, first, got));
             self.run = (key, first, first + got);
         }
         let first = self.run.1;
@@ -1026,10 +1204,12 @@ impl State {
             return;
         }
         give_back(heap, next, end - next);
-        if let Some(run) = self.dynamic.iter_mut().rev().find(|d| d.0 == heap && d.1 + d.2 == end) {
+        let mut held = self.dynamic.held();
+        if let Some(run) = held.slots.iter_mut().rev().find(|d| d.0 == heap && d.1 + d.2 == end) {
             run.2 = next - run.1;
         }
-        self.dynamic.retain(|d| d.2 > 0);
+        held.slots.retain(|d| d.2 > 0);
+        drop(held);
         self.run = (heap, next, next);
     }
 
@@ -1038,16 +1218,10 @@ impl State {
         self.trim_run();
     }
 
-    /// The list is submitted (closed; its submission is waited for): its
-    /// dynamic slots are counted as held by a list that ran until it is
-    /// reset. Once per recording.
-    pub(crate) fn submitted(&mut self) {
-        if self.ran.is_some() {
-            return;
-        }
-        let n = self.dynamic.iter().map(|d| u64::from(d.2)).sum();
-        HELD_BY_RAN.fetch_add(n, Ordering::Relaxed);
-        self.ran = Some(n);
+    /// The list's dynamic slots, for the queue that submits it
+    /// ([`Lease::start`], [`Lease::finish`]).
+    pub(crate) fn lease(&self) -> std::sync::Arc<Lease> {
+        self.dynamic.clone()
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -1156,14 +1330,19 @@ impl State {
         };
         let key = (std::ptr::from_ref(heap) as usize, view.clone(), resource.as_raw() as usize);
         let slot = match self.clear_slots.get(&key) {
-            Some(&slot) => slot,
+            Some(&slot) => {
+                CLEARS[CLEAR_SHARED].fetch_add(1, Ordering::Relaxed);
+                slot
+            }
             None => {
                 // From the list's run, as root views and fresh tables take
                 // theirs ([`Self::take_slots`]).
                 let Some(slot) = self.take_slots(key.0, visible, 1) else {
                     once!("an unordered access clear without a dynamic slot: not run");
+                    CLEARS[CLEAR_DROPPED].fetch_add(1, Ordering::Relaxed);
                     return false;
                 };
+                CLEARS[CLEAR_SLOT].fetch_add(1, Ordering::Relaxed);
                 visible.make_at(slot, view);
                 self.clear_slots.insert(key, slot);
                 slot
@@ -2987,7 +3166,11 @@ void main(uint lane : SV_GroupIndex) {
         assert_eq!(starved.root_view(&other, true, 0, false), None);
         #[cfg(feature = "diagnostics")]
         assert_eq!(NOT_RUN.with(|w| w.replace("")), "no dynamic slots for root views");
-        assert_eq!(take_dynamic_drops(), DynamicDrops { root_views: 1, ..Default::default() });
+        assert_eq!(
+            take_dynamic_drops(),
+            DynamicDrops { root_views: 1, failed_takes: [1, 0, 0, 0, 0], ..Default::default() },
+            "a take of one slot failed, and its draw was dropped"
+        );
         drop(starved);
         other.close();
         heap_host.release(held, 4);
@@ -3039,9 +3222,13 @@ void main(uint lane : SV_GroupIndex) {
         assert_eq!(host.dynamic_free().0, 256, "both runs' tails come back at close");
 
         let held = held_by_ran();
-        a.submitted();
-        a.submitted();
+        let lease = a.lease();
+        for _ in 0..2 {
+            assert!(lease.start());
+            lease.finish(true);
+        }
         assert_eq!(held_by_ran(), held + 128, "a's tables, counted once");
+        drop(lease);
         drop(a);
         assert_eq!(held_by_ran(), held, "back at the reset");
         let mut c = State::default();
@@ -3049,6 +3236,190 @@ void main(uint lane : SV_GroupIndex) {
         drop((b, c));
         assert_eq!(host.dynamic_free().0, 512);
         host.release(all, total);
+    }
+
+    /// A heap short of slots takes back those of a list that has run and
+    /// runs no more, and that list, submitted again before a reset, does not
+    /// run. A list running now, or not submitted yet, keeps its slots; one
+    /// whose submission could not be waited for is never taken from.
+    #[test]
+    fn a_heap_short_of_slots_takes_back_those_of_lists_that_ran() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let key = std::ptr::from_ref(title_heap) as usize;
+        let host = title_heap.host().expect("a host view heap");
+        let (_, total) = host.dynamic_free();
+        // Every dynamic slot held elsewhere but 1,024 in a row.
+        let all = host.dynamic(total).unwrap();
+        let base = all + 1000;
+        host.release(base, 1024);
+        take_dynamic_drops();
+        let held = held_by_ran();
+
+        // a ran, b runs now, c is not submitted yet, u's submission was not
+        // waited for.
+        let (mut a, mut b, mut c, mut u) = (State::default(), State::default(), State::default(), State::default());
+        assert_eq!(a.take_slots(key, host, 200), Some(base));
+        a.close();
+        assert_eq!(b.take_slots(key, host, 256), Some(base + 256));
+        assert_eq!(c.take_slots(key, host, 256), Some(base + 512));
+        assert_eq!(u.take_slots(key, host, 256), Some(base + 768));
+        assert_eq!(host.dynamic_free().0, 56, "a's tail came back at close");
+        let (la, lb, lu) = (a.lease(), b.lease(), u.lease());
+        assert!(la.start());
+        la.finish(true);
+        assert!(lb.start());
+        assert!(lu.start());
+        lu.finish(false);
+        assert_eq!(held_by_ran(), held + 200);
+
+        // 100 in a row: a's 200 come back, joined to its tail.
+        let mut d = State::default();
+        assert_eq!(d.take_slots(key, host, 100), Some(base), "a's slots taken back");
+        assert_eq!(held_by_ran(), held);
+        assert!(!la.start(), "a, submitted again before a reset, does not run");
+        // Only a list that ran gives its slots; b runs, c and u never ran.
+        let mut e = State::default();
+        assert_eq!(e.take_slots(key, host, 100), None);
+        lb.finish(true);
+        assert_eq!(e.take_slots(key, host, 100), Some(base + 256), "b's, once it ran");
+        assert!(!lb.start());
+        let counted = take_dynamic_drops();
+        assert_eq!((counted.taken_back, counted.slots_taken_back), (2, 456));
+        assert_eq!((counted.resubmitted, counted.not_run), (2, 2));
+        assert_eq!(counted.failed_takes, [0, 0, 0, 1, 0]);
+
+        // Reset or released, every list gives back what it still holds once.
+        drop((la, lb, lu));
+        drop((a, b, c, d, e, u));
+        assert_eq!(host.dynamic_free().0, 1024);
+        host.release(all, total);
+        assert_eq!(host.dynamic_free(), (total, total));
+    }
+
+    /// Lists making root views of many host copies (a slot per copy and
+    /// list, as with every written buffer in its own copy in video memory)
+    /// fill a short pool; a new list's views are made from the slots of the
+    /// oldest list that ran, not dropped.
+    #[test]
+    fn root_views_of_many_copies_come_back_from_lists_that_ran() {
+        let Some(gpu) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let (_, total) = host.dynamic_free();
+        let all = host.dynamic(total).unwrap();
+        host.release(all + 1000, 160);
+        let address = |b: This| crate::resource::buffer_bytes(b).unwrap().0 as u64;
+        let copies: Vec<u64> = (0..64).map(|_| address(buffer(256))).collect();
+        take_dynamic_drops();
+        let views = |state: &mut State, list: &HostList| {
+            copies
+                .iter()
+                .filter(|&&a| {
+                    state.set_view(true, 0, a);
+                    state.root_view(list, true, 0, false).is_some()
+                })
+                .count()
+        };
+        let mut states = Vec::new();
+        let mut lists = Vec::new();
+        for _ in 0..3 {
+            let list = gpu.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            assert_eq!(views(&mut state, &list), 64, "a view per copy, none dropped");
+            list.close();
+            state.close();
+            let lease = state.lease();
+            assert!(lease.start());
+            lease.finish(true);
+            states.push(state);
+            lists.push(list);
+        }
+        let counted = take_dynamic_drops();
+        assert_eq!(counted.root_views, 0);
+        assert_eq!((counted.taken_back, counted.slots_taken_back), (1, 64), "the first list's, for the third");
+        assert!(!states[0].lease().start(), "the first list is lost");
+        drop(states);
+        assert_eq!(host.dynamic_free().0, 160);
+        host.release(all, total);
+    }
+
+    /// A copy in a GPU upload heap (`VICTORY_GPU_UPLOAD`: each copy its own
+    /// placed buffer) takes the dynamic slots a copy in system memory takes,
+    /// which is its own committed buffer too: one root view per copy and
+    /// list. Run with copies in system memory, then in a child process with
+    /// the switch set (where the host has GPU upload heaps).
+    #[test]
+    fn copies_in_upload_heaps_take_the_slots_system_memory_copies_do() {
+        const CHILD: &str = "VICTORY_TEST_DRAW_UPLOAD_CHILD";
+        const NAME: &str = "draw::tests::copies_in_upload_heaps_take_the_slots_system_memory_copies_do";
+        let child = std::env::var_os(CHILD).is_some();
+        if !child {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_GPU_UPLOAD", "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && text.contains("1 passed"), "with VICTORY_GPU_UPLOAD=1:\n{text}");
+            eprintln!("{text}");
+        }
+        let Some(gpu) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        const N: u32 = 32;
+        let pages: Vec<usize> = (0..N).map(|_| crate::watch::tests::pool(1)).collect();
+        for &p in &pages {
+            crate::shadow::register_read_only(p, p as u64, 1 << 16);
+        }
+        let placed = pages
+            .iter()
+            .filter(|&&p| crate::shadow::find(p as u64, 1).expect("a copy").in_upload())
+            .count();
+        let list = gpu.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        let before = host.dynamic_free().0;
+        for &p in &pages {
+            state.set_view(true, 0, p as u64);
+            assert!(state.root_view(&list, true, 0, false).is_some());
+        }
+        list.close();
+        state.close();
+        let used = before - host.dynamic_free().0;
+        eprintln!("{placed} of {N} copies in GPU upload heaps; their root views took {used} dynamic slots");
+        if child && gpu.gpu_upload() {
+            assert_eq!(placed, N as usize, "every read-only copy placed in an upload heap");
+        } else if !child {
+            assert_eq!(placed, 0);
+        }
+        assert_eq!(used, N, "one slot per copy, wherever the copy is");
+        drop(state);
+        assert_eq!(host.dynamic_free().0, before);
+        for &p in &pages {
+            crate::shadow::unregister(p, p as u64);
+        }
     }
 
     /// A host copy whose GPU side is in video memory (`VICTORY_VRAM_COPIES`,
@@ -3423,8 +3794,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Clears of one view in one list share one dynamic slot (a stand-in
     /// clears its view at each dispatch of its program): eight clears of a
-    /// view take one, a clear of another view one more, and the views hold
-    /// their last clears; the slots come back when the list is reset.
+    /// view take one from the list's run, a clear of another view one more,
+    /// and the views hold their last clears; the rest of the run comes back
+    /// when the list closes, the two slots when it is reset.
     #[test]
     fn clears_of_one_view_in_a_list_share_a_dynamic_slot() {
         let Some(host) = crate::host::host() else {
@@ -3467,15 +3839,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (free, _) = heap_host.dynamic_free();
         let list = host.new_list().unwrap();
         let mut state = State::default();
+        // Slots taken out of the list's runs ([`State::take_slots`]); the
+        // heap lends the list a whole run of [`LIST_RUN`] at once.
+        let taken = |s: &State| s.dynamic.held().slots.iter().map(|d| d.2).sum::<u32>() - (s.run.2 - s.run.1);
         state.set_heaps(&[heap]);
         for k in 1..=8 {
             assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[], true), "clear {k}");
         }
-        assert_eq!(heap_host.dynamic_free().0, free - 1, "eight clears of one view, one slot");
+        assert_eq!(taken(&state), 1, "eight clears of one view, one slot");
+        assert_eq!(heap_host.dynamic_free().0, free - LIST_RUN, "the list's run");
         assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 2, "another view, another slot");
+        assert_eq!(taken(&state), 2, "another view, another slot");
         assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 2, "the first view's slot again");
+        assert_eq!(taken(&state), 2, "the first view's slot again");
         for t in &textures {
             let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
             readable(&list, &used(ResourceType::Srv), &srv, false);
@@ -3483,6 +3859,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         run(&list, &slots, &read, 0, Some(&out), (N / 8, N / 8));
         list.close();
         state.close();
+        assert_eq!(heap_host.dynamic_free().0, free - 2, "the run's rest comes back at close");
         host.execute(&[&list]);
         for i in [0usize, 5, 7 * 16 + 9, 255] {
             // SAFETY: inside the mapped output, after the list ran.
@@ -3495,7 +3872,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // A new recording takes a slot afresh.
         state.set_heaps(&[heap]);
         assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[], true));
-        assert_eq!(heap_host.dynamic_free().0, free - 1);
+        assert_eq!(taken(&state), 1);
         list.close();
         host.execute(&[&list]);
         list.reset();

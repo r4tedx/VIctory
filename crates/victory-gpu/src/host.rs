@@ -68,6 +68,15 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// Host submissions whose end could not be waited for: a list in one may
+/// still run, so its dynamic slots are not taken back (`crate::draw::Lease`).
+static UNWAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host submissions not waited for so far ([`UNWAITED`]).
+pub(crate) fn unwaited() -> u64 {
+    UNWAITED.load(Ordering::Relaxed)
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -1265,7 +1274,10 @@ impl Host {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        UNWAITED.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -3139,21 +3151,50 @@ impl Meter {
             // Over every frame since the last line.
             let logged_frames = std::mem::take(&mut self.logged_frames);
             let d = crate::draw::take_dynamic_drops();
-            if d != crate::draw::DynamicDrops::default() {
-                let (free, total) = crate::descriptor::fullest_dynamic().unwrap_or_default();
+            let pool = crate::descriptor::fullest_dynamic().unwrap_or_default();
+            // A capped heap's pool (the only kind short of slots) once it has
+            // been more than half used, or anything dropped or taken back.
+            let busy = pool.total < (1 << 18) && pool.low < pool.total / 2;
+            if busy || d != crate::draw::DynamicDrops::default() {
+                let f = d.failed_takes;
                 tracing::info!(
                     "dynamic descriptor slots: dropped {} draws for root views and {} for tables \
                      in {logged_frames} frames ({:.1}/frame); tables refused {} times with the \
-                     slots free but not in a row, {} with too few free; {} list runs shorter \
-                     than 256 slots; fullest view heap {free} of {total} free; {} held by lists \
-                     already submitted",
+                     slots free but not in a row, {} with too few free; failed takes by size \
+                     1: {}, 2-8: {}, 9-32: {}, 33-256: {}, more: {}; {} list runs shorter than \
+                     256 slots; fullest view heap {} of {} free, peak {} in use, {} held by \
+                     title memory view pairs; {} held by lists that have run; taken back {} \
+                     slots of {} lists that had run; lists submitted again before a reset {}, \
+                     {} of them not run (their slots taken back)",
                     d.root_views,
                     d.tables,
                     (d.root_views + d.tables) as f64 / logged_frames.max(1) as f64,
                     d.fragmented,
                     d.exhausted,
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                    f[4],
                     d.short_runs,
+                    pool.free,
+                    pool.total,
+                    pool.total - pool.low,
+                    pool.pairs,
                     crate::draw::held_by_ran(),
+                    d.slots_taken_back,
+                    d.taken_back,
+                    d.resubmitted,
+                    d.not_run,
+                );
+            }
+            let [clear_slots, clears_shared, clears_dropped] = crate::draw::take_clear_slots();
+            if busy || clear_slots + clears_dropped > 0 {
+                tracing::info!(
+                    "dynamic descriptor slots for unordered access clears (stand-ins, ambient): \
+                     {clear_slots} taken in {logged_frames} frames ({:.1}/frame), {clears_shared} \
+                     clears shared a slot of their list, {clears_dropped} not run for want of one",
+                    clear_slots as f64 / logged_frames.max(1) as f64,
                 );
             }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

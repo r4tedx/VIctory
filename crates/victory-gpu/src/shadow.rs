@@ -271,6 +271,12 @@ impl Shadow {
         }
     }
 
+    /// Whether it is in a GPU upload heap (`VICTORY_GPU_UPLOAD`).
+    #[cfg(test)]
+    pub(crate) fn in_upload(&self) -> bool {
+        self.upload.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The pages (by index in the copy) its mirror is behind on.
     #[cfg(test)]
     fn stale_pages(&self) -> Vec<usize> {
