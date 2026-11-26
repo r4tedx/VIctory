@@ -78,6 +78,8 @@ mod twin;
 #[cfg(windows)]
 mod vram;
 #[cfg(windows)]
+mod waits;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

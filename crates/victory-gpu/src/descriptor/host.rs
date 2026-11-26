@@ -91,6 +91,29 @@ struct Overflow {
     /// The slots, [`SHARD`] to a lock: lists recording at once take
     /// different ones.
     shards: Vec<Mutex<Vec<Over>>>,
+    /// Diagnostics: the generation each record (view entry) was last made
+    /// in some overflow slot, to tell a record made again at another slot
+    /// (one view per record would serve it) from a new one.
+    #[cfg(feature = "diagnostics")]
+    seen: Mutex<std::collections::HashMap<u32, u32>>,
+}
+
+/// Views fresh tables made in the overflow heap, by why
+/// ([`HostHeap::copy_overflow`]): the slot's first use; its record changed
+/// to one made before at another slot (diagnostics builds tell these; else
+/// counted as new); to one never made there; a null view; and the
+/// nanoseconds spent making them.
+pub(crate) static OVERFLOW_MADE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) const MADE_FIRST_USE: usize = 0;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const MADE_SEEN: usize = 1;
+pub(crate) const MADE_NEW: usize = 2;
+pub(crate) const MADE_NULL: usize = 3;
+pub(crate) const MADE_NS: usize = 4;
+
+/// [`OVERFLOW_MADE`] since the last call.
+pub(crate) fn take_overflow_made() -> [u64; 5] {
+    OVERFLOW_MADE.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Overflow slots per lock.
@@ -138,7 +161,15 @@ impl Overflow {
         let shards = (0..len.div_ceil(SHARD))
             .map(|s| Mutex::new(vec![Over::default(); SHARD.min(len - s * SHARD) as usize]))
             .collect();
-        Some(Overflow { _heap: heap, cpu, step, len, shards })
+        Some(Overflow {
+            _heap: heap,
+            cpu,
+            step,
+            len,
+            shards,
+            #[cfg(feature = "diagnostics")]
+            seen: Mutex::default(),
+        })
     }
 
     fn cpu(&self, at: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -774,6 +805,15 @@ impl HostHeap {
                 None => Over::NULL,
             };
             if slot.key != key {
+                let reason = match (slot.key, view) {
+                    (_, None) => MADE_NULL,
+                    (0, _) => MADE_FIRST_USE,
+                    #[cfg(feature = "diagnostics")]
+                    _ if o.seen.lock().unwrap_or_else(|e| e.into_inner()).get(&i) == Some(&generation) => MADE_SEEN,
+                    _ => MADE_NEW,
+                };
+                OVERFLOW_MADE[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let started = std::time::Instant::now();
                 let (made_kept, mark) = match view {
                     Some(view) => {
                         let (made_kept, mark) = make_marked(view, o.cpu(at));
@@ -787,6 +827,11 @@ impl HostHeap {
                         (None, None)
                     }
                 };
+                OVERFLOW_MADE[MADE_NS].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if view.is_some() {
+                    o.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(i, generation);
+                }
                 // What the old view kept goes once the work in flight has
                 // run, as for a title slot ([`HostHeap::keep`]).
                 if let Some((old, _)) = std::mem::replace(slot, Over { key, kept: made_kept, mark }).kept {
@@ -816,12 +861,17 @@ impl HostHeap {
         Some((made, views))
     }
 
+    /// Slots the overflow heap has (title slots past this heap's), if any.
+    pub(crate) fn overflow_len(&self) -> u32 {
+        self.overflow.as_ref().map_or(0, |o| o.len)
+    }
+
     /// [`HostHeap::keep`] of slots `first..` in one go: what they kept goes
     /// once the work in flight has run.
     fn keep_run(&self, first: u32, resources: Vec<Kept>) {
         let mut retired = Vec::new();
         {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let mut kept = crate::waits::lock(&self.kept, crate::waits::Lock::Kept);
             for (slot, resource) in kept.iter_mut().skip(first as usize).zip(resources) {
                 if let Some((old, _)) = std::mem::replace(slot, resource) {
                     retired.push(old);
@@ -961,7 +1011,7 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = crate::waits::lock(&self.kept, crate::waits::Lock::Kept);
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
             #[cfg(feature = "diagnostics")]

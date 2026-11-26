@@ -501,7 +501,7 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = crate::waits::lock(&VIEWS, crate::waits::Lock::Views);
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -532,7 +532,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = crate::waits::lock(&VIEWS, crate::waits::Lock::Views);
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -554,7 +554,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = crate::waits::lock(&VIEWS, crate::waits::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -563,7 +563,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// entry, generation), under one look-up.
 #[cfg(windows)]
 pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = crate::waits::lock(&VIEWS, crate::waits::Lock::Views);
     records
         .iter()
         .map(|&[tag, i, generation]| {
@@ -580,7 +580,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = crate::waits::lock(&VIEWS, crate::waits::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }

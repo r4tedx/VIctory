@@ -1201,7 +1201,7 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        self.submit(runs);
+        crate::waits::submitting(|| self.submit(runs));
     }
 
     #[cfg(test)]
@@ -3351,6 +3351,45 @@ impl Meter {
                     per(views_copied),
                 );
             }
+            // Why fresh tables' views were made (not copied), and the waits
+            // for locks recording threads share with the submitting one.
+            let [first_use, seen, new, null, made_ns] = crate::descriptor::host::take_overflow_made();
+            let [no_overflow, below_cap, past_end, old_ns] = crate::draw::take_old_path();
+            let waits = crate::waits::take();
+            if pool.total > 0 && pool.total < (1 << 18) {
+                let per = |n: u64| n as f64 / logged_frames.max(1) as f64;
+                let ms = |ns: u64| per(ns) / 1e6;
+                tracing::info!(
+                    "fresh tables' views made, per frame: in the overflow heap {:.0} ({:.1} ms) - the slot's first use {:.0}, \
+                     its record changed to one made before at another slot {:.0}, to a new one {:.0}, a null view {:.0}; \
+                     one by one {:.0} ({:.1} ms) - no overflow heap {:.0}, the table starts below the title slots {:.0}, \
+                     past the overflow heap {:.0}",
+                    per(first_use + seen + new + null),
+                    ms(made_ns),
+                    per(first_use),
+                    per(seen),
+                    per(new),
+                    per(null),
+                    per(no_overflow + below_cap + past_end),
+                    ms(old_ns),
+                    per(no_overflow),
+                    per(below_cap),
+                    per(past_end),
+                );
+                #[cfg(feature = "diagnostics")]
+                tracing::info!(
+                    "lock waits, ms/frame (views, kept resources, retired): submitting thread {:.1} {:.1} {:.1}; \
+                     other threads {:.1} {:.1} {:.1}",
+                    ms(waits[0][0]),
+                    ms(waits[0][1]),
+                    ms(waits[0][2]),
+                    ms(waits[1][0]),
+                    ms(waits[1][1]),
+                    ms(waits[1][2]),
+                );
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = waits;
             let [clear_slots, clears_shared, clears_dropped] = crate::draw::take_clear_slots();
             if busy || clear_slots + clears_dropped > 0 {
                 tracing::info!(
@@ -4025,19 +4064,19 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+    crate::waits::lock(&RETIRED, crate::waits::Lock::Retired).push(resource);
 }
 
 /// [`retire`] of several under one lock.
 pub(crate) fn retire_all(resources: Vec<ID3D12Resource>) {
     if !resources.is_empty() {
-        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(resources);
+        crate::waits::lock(&RETIRED, crate::waits::Lock::Retired).extend(resources);
     }
 }
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
-    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let retired = std::mem::take(&mut *crate::waits::lock(&RETIRED, crate::waits::Lock::Retired));
     drop(retired);
 }
 
