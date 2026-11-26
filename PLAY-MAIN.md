@@ -246,7 +246,7 @@ The 10 ignored are benchmarks and measurements. Among the passing tests:
 and P-0a's own tests. victory-shader was not run again: it is unchanged
 since e5e2e251 (288 / 2 known WARP-only / 3 above).
 
-### play/main-next-3 (head 9fc427ad; `play/main-next` points here too)
+### play/main-next-3 (head 9fc427ad, docs 0b9ec46d; play/main fast-forwarded to it)
 
 On play/main-next-2 deeb5939, in order, each its own commit:
 
@@ -314,6 +314,54 @@ loose-window commits'. The guard tests pass at both heads
 Not verified: anything on the RTX 5070; that the builder log reads
 "held back: the host has no 64-lane waves" with made=53 in a title run
 (the GPU thread's next run checks it); the P-0a zeros (above).
+
+### play/main-next-4 (head 6411fc5b; `play/main-next` points here too)
+
+On play/main 0b9ec46d, in order, each its own commit:
+
+| # | Commit | What | Switch and default | Conflicts |
+|---|--------|------|--------------------|-----------|
+| 20 | 27cb3379 | merge `play/main-vram-review` c452d063 (58b27ef3's port of #2993's review fixes: copier, Signal and wait failures keep shader writes and fall back; the budget asked again near the line; snapshots of a copy in video memory bring the range back from the GPU side first; test harness `read_host` reads the GPU side, `write_host`, `write_gpu`, `in_child_with`) | as before | draw.rs `copies_in_upload_heaps…` and shadow.rs `rerun_with_gpu_upload`: their `env_remove("VICTORY_VRAM_COPIES")` against our explicit `VICTORY_VRAM_COPIES=0`; kept ours (it holds whatever the default) |
+| 21 | d83a419d | P-0a on by default | `VICTORY_VRAM_COPIES`: **unset = 2** (every copy), `=1` read-only copies, `=0` none. Upload heaps stay off unless `=1` | n/a |
+| 22 | d3ab2370 | cherry-pick of 877093e9 (author kept): giving dynamic slots back does not walk the free run they join (microbench 4,718 -> 178 ms per 1,000 tables) | none | none |
+| 23 | 6411fc5b | merge `play/main-overflow-views` 203fe029 (877093e9 already in): fresh tables past a capped heap's title slots copy views made once per record from an overflow view heap in CPU memory | `VICTORY_OVERFLOW_VIEWS`: **on by default**, `=0` the old path | descriptor/host.rs: two tests added at one place; both kept. The merge adds exactly 203fe029's change |
+
+- **Why 21:** N2P (`VICTORY_VRAM_COPIES=2`) against N2U and BM1, as in
+  play/main-next-3. The five bindless and root-view tests that read
+  zeros with P-0a on now pass at every level (merge 20's harness fixes).
+- **Why 23:** the GPU thread's OV pair, 10 min each: OV1 (overflow views)
+  against OV0, median frame 73 to 118 ms shorter; p95 791 ms, mean 699
+  ms, its best.
+- victory-shader is unchanged since play/main-next-3 (f7a85cfc), so that
+  shader cache still applies.
+
+**Build:** `targets\play-main-next-2` (workspace fingerprints cleared;
+all ten victory crates recompiled): `diag\victory-6411fc5b.exe`, sha256
+`54ff1f24d0fbf9e6206b3db09ebe46b23c6b62fc507886067b0f2951e27e3daa`.
+Clippy at 6411fc5b (`-D warnings`, victory and victory-gpu, all
+targets): clean without and with `--features diagnostics`. `cargo xtask
+policy`: 207 files ok.
+
+**Tests** (WARP), at 6411fc5b:
+
+| Suite | Switches | Passed | Failed | Ignored |
+|-------|----------|--------|--------|---------|
+| victory-gpu lib | defaults (`VICTORY_VRAM_COPIES` unset = 2) | 313 | 0 | 12 |
+| victory-gpu lib | `VICTORY_VRAM_COPIES=0` | 313 | 0 | 12 |
+| victory-gpu lib | `VICTORY_VRAM_COPIES=1` | 313 | 0 | 12 |
+| victory-shader lib (`--features host`, skips as above) | | 297 | 2 (known WARP-only: `gathers_at_a_level_match_the_hardware`, `permutes_read_the_lane_named_and_zero_from_lanes_left_out`) | 3 |
+
+Passing at each level among them: the overflow tests
+(`overflow_views_are_on_unless_switched_off`,
+`a_table_past_the_title_slots_reads_the_same_views_copied_or_made`,
+`a_release_beside_a_long_free_run_drops_the_bound`), the BVH guard
+tests (`the_builder_stays_held_back_on_hosts_without_64_lane_waves`,
+`runs_consults_the_32_lane_guard`) and
+`vram_copies_are_every_copy_by_default`. The 12 ignored are benchmarks
+and measurements.
+
+Not verified: anything on the RTX 5070 with these defaults together
+(P-0a and overflow views were each run, not both in one build).
 
 ## Merge notes
 
