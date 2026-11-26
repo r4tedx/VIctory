@@ -2566,13 +2566,6 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
-    // A placed view of memory the GPU writes through another title texture
-    // reads that one's host copy.
-    if let Some(View::Shader(b, _)) = &placed
-        && let Some(a) = crate::resource::alias_source(*b as This)
-    {
-        crate::texture::alias_copy(list, a, *b as This);
-    }
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
@@ -2595,6 +2588,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            // A view of memory the GPU writes through another title texture
+            // whose host copy this one could not share reads that copy.
+            if let Some(a) = crate::resource::alias_source(*resource as This) {
+                crate::texture::alias_copy(list, a, *resource as This);
+            }
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(&t)
             {
@@ -4648,5 +4646,280 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn placed_unordered_textures_write_and_read_back_through_placed_views() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(4);
+        let _ = host.log_messages();
+        let va1 = title_memory(1 << 20);
+        let va2 = title_memory(1 << 20);
+        let tex1_res = texture_words(8, 8, 28, 0, 4); // R8G8B8A8_UNORM + UAV
+        let tex2_res = texture_words(8, 8, 29, 0, 4); // R8G8B8A8_UNORM_SRGB + UAV
+        let placed_uav = |va: u64, res: [u32; 14], view_fmt: u32| {
+            let mut desc = [0u32; 16];
+            desc[0] = view_fmt;
+            desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+            (desc[10], desc[11]) = (va as u32, (va >> 32) as u32);
+            View::Placed(true, res, desc)
+        };
+        let uav1 = placed_uav(va1, tex1_res, 28);
+        let srv1 = placed_view(va1, tex1_res);
+        // DXGI_FORMAT_UNKNOWN (0) on sRGB + UAV resolves through view_format -> linear 28.
+        let uav2 = placed_uav(va2, tex2_res, 0);
+        let srv2 = placed_view(va2, tex2_res);
+        slots.make(0, &uav1);
+        slots.make(1, &srv1);
+        slots.make(2, &uav2);
+        slots.make(3, &srv2);
+
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<float4> outTex : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outTex[id.xy] = float4((id.x + 1.0) / 8.0, (id.y + 1.0) / 8.0, 0.5, 1.0);
+}
+"#,
+        );
+        let copy_srv_to_uav = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))"
+Texture2D<float4> inTex : register(t0);
+RWTexture2D<float4> outTex : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outTex[id.xy] = inTex.Load(int3(id.xy, 0));
+}
+"#,
+        );
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &uav1, false);
+        let tex1 = crate::resource::texture_at(va1, &tex1_res).unwrap();
+        assert_eq!(
+            list.transition(tex1, 0x8).map(|(_, before)| before),
+            None,
+            "placed UAV moved to UNORDERED_ACCESS"
+        );
+        run(&list, &slots, &write, 0, None, (1, 1));
+
+        readable(&list, &used(ResourceType::Srv), &srv1, false);
+        readable(&list, &used(ResourceType::Uav), &uav2, false);
+        assert!(!crate::texture::title_written(
+            &crate::resource::host_resource(tex1).unwrap()
+        ));
+        // SAFETY: an open list and live objects.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(slots.0.clone())]);
+            list.list.SetComputeRootSignature(&copy_srv_to_uav.0);
+            list.list.SetPipelineState(&copy_srv_to_uav.1);
+            list.list.SetComputeRootDescriptorTable(0, slots.gpu(1));
+            list.list.SetComputeRootDescriptorTable(1, slots.gpu(2));
+            list.list.Dispatch(1, 1, 1);
+        }
+
+        readable(&list, &used(ResourceType::Srv), &srv2, false);
+        run(&list, &slots, &read, 3, Some(&out), (1, 1));
+        list.close();
+        host.execute(&[&list]);
+
+        for (x, y) in [(0usize, 0usize), (3, 5), (7, 7)] {
+            // SAFETY: inside the mapped output buffer.
+            let got = unsafe { (data.add((y * 64 + x) * 16) as *const [f32; 4]).read() };
+            // `srv2` is R8G8B8A8_UNORM_SRGB, so reading back the UNORM bytes written
+            // through `uav2` applies sRGB-to-linear decoding on R, G, B.
+            let srgb_to_linear = |c: f32| {
+                let u = (c * 255.0).round() / 255.0;
+                if u <= 0.04045 {
+                    u / 12.92
+                } else {
+                    ((u + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let want = [
+                srgb_to_linear((x as f32 + 1.0) / 8.0),
+                srgb_to_linear((y as f32 + 1.0) / 8.0),
+                srgb_to_linear(0.5),
+                1.0,
+            ];
+            for ch in 0..4 {
+                assert!(
+                    (got[ch] - want[ch]).abs() < 0.015,
+                    "texel ({x},{y}) ch {ch}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn explicit_and_placed_rgba8_textures_at_one_address_share_compute_writes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 16, 1, 0, 0, 0, 0, 0];
+        let mut raw_heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut raw_heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(raw_heap);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let _ = host.log_messages();
+
+        let write = compile_cs(
+            r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<unorm float4> outTex : register(u0);
+[RootSignature(RS)]
+[numthreads(2, 2, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outTex[id.xy] = float4(64.0 / 255.0, 0.0, 1.0, 1.0);
+}
+"#,
+        );
+        let read_bytes = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<unorm float4> inTex : register(t0);
+RWByteAddressBuffer outBuf : register(u1);
+[RootSignature(RS)]
+[numthreads(2, 2, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint4 px = uint4(round(inTex.Load(int3(id.xy, 0)) * 255.0));
+    outBuf.Store4((id.y * 2 + id.x) * 16, px);
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(4 * 16).unwrap();
+
+        // Four pairings at one guest address in a single command list:
+        // 0: placed UAV -> placed SRV;
+        // 1: explicit address-backed UAV -> placed SRV (same resource desc);
+        // 2: placed SRV (`flags = 0`) mirrored before explicit UAV (`flags = 4`) upgrades host copy;
+        // 3: explicit SRV (`flags = 0`) created before placed UAV (`flags = 4`) upgrades host copy.
+        for case in 0..4u32 {
+            let va = title_memory(1 << 20);
+            let res_rw = texture_words(2, 2, 28, 0, 4);
+            let res_ro = texture_words(2, 2, 28, 0, 0);
+            let uav_slot = (2 * case) as u64;
+            let srv_slot = uav_slot + 1;
+            let uav_handle = title_heap.start + uav_slot * 32;
+            let srv_handle = title_heap.start + srv_slot * 32;
+
+            let mut placed_uav = [0u32; 16];
+            placed_uav[0] = 28;
+            placed_uav[1] = 4;
+            (placed_uav[10], placed_uav[11]) = (va as u32, (va >> 32) as u32);
+
+            let mut placed_srv = [0u32; 16];
+            placed_srv[0] = 28;
+            placed_srv[1] = 4;
+            placed_srv[2] = 0x1688;
+            placed_srv[5] = 1;
+            (placed_srv[10], placed_srv[11]) = (va as u32, (va >> 32) as u32);
+
+            let uav_words: [u32; 10] = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            let srv_words: [u32; 10] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+
+            let mut kept_obj = std::ptr::null();
+            match case {
+                0 => {
+                    crate::descriptor::create_placed_uav(null, &res_rw, &placed_uav, uav_handle);
+                    crate::descriptor::create_placed_srv(null, &res_rw, &placed_srv, srv_handle);
+                }
+                1 => {
+                    kept_obj = texture_at_address(va, &res_rw);
+                    crate::descriptor::create_uav(null, kept_obj, null, &uav_words, uav_handle);
+                    crate::descriptor::create_placed_srv(null, &res_rw, &placed_srv, srv_handle);
+                }
+                2 => {
+                    crate::descriptor::create_placed_srv(null, &res_ro, &placed_srv, srv_handle);
+                    // Pre-mirror the placed SRV before the explicit UAV upgrades the memory's host texture.
+                    heap_host.mirror(srv_slot as u32, srv_handle, true).unwrap();
+                    kept_obj = texture_at_address(va, &res_rw);
+                    crate::descriptor::create_uav(null, kept_obj, null, &uav_words, uav_handle);
+                }
+                _ => {
+                    kept_obj = texture_at_address(va, &res_ro);
+                    crate::descriptor::create_srv(null, kept_obj, &srv_words, srv_handle);
+                    crate::descriptor::create_placed_uav(null, &res_rw, &placed_uav, uav_handle);
+                }
+            }
+
+            if case == 1 {
+                let placed_v = crate::descriptor::view(srv_handle).unwrap();
+                let Some(View::Shader(placed_r, _)) =
+                    crate::descriptor::host::placed_texture(&placed_v)
+                else {
+                    panic!("expected placed texture view");
+                };
+                assert!(
+                    std::sync::Arc::ptr_eq(
+                        &crate::resource::host_copy(kept_obj).unwrap(),
+                        &crate::resource::host_copy(placed_r as This).unwrap(),
+                    ),
+                    "case 1 placed SRV shares the explicit texture's host copy"
+                );
+            }
+
+            // SAFETY: inside the mapped output buffer.
+            unsafe { std::ptr::write_bytes(data, 0, 4 * 16) };
+
+            let list = host.new_list().unwrap();
+            let uav_view = heap_host.mirror(uav_slot as u32, uav_handle, true).unwrap();
+            readable(&list, &used(ResourceType::Uav), &uav_view, false);
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&write.0);
+                list.list.SetPipelineState(&write.1);
+                list.list
+                    .SetComputeRootDescriptorTable(0, heap_host.gpu(uav_slot as u32));
+                list.list.Dispatch(1, 1, 1);
+            }
+
+            let srv_view = heap_host.mirror(srv_slot as u32, srv_handle, true).unwrap();
+            readable(&list, &used(ResourceType::Srv), &srv_view, false);
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&read_bytes.0);
+                list.list.SetPipelineState(&read_bytes.1);
+                list.list
+                    .SetComputeRootDescriptorTable(0, heap_host.gpu(srv_slot as u32));
+                list.list
+                    .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+
+            for texel in 0..4usize {
+                // SAFETY: inside the mapped output buffer.
+                let got = unsafe { (data.add(texel * 16) as *const [u32; 4]).read() };
+                assert_eq!(got, [64, 0, 255, 255], "case {case} texel {texel}");
+            }
+            assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
+            let _ = kept_obj;
+        }
     }
 }

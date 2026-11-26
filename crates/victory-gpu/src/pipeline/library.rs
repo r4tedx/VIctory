@@ -48,7 +48,7 @@
 //! ([`NEXT_FILE`]) and takes its place at the next start.
 //! `VICTORY_LIBRARY_MAP=0`: read and written through buffers, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -784,15 +784,29 @@ fn created() -> (u64, usize) {
 /// list as loaded), and in this one.
 #[derive(Default)]
 struct Used {
-    before: HashSet<String>,
+    /// Each earlier key with its place in the list as loaded: the list is
+    /// kept most recent run first, so a lower place is a more recent run.
+    before: HashMap<String, usize>,
     now: HashSet<String>,
 }
 
 impl Used {
-    /// The list to keep: this run's keys, then earlier runs' others, at
-    /// most `EARLY_MAX` (the oldest go once it is full).
+    /// The list as saved: one key a line, most recent run first (a list
+    /// in no order, as earlier builds saved it, reads as well).
+    fn read(listed: &str) -> Used {
+        let mut before = HashMap::new();
+        for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
+            before.entry(key.to_owned()).or_insert(place);
+        }
+        Used { before, now: HashSet::new() }
+    }
+
+    /// The list to keep: this run's keys, then earlier runs' others, most
+    /// recent first, at most `EARLY_MAX` (the oldest go once it is full).
     fn list(&self) -> Vec<String> {
-        let earlier = self.before.iter().filter(|k| !self.now.contains(*k));
+        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+        earlier.sort_unstable_by_key(|&(_, &place)| place);
+        let earlier = earlier.into_iter().map(|(k, _)| k);
         self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
     }
 }
@@ -807,22 +821,22 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = before.len(), "title pipelines to start early");
-        *used = Some(Used { before, now: HashSet::new() });
+        let read = Used::read(&listed);
+        tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
+        *used = Some(read);
     }
     used
 }
 
-/// Reads the early list now if not yet, so a save keeps it (a pre-build
-/// asks for no title pipeline).
+/// Reads the early list now if not yet (a pre-build asks for no title
+/// pipeline).
 pub(crate) fn keep_early_list() {
     drop(used());
 }
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|u| u.before.contains(key))
+    used().as_ref().is_some_and(|u| u.before.contains_key(key))
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
@@ -927,11 +941,34 @@ mod tests {
     #[test]
     fn the_early_list_keeps_this_run_first() {
         let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let used = Used { before: keys(0..EARLY_MAX), now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    /// A full list makes room by the oldest runs' keys, and keeps that
+    /// order across saves.
+    #[test]
+    fn a_full_early_list_drops_the_oldest_runs_keys() {
+        let key = |i: usize| format!("{i:032x}");
+        // As saved: the last run's keys, then the run before's.
+        let saved: Vec<String> = (0..EARLY_MAX).map(key).collect();
+        let mut used = Used::read(&saved.join("\n"));
+        used.now = (EARLY_MAX..EARLY_MAX + 10).map(key).collect();
+        used.now.insert(key(EARLY_MAX - 1)); // the oldest key, used again
+        let list = used.list();
+        assert_eq!(list.len(), EARLY_MAX);
+        assert!(used.now.iter().all(|k| list.contains(k)));
+        // The ten that go are the oldest ones not used again.
+        let dropped: HashSet<String> = (EARLY_MAX - 11..EARLY_MAX - 1).map(key).collect();
+        assert!(list.iter().all(|k| !dropped.contains(k)));
+        // Read back, this run's keys come first, then the earlier ones in order.
+        let again = Used::read(&list.join("\n"));
+        assert!(used.now.iter().all(|k| again.before[k] < used.now.len()));
+        assert!(again.before[&key(0)] < again.before[&key(1)]);
     }
 
     /// The pre-build's list holds only for the library bytes it was

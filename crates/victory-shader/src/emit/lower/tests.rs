@@ -1090,3 +1090,84 @@ fn a_compute_shader_samples_at_level_zero() {
     assert_eq!(super::sample_op(true), ("sampleLevel.f32", 62));
     assert_eq!(super::sample_op(false), ("sample.f32", 60));
 }
+
+#[test]
+fn ds_bpermute_wave64_preserves_32_lane_half() {
+    // Without reading v0 (`thread_id`), only the wave64 half-wave base
+    // (`lane_index & !31`) introduces `dx.op.waveGetLaneIndex`.
+    let words = [
+        0x7E02_02FF,
+        0x0000_0104, // v_mov_b32 v1, 0x104
+        0x7E04_0285, // v_mov_b32 v2, 5
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+        0x7E00_0503, // v_readfirstlane_b32 s0, v3
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for wave64 in [false, true] {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [if wave64 { 64 } else { 32 }, 1, 1],
+            }),
+            code: code.clone(),
+        };
+        let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+            view_marks: false,
+        })
+        .unwrap();
+        assert!(lowered.wave_ops);
+        assert_eq!(lowered.uses_lane_index, wave64, "wave64={wave64}");
+        assert_eq!(lowered.has_half_wave_mask, wave64, "wave64={wave64}");
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ds_bpermute_refuses_gds() {
+    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+    let words = [
+        0x7E02_0285,           // v_mov_b32 v1, 5
+        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
+        2 << 24 | 1 << 8,
+        0x7E00_0502, // v_readfirstlane_b32 s0, v2
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        lowers(&words, 0),
+        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+    ));
+}

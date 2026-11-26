@@ -359,6 +359,8 @@ struct Tracer<'a> {
     /// The loads from that memory by code offset, with their user-data byte
     /// offset.
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
+    /// Address sums already traced, indexed by SSA value.
+    sums: std::cell::RefCell<Vec<Option<Sum>>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -456,6 +458,7 @@ impl<'a> Tracer<'a> {
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
+            sums: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -472,6 +475,8 @@ impl<'a> Tracer<'a> {
         }
         if !t.spilled.is_empty() {
             t.origin = t.propagate_copies(n)?;
+            // Sums traced to find them are older than these origins.
+            t.sums.take();
         }
         Ok(t)
     }
@@ -680,6 +685,10 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        let index = v.0 as usize;
+        if let Some(&Some(sum)) = self.sums.borrow().get(index) {
+            return sum;
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -710,14 +719,24 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
-            return dynamic;
+        let sum =
+            if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+                dynamic
+            } else {
+                Sum {
+                    base: x.base.or(y.base),
+                    offset: x.offset.wrapping_add(y.offset),
+                    dynamic: x.dynamic.or(y.dynamic),
+                }
+            };
+        // The operands' origins are settled before tracing starts. Every
+        // use of this value can reuse its sum, including an opaque result.
+        let mut sums = self.sums.borrow_mut();
+        if index >= sums.len() {
+            sums.resize(index + 1, None);
         }
-        Sum {
-            base: x.base.or(y.base),
-            offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
-        }
+        sums[index] = Some(sum);
+        sum
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.

@@ -10,6 +10,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -102,9 +103,9 @@ enum Command {
         /// `--list`, a line per program too.
         #[arg(long)]
         count: bool,
-        /// Worker threads (default: every logical core).
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines), for this
@@ -187,7 +188,7 @@ fn main() -> Result<()> {
             cache: true,
             host_lanes,
             ..
-        } => translate::warm(paths, jobs, pipelines, host_lanes),
+        } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines, host_lanes),
         Command::Translate {
             paths,
             validate,
@@ -197,7 +198,7 @@ fn main() -> Result<()> {
             jobs,
             cache: false,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, count, jobs, host_lanes),
+        } => translate::run(paths, validate, pipelines, list, count, jobs.map(NonZeroUsize::get), host_lanes),
         Command::Run {
             exe,
             unimplemented,
@@ -254,6 +255,13 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    check_policy(&cfg)
+}
+
+/// Reports each configured path the asset policy refuses, and fails if
+/// there is one, so that `victory config` exits nonzero.
+fn check_policy(cfg: &victory_core::Config) -> Result<()> {
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -262,8 +270,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy"
+    );
     Ok(())
 }
 
@@ -279,4 +292,37 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::check_policy;
+
+    fn outside() -> PathBuf {
+        std::env::temp_dir().join("victory-config-test")
+    }
+
+    #[test]
+    fn config_check_passes_paths_outside_the_repository() {
+        let cfg = victory_core::Config {
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        assert!(check_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_check_fails_a_path_inside_the_repository() {
+        let cfg = victory_core::Config {
+            game_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("game")),
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        let err = check_policy(&cfg).unwrap_err();
+        assert!(err.to_string().contains("1 configured path"), "{err}");
+    }
 }

@@ -203,6 +203,8 @@ mod bvh_tests;
 mod container;
 pub mod counts;
 #[cfg(all(test, windows))]
+mod crosslane_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;

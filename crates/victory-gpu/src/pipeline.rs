@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -292,9 +294,9 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
+/// The host pipeline of a title pipeline; `None` if it is skipped, one of its
+/// shaders does not translate, the host refuses it, or it is still being made
+/// (its first use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
@@ -368,7 +370,7 @@ pub(crate) fn take_waited_ms() -> f64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(feature = "diagnostics", any(windows, test)))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -389,16 +391,20 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
@@ -406,7 +412,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
@@ -426,7 +432,9 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        p.host
+            .skipped_shader
+            .as_deref()
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
     };
@@ -482,7 +490,12 @@ fn hand_out(
     #[cfg(windows)]
     let walks_bvh = !builder && shaders.iter().any(|s| walks_bvh(&s.container));
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = Arc::new(make::Pending::new(
+        shaders.clone(),
+        graphics,
+        #[cfg(feature = "diagnostics")]
+        skip_hashes(),
+    ));
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -722,6 +735,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
@@ -840,7 +855,7 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

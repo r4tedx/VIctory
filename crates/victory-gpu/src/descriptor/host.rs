@@ -865,13 +865,34 @@ impl HostHeap {
         };
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
-        // (heap syncs revisit it at every submission).
-        let lazy = || {
-            for_draw
-                && is_texture(&view)
-                && self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_none()
+        // (heap syncs revisit it at every submission). Also re-mirror if a
+        // later unordered or renderable view upgraded the memory's HostTexture.
+        let needs_remake = || {
+            if !for_draw || !is_texture(&view) {
+                return false;
+            }
+            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+                .as_ref()
+                .map(|(res, _)| windows::core::Interface::as_raw(res));
+            let Some(held) = held else {
+                return true;
+            };
+            is_placed_texture(&view)
+                && placed_texture(&view).is_some_and(|p| {
+                    let (View::Shader(r, _) | View::Unordered(r, ..)) = p else {
+                        return false;
+                    };
+                    !crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
+                        windows::core::Interface::as_raw(&copy.texture) == held
+                            || copy.twin.get().and_then(Option::as_ref).is_some_and(|t| {
+                                t.planes
+                                    .iter()
+                                    .any(|p| windows::core::Interface::as_raw(&p.texture) == held)
+                            })
+                    })
+                })
         };
-        if made[index as usize] == key && !lazy() {
+        if made[index as usize] == key && !needs_remake() {
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -895,7 +916,7 @@ impl HostHeap {
                 drop(made);
                 return self.mirror(index, handle, for_draw);
             }
-            if made[index as usize] == key && !lazy() {
+            if made[index as usize] == key && !needs_remake() {
                 return Some(view);
             }
         }
@@ -1598,7 +1619,8 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let is_typeless = |f: u32| family(f) == f && family(f + 1) == f;
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -1621,14 +1643,22 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
     }
+    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
+        once!(unordered, view, own, "view the host does not allow");
+        return false;
+    }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    let target = if !typeless && !cast { own } else { view };
-    if unordered && !typed_store(target) {
-        once!(target, own, "an unordered view in a format the host cannot store");
+    let effective = if typeless || cast { view } else { own };
+    if unordered && !typed_store(effective) {
+        once!(
+            view = effective,
+            own,
+            "an unordered view in a format the host cannot store"
+        );
         return false;
     }
     if let Some(format) = format
@@ -1724,6 +1754,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
+                if let Some(desc) = desc.as_mut()
+                    && desc.Format.0 == 0
+                    && let Some(format) = crate::resource::view_format(resource)
+                {
+                    desc.Format = DXGI_FORMAT(format as i32);
+                }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -1766,6 +1802,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
+            if let Some(desc) = desc.as_mut()
+                && desc.Format.0 == 0
+                && let Some(format) = crate::resource::view_format(resource)
+            {
+                desc.Format = DXGI_FORMAT(format as i32);
+            }
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -1803,10 +1845,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -1853,11 +1891,11 @@ fn is_texture(view: &View) -> bool {
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A view of a texture the title placed in memory itself, as a view of the
+/// resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
@@ -1865,7 +1903,12 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let view_desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture as usize, 0, view_desc)
+    } else {
+        View::Shader(texture as usize, view_desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -2843,5 +2886,133 @@ mod tests {
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    fn placed_memory() -> u64 {
+        let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+        // SAFETY: non-zero size and power-of-two alignment; leaked for the test.
+        unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+    }
+
+    fn placed_tex_desc(width: u64, height: u32, format: u32, flags: u32) -> [u32; 14] {
+        [
+            3,
+            0,
+            0,
+            0,
+            width as u32,
+            (width >> 32) as u32,
+            height,
+            1 | (1 << 16),
+            format,
+            1,
+            0,
+            0,
+            flags,
+            0,
+        ]
+    }
+
+    fn placed_tex_uav_desc(va: u64, view_format: u32) -> [u32; 16] {
+        let mut desc = [0u32; 16];
+        desc[0] = view_format;
+        desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        desc[10] = va as u32;
+        desc[11] = (va >> 32) as u32;
+        desc
+    }
+
+    fn placed_tex_srv_desc(va: u64, view_format: u32) -> [u32; 16] {
+        let mut desc = [0u32; 16];
+        desc[0] = view_format;
+        desc[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[5] = 1; // MipLevels
+        desc[10] = va as u32;
+        desc[11] = (va >> 32) as u32;
+        desc
+    }
+
+    #[test]
+    fn placed_uav_textures_create_real_host_uavs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let bgrx_uav = typed_store(88);
+        let cases = [
+            (28u32, 28u32, 4u32, true),     // R8G8B8A8_UNORM
+            (27u32, 28u32, 4u32, true),     // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
+            (29u32, 29u32, 4u32, true),     // R8G8B8A8_UNORM_SRGB -> linear R8G8B8A8_UNORM
+            (29u32, 0u32, 4u32, true),      // R8G8B8A8_UNORM_SRGB + UNKNOWN -> linear 28
+            (91u32, 91u32, 4u32, true),     // B8G8R8A8_UNORM_SRGB -> linear B8G8R8A8_UNORM
+            (91u32, 0u32, 4u32, true),      // B8G8R8A8_UNORM_SRGB + UNKNOWN -> linear 87
+            (28u32, 28u32, 0u32, false),    // missing ALLOW_UNORDERED_ACCESS -> null fallback
+            (93u32, 93u32, 4u32, bgrx_uav), // B8G8R8X8_UNORM_SRGB -> linear 88 if supported
+            (93u32, 0u32, 4u32, bgrx_uav),  // B8G8R8X8_UNORM_SRGB + UNKNOWN -> linear 88
+            (92u32, 88u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+            (92u32, 93u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM_SRGB
+            (40u32, 40u32, 4u32, false),    // D32_FLOAT + UAV flag (no depth flag) -> null fallback
+            (55u32, 55u32, 4u32, false),    // D16_UNORM + UAV flag (no depth flag) -> null fallback
+            (39u32, 40u32, 4u32, false),    // R32_TYPELESS + D32_FLOAT view -> null fallback
+            (53u32, 55u32, 4u32, false),    // R16_TYPELESS + D16_UNORM view -> null fallback
+            (27u32, 27u32, 4u32, false),    // R8G8B8A8_TYPELESS + typeless view -> null fallback
+        ];
+        let mut slots = [[0u32; 8]; 24];
+        for (idx, (res_fmt, view_fmt, flags, expect_real)) in cases.into_iter().enumerate() {
+            let va = placed_memory();
+            let resource = placed_tex_desc(4, 4, res_fmt, flags);
+            let desc = placed_tex_uav_desc(va, view_fmt);
+            let slot_addr = slots[idx].as_mut_ptr() as u64;
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &desc, slot_addr);
+            let view = crate::descriptor::view(slot_addr).unwrap();
+            assert!(matches!(
+                placed_texture(&view),
+                Some(View::Unordered(_, 0, Some(_)))
+            ));
+            assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
+            assert!(
+                heap.kept.lock().unwrap()[idx].is_none(),
+                "case {idx} mirror(false) should defer host creation"
+            );
+            let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
+            let dyn_slot = heap.count + idx as u32;
+            heap.make_at(dyn_slot, &mirrored);
+            let kept = heap.kept.lock().unwrap();
+            assert_eq!(kept[idx].is_some(), expect_real, "case {idx} mirror");
+            assert_eq!(
+                kept[dyn_slot as usize].is_some(),
+                expect_real,
+                "case {idx} make_at"
+            );
+        }
+        for (offset, (res_fmt, view_fmt, expect_real)) in [
+            (39u32, 40u32, false), // R32_TYPELESS + D32_FLOAT SRV -> null fallback
+            (53u32, 55u32, false), // R16_TYPELESS + D16_UNORM SRV -> null fallback
+            (29u32, 0u32, true),   // R8G8B8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 29
+            (91u32, 0u32, true),   // B8G8R8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 91
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let idx = cases.len() + offset;
+            let va = placed_memory();
+            let resource = placed_tex_desc(4, 4, res_fmt, 4);
+            let desc = placed_tex_srv_desc(va, view_fmt);
+            let slot_addr = slots[idx].as_mut_ptr() as u64;
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
+            heap.mirror(idx as u32, slot_addr, true).unwrap();
+            assert_eq!(
+                heap.kept.lock().unwrap()[idx].is_some(),
+                expect_real,
+                "srv case {offset}"
+            );
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
     }
 }

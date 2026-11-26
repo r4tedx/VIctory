@@ -66,6 +66,11 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_wave(words, false)
+}
+
+fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
+    let wave = if wave64 { 64 } else { 32 };
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -78,7 +83,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -95,7 +100,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [wave, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -370,6 +375,160 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
     }
+}
+
+/// Builds, DXIL-validates, and runs a single-wave `ds_bpermute_b32` compute
+/// shader (`wave` = 32 or 64) where `body` leaves each lane's result in `v3`.
+fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
+    let wave = if wave64 { 64 } else { 32 };
+    assert_eq!(want.len(), wave as usize);
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    ];
+    words.extend_from_slice(body);
+    words.extend_from_slice(&[
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let shader = build_wave(&words, wave64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(wave),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
+        // 32-lane hardware adapters.
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
+            eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+    }
+}
+
+#[test]
+fn permutes_mask_high_address_bits_and_divergent_branches() {
+    // High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so
+    // only bits 6:2 select the source lane. Lanes 16..31 skip the permute via
+    // `s_cbranch_execz`, so reads from them yield 0 while they keep `v3`.
+    let body = [
+        0x4A04_00FF,
+        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+        0x4A06_00FF,
+        0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+    ];
+    let want: Vec<u32> = (0..32)
+        .map(|l| {
+            if l < 8 {
+                0x3000 + l + 8
+            } else if l < 16 {
+                0
+            } else {
+                0xBEEF_0000 + l
+            }
+        })
+        .collect();
+    run_permute_cs(false, &body, &want);
+}
+
+#[test]
+fn wave64_permutes_stay_within_each_32_lane_half() {
+    // RDNA 2 ISA §10.4.4: wave64 permutes lanes 0..31 and 32..63 independently.
+    // v1 = ((lane & 31) << 2) + 0x103 with offset:12 exercises both high/low
+    // bit masking and wrapping within each 32-lane half (29..31 -> 0..2,
+    // 61..63 -> 32..34; lane 32 pulls from lane 35, not lane 3).
+    let body = [
+        0x4A04_00FF,
+        0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+        0x3602_009F, // v_and_b32 v1, 31, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    ];
+    let want: Vec<u32> = (0..64)
+        .map(|l| 0x4000 + ((l & !31) | ((l + 3) & 31)))
+        .collect();
+    run_permute_cs(true, &body, &want);
+}
+
+#[test]
+fn wave64_permutes_check_exec_within_each_half() {
+    // Active lanes 0..39 in wave64: lanes 32..39 pull from upper-half lanes
+    // 40..47 (inactive -> 0), even though lower-half lanes 8..15 are active;
+    // inactive lanes 40..63 preserve 0xcafe0000 + lane.
+    let body = [
+        0x4A04_00FF,
+        0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+        0x4A06_00FF,
+        0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3602_029F, // v_and_b32 v1, 31, v1
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ];
+    let want: Vec<u32> = (0..64)
+        .map(|l| {
+            if l < 32 {
+                0x5000 + ((l + 8) & 31)
+            } else if l < 40 {
+                0
+            } else {
+                0xCAFE_0000 + l
+            }
+        })
+        .collect();
+    run_permute_cs(true, &body, &want);
 }
 
 /// A lane mask joined with data at a uniform loop's header, as the title's
