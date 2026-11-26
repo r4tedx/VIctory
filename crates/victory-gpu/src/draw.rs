@@ -3361,8 +3361,9 @@ void main(uint lane : SV_GroupIndex) {
     /// A copy in a GPU upload heap (`VICTORY_GPU_UPLOAD`: each copy its own
     /// placed buffer) takes the dynamic slots a copy in system memory takes,
     /// which is its own committed buffer too: one root view per copy and
-    /// list. Run with copies in system memory, then in a child process with
-    /// the switch set (where the host has GPU upload heaps).
+    /// list. Run with the default placement (copies in GPU upload heaps
+    /// where the host has them), then in a child process with
+    /// `VICTORY_GPU_UPLOAD=0` (every copy in system memory).
     #[test]
     fn copies_in_upload_heaps_take_the_slots_system_memory_copies_do() {
         const CHILD: &str = "VICTORY_TEST_DRAW_UPLOAD_CHILD";
@@ -3372,11 +3373,11 @@ void main(uint lane : SV_GroupIndex) {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
-                .env("VICTORY_GPU_UPLOAD", "1")
+                .env("VICTORY_GPU_UPLOAD", "0")
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-            assert!(out.status.success() && text.contains("1 passed"), "with VICTORY_GPU_UPLOAD=1:\n{text}");
+            assert!(out.status.success() && text.contains("1 passed"), "with VICTORY_GPU_UPLOAD=0:\n{text}");
             eprintln!("{text}");
         }
         let Some(gpu) = crate::host::host() else {
@@ -3409,10 +3410,13 @@ void main(uint lane : SV_GroupIndex) {
         state.close();
         let used = before - host.dynamic_free().0;
         eprintln!("{placed} of {N} copies in GPU upload heaps; their root views took {used} dynamic slots");
-        if child && gpu.gpu_upload() {
+        if child {
+            assert!(!gpu.gpu_upload(), "VICTORY_GPU_UPLOAD=0 turns it off");
+            assert_eq!(placed, 0, "VICTORY_GPU_UPLOAD=0: every copy in system memory");
+        } else if gpu.gpu_upload() {
             assert_eq!(placed, N as usize, "every read-only copy placed in an upload heap");
-        } else if !child {
-            assert_eq!(placed, 0);
+        } else {
+            assert_eq!(placed, 0, "no GPU upload heaps: every copy in system memory");
         }
         assert_eq!(used, N, "one slot per copy, wherever the copy is");
         drop(state);
