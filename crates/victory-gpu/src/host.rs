@@ -2855,6 +2855,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    transfer(src, dst, len).0
+}
+
+/// [`read`], with the bytes the kernel reports copied.
+fn transfer(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -2863,10 +2868,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    let copied = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) } != 0;
     #[cfg(feature = "diagnostics")]
     victory_core::memory_syscalls::Call::ReadProcessMemory.record_timed(done, started);
-    copied != 0
+    (ok, done)
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2878,7 +2883,14 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
 /// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(not(feature = "diagnostics"))]
     let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+    #[cfg(feature = "diagnostics")]
+    let write = |at: usize, n: usize| {
+        let (ok, done) = transfer(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+        crate::copyback_census::record(at, done);
+        ok
+    };
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -3431,6 +3443,9 @@ impl Meter {
                     table_copies as f64 / frames
                 );
             }
+            // Over the same frames: every copy-back since the last line.
+            #[cfg(feature = "diagnostics")]
+            crate::copyback_census::log(logged_frames.max(1) as f64);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let waiting = crate::resource::waiting_textures();
             let (let_go, let_go_bytes) = crate::resource::let_go_counts();

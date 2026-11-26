@@ -707,6 +707,9 @@ pub(crate) fn store(dst: *mut u8, src: *const u8, len: usize) {
             );
         }
         STORING.set((0, 0));
+        // What the stores copied; the kernel's copy below counts its own.
+        #[cfg(feature = "diagnostics")]
+        crate::copyback_census::record(dst as usize, len - left);
         if left != 0 {
             let done = len - left;
             crate::host::write_mapped(dst.wrapping_add(done), src.wrapping_add(done), left);
