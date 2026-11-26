@@ -107,9 +107,9 @@ impl Map {
 
 /// What a heap's page table names: the copies, the level-1 index of each
 /// block (block 0 is the null one), and the copy each entry names.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Layout {
-    copies: Vec<Arc<Shadow>>,
+    copies: Vec<Option<Arc<Shadow>>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -344,13 +344,57 @@ impl Shared {
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        // Copies hidden by another copy on every page have no live entry.
+        let mut used = vec![false; named.len()];
+        for &k in owner.iter().flatten() {
+            used[k] = true;
+        }
+        let copies: Vec<_> = named.into_iter().zip(used).map(|(copy, used)| {
+            if used {
+                return Some(copy);
+            }
+            let slot = self.pairs.remove(&(Arc::as_ptr(&copy) as usize)).expect("copy has a pair");
+            heap.raw_pair_at(slot, None, 0);
+            heap.free_pair(slot);
+            None
+        }).collect();
         self.layout = Arc::new(Layout {
-            copies: named,
+            copies,
             blocks,
             owner,
         });
         self.generation = now;
         stats(|s| s.tables += 1);
+    }
+}
+
+/// Reclaim idle windows between submissions. A remap can also detach a
+/// window still named by a page table. Null its views and keep the other
+/// copies pinned until the next preparation rewrites that table.
+pub(crate) fn reap_loose() {
+    if !crate::shadow::reap_loose() {
+        return;
+    }
+    let keys: Vec<_> = shared().iter().map(|(key, _)| *key).collect();
+    for key in keys {
+        with_heap(key, |heap| {
+            let mut tables = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            let Some((_, state)) = tables.iter_mut().find(|(k, s)| *k == key && s.host == host) else {
+                return;
+            };
+            for slot in &mut Arc::make_mut(&mut state.layout).copies {
+                if !slot.as_ref().is_some_and(|copy| copy.was_remapped()) {
+                    continue;
+                }
+                let copy = slot.take().expect("remapped copy");
+                if let Some(pair) = state.pairs.remove(&(Arc::as_ptr(&copy) as usize)) {
+                    heap.raw_pair_at(pair, None, 0);
+                    heap.free_pair(pair);
+                }
+                state.generation = u64::MAX;
+            }
+        });
     }
 }
 
@@ -380,7 +424,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         Some(s.layout.clone())
     })
     .flatten();
-    for c in layout.iter().flat_map(|l| &l.copies) {
+    for c in layout.iter().flat_map(|l| l.copies.iter().flatten()) {
         let (start, len) = c.range();
         add(c, start as usize, len as usize);
     }
@@ -486,16 +530,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             // The pages from copies in video memory, into their mirrors.
             let pulled: Vec<_> = writes
                 .iter()
-                .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
+                .filter_map(|&(k, at)| copies[k].as_ref().map(|copy| (copy.clone(), at as usize, 1 << 16)))
                 .collect();
             crate::shadow::pull(&pulled);
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let Some(copy) = copies[k].as_ref() else { continue };
+            let n = copy.copy_back_page(at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
-                copy = format_args!("{:#x?}", copies[k].range()),
+                copy = format_args!("{:#x?}", copy.range()),
                 bytes = n,
                 "title memory page written back"
             );

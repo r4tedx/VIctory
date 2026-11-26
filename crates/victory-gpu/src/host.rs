@@ -1184,6 +1184,10 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // SAFETY: querying the fence owned by this queue.
+        if unsafe { self.fence.GetCompletedValue() } >= *submitted {
+            crate::memory::reap_loose();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         crate::descriptor::sync_heaps();
@@ -3266,6 +3270,14 @@ impl Meter {
                 crate::copystat::log(window);
                 crate::bindless::log(window);
                 crate::shadow::log_views(window);
+                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                let (windows, window_bytes) = crate::shadow::loose_stats();
+                tracing::info!(
+                    "loose windows: {windows} ({:.0} MB live), {} covered by a wider \
+                     one since start",
+                    window_bytes as f64 / 1e6,
+                    reuses
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
