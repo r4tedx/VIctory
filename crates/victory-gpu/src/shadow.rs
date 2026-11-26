@@ -1683,6 +1683,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// HoLa-Lee's `a_pending_copy_back_does_not_write_into_memory_the_title_took_back`
+    /// (#3036, posted on #2612), as they wrote it except that the title takes
+    /// the addresses back through `XMemVirtualAlloc`, which reports what it
+    /// allocates (`title_memory_remapped`). With the host's bare `VirtualFree`
+    /// and `VirtualAlloc`, as in theirs, nothing here sees the memory change
+    /// and the shaders' byte lands (`crate::watch`'s shortcut).
+    #[test]
+    fn a_copy_back_pending_when_the_title_takes_memory_back_through_xmem_skips_it() {
+        use crate::watch::title_memory_remapped;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let len = PAGE;
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        copy.writing(p, 64, false);
+        copy.write_host(p as u64 + 24, &[0x99]);
+        unregister(p, p as u64);
+        // SAFETY: our own allocation, freed once.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: a fresh allocation of the same size, filled for the test.
+        let q = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert!(q != 0);
+        // As `XMemVirtualAlloc` reports it.
+        title_memory_remapped(q, len);
+        // SAFETY: the allocation above.
+        unsafe { std::ptr::write_bytes(q as *mut u8, 0xee, len) };
+        if q != p {
+            // SAFETY: as above.
+            unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+            eprintln!("the allocator did not reuse the address ({p:#x} then {q:#x}); not observed");
+            return;
+        }
+        copy.copy_back(p, 64);
+        // SAFETY: the re-used allocation, still mapped.
+        let after = unsafe { (q as *const u8).add(24).read_volatile() };
+        // SAFETY: as above.
+        unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+        eprintln!("observed at {p:#x}");
+        assert_eq!(
+            after, 0xee,
+            "a byte a shader wrote for a submission that is over landed in memory the title re-used"
+        );
+    }
+
     /// What a frame withheld leaves every host copy of its memory at the
     /// frame's end (run textures9's shape): in frame N a program using title
     /// memory writes a record into the copies and the frame misses, so it
